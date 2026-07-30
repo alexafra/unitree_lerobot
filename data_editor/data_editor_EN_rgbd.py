@@ -5,8 +5,8 @@ import json
 import shutil
 from collections import defaultdict
 
-import cv2
 import numpy as np
+
 
 from PyQt5.QtCore import Qt, QTimer, QRect, pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QBrush
@@ -21,6 +21,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QFrame,
     QFileDialog,
+    QComboBox
 )
 
 
@@ -70,6 +71,9 @@ class ImageLabel(QLabel):
 
 def load_depth_pixmap(image_path):
     """Load a 16-bit depth PNG and convert it to a visible colour image."""
+
+    import cv2
+
     depth = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
 
     if depth is None:
@@ -333,6 +337,8 @@ class DatasetPlayer(QWidget):
         super().__init__()
         self.root_dir = root_dir
         self.interval_ms = interval_ms
+        self.playback_speed = 1
+        self.playback_frame_step = 1
 
         self.episodes = []
         self.current_episode_index = 0
@@ -348,6 +354,7 @@ class DatasetPlayer(QWidget):
         self.init_ui()
 
         self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.timeout.connect(self.play_next_frame)
         self.timer.start(self.interval_ms)
 
@@ -480,6 +487,13 @@ class DatasetPlayer(QWidget):
                 padding-bottom: 4px;
             }
         """)
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItems(["1x", "2x", "4x", "8x", "16x", "32x"])
+        self.speed_combo.setCurrentText("1x")
+        self.speed_combo.setMinimumWidth(75)
+        self.speed_combo.currentTextChanged.connect(
+            self.set_playback_speed
+        )
 
         self.play_pause_btn = QPushButton("Pause")
         self.play_pause_btn.clicked.connect(self.toggle_play_pause)
@@ -559,6 +573,8 @@ class DatasetPlayer(QWidget):
 
         control_layout = QHBoxLayout()
         control_layout.addStretch()
+        control_layout.addWidget(QLabel("Speed:"))
+        control_layout.addWidget(self.speed_combo)
         control_layout.addWidget(self.play_pause_btn)
         control_layout.addWidget(self.play_all_btn)
         control_layout.addWidget(self.play_selection_btn)
@@ -586,6 +602,20 @@ class DatasetPlayer(QWidget):
 
     def update_root_dir_label(self):
         self.root_dir_label.setText(f"Current Dataset Path: {self.root_dir}")
+
+    def set_playback_speed(self, speed_text):
+        self.playback_speed = int(speed_text.removesuffix("x"))
+
+        timer_speed = min(self.playback_speed, 8)
+
+        self.playback_frame_step = max(1, self.playback_speed // timer_speed)
+
+        playback_interval = max(1, round(self.interval_ms / timer_speed))
+
+        if hasattr(self, "timer"):
+            self.timer.setInterval(playback_interval)
+
+        self.update_range_info()
 
     def clear_player_state(self, message="No available data"):
         self.episodes = []
@@ -687,11 +717,18 @@ class DatasetPlayer(QWidget):
             self.range_info_label.setText("No available frames")
             return
 
+
         start, end = self.range_slider.get_selected_range()
         mode_text = "Play selected range only" if self.play_selection_only else "Loop full episode"
         state_text = "Playing" if self.is_playing else "Paused"
+        speed_text = f"{self.playback_speed}x"
+
+        if self.playback_frame_step > 1:
+            speed_text += f" (frame step {self.playback_frame_step})"
+
         self.range_info_label.setText(
-            f"Mode: {mode_text}    State: {state_text}    Selected range: frame {start} ~ frame {end}"
+            f"Mode: {mode_text}    State: {state_text}    Speed: {speed_text}    "
+            f"Selected range: frame {start} ~ frame {end}"
         )
 
     def on_range_changed(self, start, end):
@@ -976,16 +1013,20 @@ class DatasetPlayer(QWidget):
                 self.current_frame_index = start
 
             self.show_frame(self.current_frame_index)
-            self.current_frame_index += 1
 
-            if self.current_frame_index > end:
-                self.current_frame_index = start
+            selection_length = end - start + 1
+
+            self.current_frame_index = start + (self.current_frame_index - start 
+                + self.playback_frame_step
+            ) % selection_length
+
         else:
             self.show_frame(self.current_frame_index)
-            self.current_frame_index += 1
+            self.current_frame_index = (
+                self.current_frame_index
+                + self.playback_frame_step
+            ) % len(self.frame_keys)
 
-            if self.current_frame_index >= len(self.frame_keys):
-                self.current_frame_index = 0
 
     def prev_episode(self):
         if self.current_episode_index > 0:
