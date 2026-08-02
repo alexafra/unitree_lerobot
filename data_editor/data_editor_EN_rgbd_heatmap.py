@@ -69,65 +69,8 @@ class ImageLabel(QLabel):
             self.setText(f"{self._title}\nNo image")
 
 
-DEFAULT_DEPTH_SCALE_M_PER_UNIT = 0.001
-DEPTH_NEAR_M = 0.25
-DEPTH_FAR_M = 1.0
-
-
-def resolve_depth_scale_m_per_unit(json_obj):
-    """Read the episode depth scale, falling back only when it is absent."""
-
-    stored_scale = (
-        json_obj.get("info", {})
-        .get("depth", {})
-        .get("scale_m_per_unit")
-    )
-    if stored_scale is None:
-        return DEFAULT_DEPTH_SCALE_M_PER_UNIT
-
-    try:
-        depth_scale_m_per_unit = float(stored_scale)
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            f"depth scale must be numeric, got {stored_scale!r}"
-        ) from error
-
-    if not np.isfinite(depth_scale_m_per_unit) or depth_scale_m_per_unit <= 0:
-        raise ValueError(
-            f"depth scale must be positive and finite, got {stored_scale!r}"
-        )
-    return depth_scale_m_per_unit
-
-
-def depth_to_gray_rgb(
-    depth,
-    depth_scale_m_per_unit=DEFAULT_DEPTH_SCALE_M_PER_UNIT,
-):
-    """Apply the training converter fixed metric-depth grayscale encoding."""
-
-    if depth.ndim == 3:
-        import cv2
-
-        depth = cv2.cvtColor(depth, cv2.COLOR_BGR2GRAY)
-
-    valid_mask = np.isfinite(depth) & (depth > 0)
-    depth_m = depth.astype(np.float32) * depth_scale_m_per_unit
-    normalized = np.clip(
-        (depth_m - DEPTH_NEAR_M) / (DEPTH_FAR_M - DEPTH_NEAR_M),
-        0.0,
-        1.0,
-    )
-
-    gray = np.zeros(depth.shape, dtype=np.uint8)
-    gray[valid_mask] = 1 + np.round(254 * normalized[valid_mask]).astype(np.uint8)
-    return np.repeat(gray[..., None], 3, axis=-1)
-
-
-def load_depth_pixmap(
-    image_path,
-    depth_scale_m_per_unit=DEFAULT_DEPTH_SCALE_M_PER_UNIT,
-):
-    """Load depth and display the same fixed-scale grayscale used for training."""
+def load_depth_pixmap(image_path):
+    """Load a 16-bit depth PNG and convert it to a visible colour image."""
 
     import cv2
 
@@ -136,13 +79,50 @@ def load_depth_pixmap(
     if depth is None:
         return QPixmap()
 
-    gray_rgb = depth_to_gray_rgb(depth, depth_scale_m_per_unit)
+    if depth.ndim == 3:
+        depth = cv2.cvtColor(depth, cv2.COLOR_BGR2GRAY)
 
-    height, width, channels = gray_rgb.shape
+    valid_mask = np.isfinite(depth) & (depth > 0)
+
+    if not np.any(valid_mask):
+        display = np.zeros(depth.shape, dtype=np.uint8)
+    else:
+        valid_values = depth[valid_mask].astype(np.float32)
+        low, high = np.percentile(valid_values, [2, 98])
+
+        if high <= low:
+            display = np.zeros(depth.shape, dtype=np.uint8)
+            display[valid_mask] = 255
+        else:
+            clipped = np.clip(
+                depth.astype(np.float32),
+                low,
+                high,
+            )
+
+            display = (
+                (clipped - low)
+                / (high - low)
+                * 255.0
+            ).astype(np.uint8)
+
+            display[~valid_mask] = 0
+
+    coloured = cv2.applyColorMap(
+        display,
+        cv2.COLORMAP_TURBO,
+    )
+
+    coloured = cv2.cvtColor(
+        coloured,
+        cv2.COLOR_BGR2RGB,
+    )
+
+    height, width, channels = coloured.shape
     bytes_per_line = channels * width
 
     image = QImage(
-        gray_rgb.data,
+        coloured.data,
         width,
         height,
         bytes_per_line,
@@ -366,7 +346,6 @@ class DatasetPlayer(QWidget):
         self.frame_keys = []
         self.frames_map = defaultdict(dict)
         self.current_frame_index = 0
-        self.depth_scale_m_per_unit = DEFAULT_DEPTH_SCALE_M_PER_UNIT
 
         self.is_playing = True
         self.play_selection_only = False
@@ -645,7 +624,6 @@ class DatasetPlayer(QWidget):
         self.frame_keys = []
         self.frames_map = defaultdict(dict)
         self.current_frame_index = 0
-        self.depth_scale_m_per_unit = DEFAULT_DEPTH_SCALE_M_PER_UNIT
         self.play_selection_only = False
 
         self.episode_label.setText("Current Episode: None")
@@ -869,14 +847,6 @@ class DatasetPlayer(QWidget):
             )
             return
 
-        try:
-            self.depth_scale_m_per_unit = resolve_depth_scale_m_per_unit(json_obj)
-        except ValueError as error:
-            self.clear_player_state(
-                f"Invalid depth scale in {json_path}: {error}"
-            )
-            return
-
         data_items = json_obj.get("data")
 
         if not isinstance(data_items, list):
@@ -994,7 +964,6 @@ class DatasetPlayer(QWidget):
             f"Current frame: "
             f"{frame_index}/{len(self.frame_keys) - 1}    "
             f"Frame ID: {frame_id:06d}    "
-            f"Depth scale: {self.depth_scale_m_per_unit:g} m/unit    "
             f"Mode: {mode_text}    "
             f"State: {state_text}"
         )
@@ -1018,10 +987,7 @@ class DatasetPlayer(QWidget):
                 continue
 
             if is_depth:
-                pixmap = load_depth_pixmap(
-                    image_path,
-                    self.depth_scale_m_per_unit,
-                )
+                pixmap = load_depth_pixmap(image_path)
             else:
                 pixmap = QPixmap(image_path)
 

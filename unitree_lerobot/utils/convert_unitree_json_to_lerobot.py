@@ -3,14 +3,20 @@ Script Json to Lerobot.
 
 # --raw-dir     Corresponds to the directory of your JSON dataset
 # --repo-id     Your unique repo ID on Hugging Face Hub
-# --robot_type  The type of the robot used in the dataset (e.g., Unitree_Z1_Single, Unitree_Z1_Dual, Unitree_G1_Dex1, Unitree_G1_Dex3, Unitree_G1_Brainco, Unitree_G1_Inspire)
-# --push_to_hub Whether or not to upload the dataset to Hugging Face Hub (true or false)
+# --robot-type  The type of the robot used in the dataset (e.g., Unitree_Z1_Single, Unitree_Z1_Dual, Unitree_G1_Dex1, Unitree_G1_Dex3, Unitree_G1_Brainco, Unitree_G1_Inspire)
+# --push-to-hub Whether or not to upload the dataset to Hugging Face Hub (true or false)
+# --include-depth Include aligned depth_0 as a normalized three-channel visual feature
+# --depth-near-m Fixed near bound used for depth normalization
+# --depth-far-m  Fixed far bound used for depth normalization
 
 python unitree_lerobot/utils/convert_unitree_json_to_lerobot.py \
     --raw-dir $HOME/datasets/g1_grabcube_double_hand \
     --repo-id your_name/g1_grabcube_double_hand \
-    --robot_type Unitree_G1_Dex3 \
-    --push_to_hub
+    --robot-type Unitree_G1_Dex3_HeadOnly \
+    --include-depth \
+    --depth-near-m 0.25 \
+    --depth-far-m 1.0 \
+    --push-to-hub
 """
 
 import os
@@ -18,7 +24,6 @@ import cv2
 import tqdm
 import tyro
 import json
-import glob
 import dataclasses
 import shutil
 import numpy as np
@@ -42,10 +47,24 @@ class DatasetConfig:
 
 
 DEFAULT_DATASET_CONFIG = DatasetConfig()
+DEFAULT_DEPTH_SCALE_M_PER_UNIT = 0.001
+DEFAULT_DEPTH_NEAR_M = 0.25
+DEFAULT_DEPTH_FAR_M = 1.0
+DEPTH_SOURCE_KEY = "depth_0"
+DEPTH_COLOR_SOURCE_KEY = "color_0"
+DEPTH_OUTPUT_KEY = "depth_gray_view"
 
 
 class JsonDataset:
-    def __init__(self, data_dirs: Path, robot_type: str) -> None:
+    def __init__(
+        self,
+        data_dirs: Path,
+        robot_type: str,
+        *,
+        include_depth: bool = False,
+        depth_near_m: float = DEFAULT_DEPTH_NEAR_M,
+        depth_far_m: float = DEFAULT_DEPTH_FAR_M,
+    ) -> None:
         """
         Initialize the dataset for loading and processing HDF5 files containing robot manipulation data.
 
@@ -54,8 +73,17 @@ class JsonDataset:
         """
         assert data_dirs is not None, "Data directory cannot be None"
         assert robot_type is not None, "Robot type cannot be None"
-        self.data_dirs = data_dirs
+        self.data_dirs = Path(data_dirs)
         self.json_file = "data.json"
+
+        if depth_far_m <= depth_near_m:
+            raise ValueError(
+                f"depth_far_m ({depth_far_m}) must be greater than depth_near_m ({depth_near_m})"
+            )
+
+        self.include_depth = include_depth
+        self.depth_near_m = depth_near_m
+        self.depth_far_m = depth_far_m
 
         # Initialize paths and cache
         self._init_paths()
@@ -67,17 +95,36 @@ class JsonDataset:
     def _init_paths(self) -> None:
         """Initialize episode and task paths."""
 
-        self.episode_paths = []
-        self.task_paths = []
+        if not self.data_dirs.is_dir():
+            raise NotADirectoryError(f"Raw dataset directory does not exist: {self.data_dirs}")
 
-        for task_path in glob.glob(os.path.join(self.data_dirs, "*")):
-            if os.path.isdir(task_path):
-                episode_paths = glob.glob(os.path.join(task_path, "*"))
+        direct_episode_paths = sorted(
+            path
+            for path in self.data_dirs.iterdir()
+            if path.is_dir() and (path / self.json_file).is_file()
+        )
+
+        if direct_episode_paths:
+            self.task_paths = [self.data_dirs]
+            self.episode_paths = direct_episode_paths
+        else:
+            self.task_paths = []
+            self.episode_paths = []
+            for task_path in sorted(path for path in self.data_dirs.iterdir() if path.is_dir()):
+                episode_paths = sorted(
+                    path
+                    for path in task_path.iterdir()
+                    if path.is_dir() and (path / self.json_file).is_file()
+                )
                 if episode_paths:
                     self.task_paths.append(task_path)
                     self.episode_paths.extend(episode_paths)
 
-        self.episode_paths = sorted(self.episode_paths)
+        if not self.episode_paths:
+            raise FileNotFoundError(
+                f"No episode directories containing {self.json_file} were found under {self.data_dirs}"
+            )
+
         self.episode_ids = list(range(len(self.episode_paths)))
 
     def __len__(self) -> int:
@@ -163,13 +210,89 @@ class JsonDataset:
 
         return images
 
+    def _parse_depth_images(
+        self,
+        episode_path: str,
+        episode_data: dict,
+    ) -> dict[str, list[np.ndarray]]:
+        """Load aligned uint16 depth and convert it to a model-ready RGB image."""
+
+        images = defaultdict(list)
+
+        depth_info = episode_data.get("info", {}).get("depth", {})
+
+        stored_scale = depth_info.get("scale_m_per_unit")
+
+        if stored_scale is None:
+            depth_scale = DEFAULT_DEPTH_SCALE_M_PER_UNIT
+            print(
+                f"Warning: depth scale missing for {episode_path}; "
+                f"assuming {depth_scale} m/unit"
+            )
+        else:
+            depth_scale = float(stored_scale)
+
+        if not np.isfinite(depth_scale) or depth_scale <= 0:
+            raise ValueError(f"Invalid depth scale in {episode_path}: {depth_scale}")
+
+        # depth_0 is aligned with color_0.
+        rgb_camera_key = self.camera_to_image_key.get(DEPTH_COLOR_SOURCE_KEY)
+
+        if rgb_camera_key is None:
+            raise ValueError(f"No image mapping exists for {DEPTH_COLOR_SOURCE_KEY}")
+
+        output_key = DEPTH_OUTPUT_KEY
+
+        for sample_data in episode_data["data"]:
+            relative_path = sample_data.get("depths", {}).get(DEPTH_SOURCE_KEY)
+
+            if not relative_path:
+                raise ValueError(f"Missing {DEPTH_SOURCE_KEY} in frame {sample_data.get('idx')}")
+
+            depth_path = os.path.join(episode_path, relative_path)
+
+            depth_u16 = cv2.imread(
+                depth_path,
+                cv2.IMREAD_UNCHANGED,
+            )
+
+            if depth_u16 is None:
+                raise RuntimeError(f"Failed to read depth image: {depth_path}")
+
+            if depth_u16.dtype != np.uint16 or depth_u16.ndim != 2:
+                raise ValueError(
+                    f"Expected HxW uint16 depth at {depth_path}; "
+                    f"got shape={depth_u16.shape}, dtype={depth_u16.dtype}"
+                )
+
+            depth_m = depth_u16.astype(np.float32) * depth_scale
+            valid = depth_u16 != 0
+
+            normalized = np.clip(
+                (depth_m - self.depth_near_m) / (self.depth_far_m - self.depth_near_m),
+                0.0,
+                1.0,
+            )
+
+            gray = np.zeros_like(depth_u16, dtype=np.uint8)
+            gray[valid] = 1 + np.round(254 * normalized[valid]).astype(np.uint8)
+
+            depth_rgb = np.repeat(gray[..., None], 3, axis=-1)
+
+            images[output_key].append(depth_rgb)
+
+        return images
+
     def get_item(
         self,
         index: int | None = None,
     ) -> dict:
         """Get a training sample from the dataset."""
 
-        file_path = np.random.choice(self.episode_paths) if index is None else self.episode_paths[index]
+        if index is None:
+            index = int(np.random.randint(len(self.episode_paths)))
+
+        file_path = self.episode_paths[index]
         episode_data = self.episodes_data_cached[index]
 
         # Load state and action data
@@ -184,6 +307,30 @@ class JsonDataset:
 
         # Load camera images
         cameras = self._parse_images(file_path, episode_data)
+        if self.include_depth:
+            cameras.update(self._parse_depth_images(file_path, episode_data))
+
+        if not cameras:
+            raise ValueError(f"No camera frames found for episode {file_path}")
+
+        reference_shape = next(iter(cameras.values()))[0].shape
+        for camera_key, frames in cameras.items():
+            if len(frames) != episode_length:
+                raise ValueError(
+                    f"Frame count mismatch for {camera_key} in {file_path}: "
+                    f"expected {episode_length}, got {len(frames)}"
+                )
+            for frame_index, frame in enumerate(frames):
+                if frame.dtype != np.uint8:
+                    raise ValueError(
+                        f"Expected uint8 image for {camera_key} frame {frame_index} in "
+                        f"{file_path}; got {frame.dtype}"
+                    )
+                if frame.shape != reference_shape:
+                    raise ValueError(
+                        f"Image shape mismatch for {camera_key} frame {frame_index} in "
+                        f"{file_path}: expected {reference_shape}, got {frame.shape}"
+                    )
 
         # Extract camera configuration
         cam_height, cam_width = next(img for imgs in cameras.values() if imgs for img in imgs).shape[:2]
@@ -213,10 +360,12 @@ def create_empty_dataset(
     *,
     has_velocity: bool = False,
     has_effort: bool = False,
+    include_depth: bool = False,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ) -> LeRobotDataset:
-    motors = ROBOT_CONFIGS[robot_type].motors
-    cameras = ROBOT_CONFIGS[robot_type].cameras
+    robot_config = ROBOT_CONFIGS[robot_type]
+    motors = robot_config.motors
+    cameras = robot_config.cameras
 
     features = {
         "observation.state": {
@@ -264,6 +413,21 @@ def create_empty_dataset(
             ],
         }
 
+    if include_depth:
+        rgb_camera_key = robot_config.camera_to_image_key.get(DEPTH_COLOR_SOURCE_KEY)
+        if rgb_camera_key is None:
+            raise ValueError(f"No image mapping exists for {DEPTH_COLOR_SOURCE_KEY}")
+
+        features[f"observation.images.{DEPTH_OUTPUT_KEY}"] = {
+            "dtype": mode,
+            "shape": (480, 640, 3),
+            "names": [
+                "height",
+                "width",
+                "channel",
+            ],
+        }
+
     if Path(HF_LEROBOT_HOME / repo_id).exists():
         shutil.rmtree(HF_LEROBOT_HOME / repo_id)
 
@@ -284,8 +448,18 @@ def populate_dataset(
     dataset: LeRobotDataset,
     raw_dir: Path,
     robot_type: str,
+    *,
+    include_depth: bool = False,
+    depth_near_m: float = DEFAULT_DEPTH_NEAR_M,
+    depth_far_m: float = DEFAULT_DEPTH_FAR_M,
 ) -> LeRobotDataset:
-    json_dataset = JsonDataset(raw_dir, robot_type)
+    json_dataset = JsonDataset(
+        raw_dir,
+        robot_type,
+        include_depth=include_depth,
+        depth_near_m=depth_near_m,
+        depth_far_m=depth_far_m,
+    )
     for i in tqdm.tqdm(range(len(json_dataset))):
         episode = json_dataset.get_item(i)
 
@@ -320,6 +494,9 @@ def json_to_lerobot(
     *,
     push_to_hub: bool = False,
     mode: Literal["video", "image"] = "video",
+    include_depth: bool = False,
+    depth_near_m: float = DEFAULT_DEPTH_NEAR_M,
+    depth_far_m: float = DEFAULT_DEPTH_FAR_M,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ):
     if (HF_LEROBOT_HOME / repo_id).exists():
@@ -331,13 +508,29 @@ def json_to_lerobot(
         mode=mode,
         has_effort=False,
         has_velocity=False,
+        include_depth=include_depth,
         dataset_config=dataset_config,
     )
+    if include_depth:
+        dataset.meta.info["depth_encoding"] = {
+            "source_key": DEPTH_SOURCE_KEY,
+            "feature_key": f"observation.images.{DEPTH_OUTPUT_KEY}",
+            "encoding": "linear_grayscale_replicated_rgb",
+            "default_scale_m_per_unit": DEFAULT_DEPTH_SCALE_M_PER_UNIT,
+            "near_m": depth_near_m,
+            "far_m": depth_far_m,
+            "invalid_value": 0,
+            "valid_value_range": [1, 255],
+        }
     dataset = populate_dataset(
         dataset,
         raw_dir,
         robot_type=robot_type,
+        include_depth=include_depth,
+        depth_near_m=depth_near_m,
+        depth_far_m=depth_far_m,
     )
+    dataset.finalize()
 
     if push_to_hub:
         dataset.push_to_hub(upload_large_folder=True)
