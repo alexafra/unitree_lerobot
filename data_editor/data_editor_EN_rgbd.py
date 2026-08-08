@@ -3,6 +3,7 @@ import re
 import sys
 import json
 import shutil
+import tempfile
 from collections import defaultdict
 
 import numpy as np
@@ -21,7 +22,8 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QFrame,
     QFileDialog,
-    QComboBox
+    QComboBox,
+    QLineEdit
 )
 
 
@@ -72,6 +74,28 @@ class ImageLabel(QLabel):
 DEFAULT_DEPTH_SCALE_M_PER_UNIT = 0.001
 DEPTH_NEAR_M = 0.25
 DEPTH_FAR_M = 1.0
+
+
+def calculate_measured_fps(data_items):
+    """Calculate the average recorded framerate from frame timestamps."""
+
+    timestamps = [
+        item.get("timestamp_s")
+        for item in data_items
+        if isinstance(item, dict)
+        and isinstance(item.get("timestamp_s"), (int, float))
+        and not isinstance(item.get("timestamp_s"), bool)
+        and np.isfinite(item.get("timestamp_s"))
+    ]
+
+    if len(timestamps) < 2:
+        return None
+
+    elapsed = timestamps[-1] - timestamps[0]
+    if elapsed <= 0:
+        return None
+
+    return (len(timestamps) - 1) / elapsed
 
 
 def resolve_depth_scale_m_per_unit(json_obj):
@@ -371,6 +395,9 @@ class DatasetPlayer(QWidget):
         self.is_playing = True
         self.play_selection_only = False
         self.was_playing_before_drag = False
+        self.measured_fps = None
+        self.current_json_path = ""
+        self.current_goal = ""
 
         self.init_ui()
 
@@ -453,6 +480,43 @@ class DatasetPlayer(QWidget):
                 padding: 8px;
             }
         """)
+
+        self.fps_label = QLabel("Measured framerate: N/A")
+        self.fps_label.setAlignment(Qt.AlignCenter)
+        self.fps_label.setStyleSheet("""
+            QLabel {
+                font-size: 16px;
+                font-weight: bold;
+                color: #333;
+            }
+        """)
+
+        self.goal_label = QLabel("Goal:")
+        self.goal_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+
+        self.goal_edit = QLineEdit()
+        self.goal_edit.setPlaceholderText("No goal specified")
+        self.goal_edit.setMinimumWidth(400)
+        self.goal_edit.setEnabled(False)
+        self.goal_edit.setToolTip("Press Enter or click away to save the goal")
+        self.goal_edit.editingFinished.connect(self.save_goal)
+        self.goal_edit.setStyleSheet("""
+            QLineEdit {
+                font-size: 16px;
+                padding: 5px 8px;
+                border: 1px solid #aaa;
+                border-radius: 4px;
+                background: white;
+            }
+        """)
+
+        episode_details_layout = QHBoxLayout()
+        episode_details_layout.addStretch()
+        episode_details_layout.addWidget(self.fps_label)
+        episode_details_layout.addSpacing(30)
+        episode_details_layout.addWidget(self.goal_label)
+        episode_details_layout.addWidget(self.goal_edit, 1)
+        episode_details_layout.addStretch()
 
         self.info_label = QLabel("")
         self.info_label.setAlignment(Qt.AlignCenter)
@@ -607,6 +671,7 @@ class DatasetPlayer(QWidget):
         center_layout = QVBoxLayout()
         center_layout.addLayout(root_layout)
         center_layout.addWidget(self.episode_label)
+        center_layout.addLayout(episode_details_layout)
         center_layout.addWidget(self.info_label)
         center_layout.addLayout(grid)
         center_layout.addSpacing(12)
@@ -638,7 +703,82 @@ class DatasetPlayer(QWidget):
 
         self.update_range_info()
 
+    def update_framerate_label(self):
+        if self.measured_fps is None:
+            self.fps_label.setText("Measured framerate: N/A")
+        else:
+            self.fps_label.setText(
+                f"Measured framerate: {self.measured_fps:.2f} FPS"
+            )
+
+    def set_goal(self, goal, enabled):
+        self.current_goal = goal
+        self.goal_edit.setText(goal)
+        self.goal_edit.setEnabled(enabled)
+
+    def save_goal(self):
+        if not self.current_json_path or not self.goal_edit.isEnabled():
+            return
+
+        new_goal = self.goal_edit.text()
+        if new_goal == self.current_goal:
+            return
+
+        temporary_path = None
+
+        try:
+            with open(
+                self.current_json_path,
+                "r",
+                encoding="utf-8",
+            ) as file:
+                json_obj = json.load(file)
+
+            text_info = json_obj.get("text")
+            if not isinstance(text_info, dict):
+                text_info = {}
+                json_obj["text"] = text_info
+
+            text_info["goal"] = new_goal
+
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=os.path.dirname(self.current_json_path),
+                prefix=".data_goal_",
+                suffix=".tmp",
+                delete=False,
+            ) as file:
+                temporary_path = file.name
+                json.dump(
+                    json_obj,
+                    file,
+                    ensure_ascii=False,
+                    indent=4,
+                )
+                file.write("\n")
+
+            os.replace(temporary_path, self.current_json_path)
+            self.current_goal = new_goal
+
+        except (OSError, json.JSONDecodeError) as error:
+            if temporary_path and os.path.isfile(temporary_path):
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    pass
+            self.goal_edit.setText(self.current_goal)
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Could not save the goal:\n{error}",
+            )
+
     def clear_player_state(self, message="No available data"):
+        self.measured_fps = None
+        self.update_framerate_label()
+        self.current_json_path = ""
+        self.set_goal("", enabled=False)
         self.episodes = []
         self.current_episode_index = 0
         self.current_episode_name = ""
@@ -809,6 +949,10 @@ class DatasetPlayer(QWidget):
         self.update_range_info()
 
     def load_episode(self, episode_index):
+        self.measured_fps = None
+        self.update_framerate_label()
+        self.current_json_path = ""
+        self.set_goal("", enabled=False)
         if not self.episodes:
             self.clear_player_state("No available datasets")
             return
@@ -884,6 +1028,16 @@ class DatasetPlayer(QWidget):
                 "Invalid data.json: missing data array"
             )
             return
+
+        self.measured_fps = calculate_measured_fps(data_items)
+        self.update_framerate_label()
+
+        text_info = json_obj.get("text")
+        goal = text_info.get("goal", "") if isinstance(text_info, dict) else ""
+        if not isinstance(goal, str):
+            goal = str(goal)
+        self.current_json_path = json_path
+        self.set_goal(goal, enabled=True)
 
         frames_map = defaultdict(dict)
 
