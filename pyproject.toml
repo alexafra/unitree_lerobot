@@ -18,12 +18,25 @@ dependencies = [
     "tyro>=0.9.10",
     "matplotlib>=3.9.0",
     "meshcat==0.3.2",
+    "msgpack>=1.0.8",
+    "msgpack-numpy==0.4.8",
+    "opencv-python>=4.9.0",
+    "PyYAML>=6.0",
+    "pyzmq>=26.0.0",
     # "unitree_sdk2py @ git+https://github.com/unitreerobotics/unitree_sdk2_python.git@master",
     "logging_mp==0.2.1",
 ]
 
 [tool.setuptools]
-packages = ["unitree_lerobot"]
+packages = [
+    "unitree_lerobot",
+    "unitree_lerobot.eval_robot",
+    "unitree_lerobot.eval_robot.image_server",
+    "unitree_lerobot.eval_robot.robot_control",
+    "unitree_lerobot.eval_robot.robot_control.uniarml1",
+    "unitree_lerobot.eval_robot.utils",
+    "unitree_lerobot.utils",
+]
 
 [tool.ruff]
 line-length = 120

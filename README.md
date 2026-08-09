@@ -272,6 +272,11 @@ If you want to use multi-GPU training, please refer to the details [here](https:
 
 # 4. 🤖 Real-World Testing
 
+For an Isaac-GR00T N1.7 checkpoint controlling a G1-29 with Dex3 hands, use the
+[guarded GR00T deployment guide](docs/groot_g1_dex3.md). Its default shadow mode is
+publisher-free; real actuation remains explicitly fail-closed pending hardware
+qualification.
+
 To test your trained model on a real robot, you can use the eval_g1.py script located in the eval_robot folder. Here’s how to run it:
 
 [To open the image_server, follow these steps](https://github.com/unitreerobotics/avp_teleoperate?tab=readme-ov-file#31-%EF%B8%8F-image-server)
