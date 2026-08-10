@@ -26,11 +26,16 @@ from unitree_lerobot.eval_robot.groot_client import DeploymentError
 from unitree_lerobot.eval_robot.image_server.rgbd_protocol import RGBD_PROTOCOL
 from unitree_lerobot.eval_robot.groot_contract import (
     ActionChunk,
+    ARM_JOINT_NAMES,
     CONTROL_HZ,
     DepthEncodingContract,
     EXPECTED_DEPTH_VIEW_SHAPE,
     EXPECTED_EGO_VIEW_SHAPE,
+    InitializationSpec,
+    LEFT_HAND_JOINT_NAMES,
+    RIGHT_HAND_JOINT_NAMES,
     validate_action_chunk,
+    validate_initialization_spec,
     validate_measured_state,
 )
 from unitree_lerobot.utils.depth_encoding import encode_depth_gray_rgb
@@ -51,12 +56,30 @@ MAX_ARM_TRACKING_ERROR_RAD = 0.35
 MAX_HAND_TRACKING_ERROR_RAD = 0.50
 TRACKING_GRACE_S = 0.50
 MAX_ACTION_LATENESS_S = 0.02
+# OFFICIAL: Unitree G1 asset mapping identifies mode_machine 5 as
+# g1_29dof_with_hand_rev_1_0 (eval_robot/assets/g1/README.md).
 QUALIFIED_REAL_MODE_MACHINE = 5
 PREARM_STATIONARY_DWELL_S = 0.5
 PREARM_STATE_MAX_AGE_S = 0.05
 PREARM_MAX_ARM_DQ_RAD_S = 0.10
 PREARM_MAX_POSITION_DRIFT_RAD = 0.02
 PREARM_MIN_DISTINCT_SAMPLES = 5
+INITIALIZATION_ARM_SPEED_RAD_S = 0.25
+INITIALIZATION_HAND_SPEED_RAD_S = 0.50
+INITIALIZATION_MAX_ARM_STEP_RAD = INITIALIZATION_ARM_SPEED_RAD_S / PUBLISH_HZ
+INITIALIZATION_MAX_HAND_STEP_RAD = INITIALIZATION_HAND_SPEED_RAD_S / PUBLISH_HZ
+INITIALIZATION_MIN_MOVE_S = 0.50
+INITIALIZATION_MAX_DURATION_S = 30.0
+INITIALIZATION_START_TIMEOUT_S = 3.0
+INITIALIZATION_START_DWELL_S = 0.50
+INITIALIZATION_CONVERGENCE_TIMEOUT_S = 3.0
+INITIALIZATION_CONVERGENCE_DWELL_S = 0.50
+INITIALIZATION_MIN_DISTINCT_SAMPLES = 5
+INITIALIZATION_ARM_TOLERANCE_RAD = 0.05
+INITIALIZATION_HAND_TOLERANCE_RAD = 0.10
+INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S = 0.10
+INITIALIZATION_MAX_POSITION_DRIFT_RAD = 0.02
+INITIALIZATION_COMMAND_MAX_AGE_S = 0.25
 
 # IsaacLab publishes/consumes its right hand as thumb, middle, index.  The real
 # Dex3 and recorded dataset use thumb, index, middle.  This permutation is its own
@@ -82,6 +105,91 @@ class CameraImages:
     rgb: np.ndarray
     depth_gray: np.ndarray | None = None
     sequence: int | None = None
+
+
+def _largest_named_value(
+    groups: tuple[tuple[str, np.ndarray, tuple[str, ...]], ...],
+) -> tuple[str, int, str, float]:
+    """Return the signed value with the largest magnitude and its joint identity."""
+
+    best: tuple[str, int, str, float] | None = None
+    for group_name, raw_values, joint_names in groups:
+        values = np.asarray(raw_values, dtype=np.float64)
+        joint = int(np.argmax(np.abs(values)))
+        candidate = (group_name, joint, joint_names[joint], float(values[joint]))
+        if best is None or abs(candidate[3]) > abs(best[3]):
+            best = candidate
+    assert best is not None
+    return best
+
+
+def _smooth_initialization_path(
+    current: np.ndarray,
+    target: np.ndarray,
+    steps: int,
+) -> np.ndarray:
+    phase = np.arange(1, steps + 1, dtype=np.float64) / steps
+    blend = phase * phase * (3.0 - 2.0 * phase)
+    return current[None] + blend[:, None] * (target - current)[None]
+
+
+def build_initialization_chunk(state: RobotState, spec: InitializationSpec) -> ActionChunk:
+    """Resolve measured targets and create a bounded smooth joint-space path."""
+
+    validate_initialization_spec(spec)
+    validate_measured_state(state.arm, state.arm_dq, state.left_hand, state.right_hand)
+    current = (
+        np.asarray(state.arm, dtype=np.float64),
+        np.asarray(state.left_hand, dtype=np.float64),
+        np.asarray(state.right_hand, dtype=np.float64),
+    )
+    targets = tuple(
+        measured.copy() if target is None else np.asarray(target, dtype=np.float64).copy()
+        for measured, target in zip(
+            current,
+            (spec.arm, spec.left_hand, spec.right_hand),
+            strict=True,
+        )
+    )
+    max_steps = (INITIALIZATION_MAX_ARM_STEP_RAD, INITIALIZATION_MAX_HAND_STEP_RAD, INITIALIZATION_MAX_HAND_STEP_RAD)
+    # A cubic smoothstep has a maximum slope of 1.5.  This initial estimate is
+    # checked below against the actual discrete path before it can be used.
+    movement = any(np.any(target != measured) for measured, target in zip(current, targets, strict=True))
+    steps = max(
+        1,
+        *(
+            int(np.ceil(1.5 * float(np.max(np.abs(target - measured))) / max_step))
+            for measured, target, max_step in zip(current, targets, max_steps, strict=True)
+        ),
+    )
+    if movement:
+        steps = max(steps, round(INITIALIZATION_MIN_MOVE_S * PUBLISH_HZ))
+    while True:
+        paths = tuple(
+            _smooth_initialization_path(measured, target, steps)
+            for measured, target in zip(current, targets, strict=True)
+        )
+        actual_steps = tuple(
+            float(np.max(np.abs(np.diff(np.vstack((measured, path)), axis=0))))
+            for measured, path in zip(current, paths, strict=True)
+        )
+        if all(actual <= limit + 1e-12 for actual, limit in zip(actual_steps, max_steps, strict=True)):
+            break
+        steps += 1
+
+    duration_s = steps / PUBLISH_HZ
+    if duration_s > INITIALIZATION_MAX_DURATION_S:
+        raise DeploymentError(
+            f"Initialization path needs {duration_s:.1f}s at the fixed conservative rate; "
+            f"the limit is {INITIALIZATION_MAX_DURATION_S:.1f}s"
+        )
+    chunk = ActionChunk(
+        arm=np.ascontiguousarray(paths[0]),
+        left_hand=np.ascontiguousarray(paths[1]),
+        right_hand=np.ascontiguousarray(paths[2]),
+    )
+    validate_action_chunk(chunk, *current)
+    return chunk
 
 
 def initialize_dds(simulation: bool, network_interface: str | None) -> None:
@@ -537,10 +645,16 @@ class _G1Dex3CommandBackend:
     def _validate_runtime_state(self, state: RobotState) -> RobotState:
         if not self.simulation and state.mode_machine != QUALIFIED_REAL_MODE_MACHINE:
             raise DeploymentError(
-                f"Robot mode_machine changed from qualified mode {QUALIFIED_REAL_MODE_MACHINE} to {state.mode_machine}"
+                f"Robot mode_machine changed from QUALIFIED_REAL_MODE_MACHINE="
+                f"{QUALIFIED_REAL_MODE_MACHINE} to {state.mode_machine}"
             )
-        if np.max(np.abs(state.arm_dq)) > MAX_ARM_DQ_RAD_S:
-            raise DeploymentError(f"Arm velocity exceeded {MAX_ARM_DQ_RAD_S:.1f} rad/s")
+        joint = int(np.argmax(np.abs(state.arm_dq)))
+        velocity = float(state.arm_dq[joint])
+        if abs(velocity) > MAX_ARM_DQ_RAD_S:
+            raise DeploymentError(
+                f"Arm velocity at joint {joint} ({ARM_JOINT_NAMES[joint]}) is {velocity:+.3f} rad/s; "
+                f"MAX_ARM_DQ_RAD_S={MAX_ARM_DQ_RAD_S:.3f} rad/s"
+            )
         return state
 
     def state(self) -> RobotState:
@@ -555,28 +669,40 @@ class _G1Dex3CommandBackend:
             deadline = time.monotonic() + PREARM_STATIONARY_DWELL_S
             while time.monotonic() < deadline:
                 state = self._validate_runtime_state(self.reader.read(timeout_s=0.1))
-                if time.monotonic() - state.captured_at > PREARM_STATE_MAX_AGE_S:
-                    raise DeploymentError("Robot state is not fresh enough to arm")
-                if np.max(np.abs(state.arm_dq)) > PREARM_MAX_ARM_DQ_RAD_S:
+                state_age = time.monotonic() - state.captured_at
+                if state_age > PREARM_STATE_MAX_AGE_S:
                     raise DeploymentError(
-                        f"Arm must be stationary before arming ({PREARM_MAX_ARM_DQ_RAD_S:.2f} rad/s limit)"
+                        f"Robot state age is {state_age:.3f}s; PREARM_STATE_MAX_AGE_S={PREARM_STATE_MAX_AGE_S:.3f}s"
                     )
-                if (
-                    max(
-                        np.max(np.abs(state.arm - reference.arm)),
-                        np.max(np.abs(state.left_hand - reference.left_hand)),
-                        np.max(np.abs(state.right_hand - reference.right_hand)),
+                joint = int(np.argmax(np.abs(state.arm_dq)))
+                velocity = float(state.arm_dq[joint])
+                if abs(velocity) > PREARM_MAX_ARM_DQ_RAD_S:
+                    raise DeploymentError(
+                        f"Arm is not stationary at joint {joint} ({ARM_JOINT_NAMES[joint]}): "
+                        f"{velocity:+.3f} rad/s; "
+                        f"PREARM_MAX_ARM_DQ_RAD_S={PREARM_MAX_ARM_DQ_RAD_S:.3f} rad/s"
                     )
-                    > PREARM_MAX_POSITION_DRIFT_RAD
-                ):
-                    raise DeploymentError("Robot position changed during the pre-arm stationary dwell")
+                group, joint, joint_name, drift = _largest_named_value(
+                    (
+                        ("arm", state.arm - reference.arm, ARM_JOINT_NAMES),
+                        ("left hand", state.left_hand - reference.left_hand, LEFT_HAND_JOINT_NAMES),
+                        ("right hand", state.right_hand - reference.right_hand, RIGHT_HAND_JOINT_NAMES),
+                    )
+                )
+                if abs(drift) > PREARM_MAX_POSITION_DRIFT_RAD:
+                    raise DeploymentError(
+                        f"Pre-arm {group} position drift at joint {joint} ({joint_name}) is "
+                        f"{drift:+.4f} rad; PREARM_MAX_POSITION_DRIFT_RAD="
+                        f"{PREARM_MAX_POSITION_DRIFT_RAD:.4f} rad"
+                    )
                 if state.captured_at > last_captured_at:
                     distinct_samples += 1
                     last_captured_at = state.captured_at
                 time.sleep(0.005)
             if distinct_samples < PREARM_MIN_DISTINCT_SAMPLES:
                 raise DeploymentError(
-                    "Too few distinct robot-state samples arrived during the pre-arm stationary dwell"
+                    f"Only {distinct_samples} distinct robot-state samples arrived during the pre-arm dwell; "
+                    f"PREARM_MIN_DISTINCT_SAMPLES={PREARM_MIN_DISTINCT_SAMPLES}"
                 )
         self._arm_message.mode_machine = state.mode_machine if self.simulation else QUALIFIED_REAL_MODE_MACHINE
         self.set_target(state.arm, state.left_hand, state.right_hand)
@@ -715,6 +841,205 @@ def _status(status_queue: MpQueue, kind: str, payload: Any = None) -> None:
         pass
 
 
+def _tracking_errors(backend: _G1Dex3CommandBackend, state: RobotState) -> tuple[float, float]:
+    arm_error = float(np.max(np.abs(state.arm - backend._arm_target)))
+    hand_error = float(
+        max(
+            np.max(np.abs(state.left_hand - backend._left_target)),
+            np.max(np.abs(state.right_hand - backend._right_target)),
+        )
+    )
+    return arm_error, hand_error
+
+
+def _enforce_tracking(backend: _G1Dex3CommandBackend, state: RobotState) -> None:
+    _, arm_joint, arm_name, arm_delta = _largest_named_value(
+        (("arm", state.arm - backend._arm_target, ARM_JOINT_NAMES),)
+    )
+    if abs(arm_delta) > MAX_ARM_TRACKING_ERROR_RAD:
+        raise DeploymentError(
+            f"Arm tracking error at joint {arm_joint} ({arm_name}) is {arm_delta:+.3f} rad "
+            f"(measured minus target); MAX_ARM_TRACKING_ERROR_RAD="
+            f"{MAX_ARM_TRACKING_ERROR_RAD:.3f} rad"
+        )
+    hand_group, hand_joint, hand_name, hand_delta = _largest_named_value(
+        (
+            ("left hand", state.left_hand - backend._left_target, LEFT_HAND_JOINT_NAMES),
+            ("right hand", state.right_hand - backend._right_target, RIGHT_HAND_JOINT_NAMES),
+        )
+    )
+    if abs(hand_delta) > MAX_HAND_TRACKING_ERROR_RAD:
+        raise DeploymentError(
+            f"{hand_group.title()} tracking error at joint {hand_joint} ({hand_name}) is "
+            f"{hand_delta:+.3f} rad (measured minus target); MAX_HAND_TRACKING_ERROR_RAD="
+            f"{MAX_HAND_TRACKING_ERROR_RAD:.3f} rad"
+        )
+
+
+def _position_drift(state: RobotState, reference: RobotState) -> float:
+    return float(
+        max(
+            np.max(np.abs(state.arm - reference.arm)),
+            np.max(np.abs(state.left_hand - reference.left_hand)),
+            np.max(np.abs(state.right_hand - reference.right_hand)),
+        )
+    )
+
+
+def _wait_for_initialization_start(
+    backend: _G1Dex3CommandBackend,
+    stop_event: Any,
+    heartbeat: Any,
+) -> RobotState | None:
+    """Hold the current command until fresh measured state is stationary again."""
+
+    period = 1.0 / PUBLISH_HZ
+    deadline = time.monotonic() + INITIALIZATION_START_TIMEOUT_S
+    stationary_since: float | None = None
+    stationary_reference: RobotState | None = None
+    distinct_samples = 0
+    last_capture = float("-inf")
+    latest: RobotState | None = None
+    while not stop_event.is_set() and time.monotonic() < deadline:
+        loop_started = time.monotonic()
+        if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
+            raise DeploymentError("Parent heartbeat expired before initialization movement")
+        latest = backend.state()
+        now = time.monotonic()
+        if now - latest.captured_at > PREARM_STATE_MAX_AGE_S:
+            raise DeploymentError("Robot state is not fresh enough to start initialization")
+        _enforce_tracking(backend, latest)
+        arm_error, hand_error = _tracking_errors(backend, latest)
+
+        stationary = (
+            (backend.simulation or float(np.max(np.abs(latest.arm_dq))) <= INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S)
+            and arm_error <= INITIALIZATION_ARM_TOLERANCE_RAD
+            and hand_error <= INITIALIZATION_HAND_TOLERANCE_RAD
+        )
+        if stationary:
+            if stationary_since is None:
+                stationary_since = now
+                stationary_reference = latest
+                distinct_samples = 0
+                last_capture = float("-inf")
+            assert stationary_reference is not None
+            if _position_drift(latest, stationary_reference) > INITIALIZATION_MAX_POSITION_DRIFT_RAD:
+                stationary_since = now
+                stationary_reference = latest
+                distinct_samples = 0
+                last_capture = float("-inf")
+            if latest.captured_at > last_capture:
+                distinct_samples += 1
+                last_capture = latest.captured_at
+            if (
+                now - stationary_since >= INITIALIZATION_START_DWELL_S
+                and distinct_samples >= INITIALIZATION_MIN_DISTINCT_SAMPLES
+            ):
+                return latest
+        else:
+            stationary_since = None
+            stationary_reference = None
+            distinct_samples = 0
+            last_capture = float("-inf")
+
+        backend.publish()
+        elapsed = time.monotonic() - loop_started
+        stop_event.wait(max(0.0, period - elapsed))
+    if stop_event.is_set():
+        return None
+    if latest is None:
+        raise DeploymentError("No fresh robot state arrived before initialization")
+    arm_error, hand_error = _tracking_errors(backend, latest)
+    raise DeploymentError(
+        "Robot did not become stationary at the held target before initialization: "
+        f"arm error={arm_error:.3f} rad, hand error={hand_error:.3f} rad, "
+        f"max arm dq={float(np.max(np.abs(latest.arm_dq))):.3f} rad/s"
+    )
+
+
+def _execute_initialization(
+    backend: _G1Dex3CommandBackend,
+    chunk: ActionChunk,
+    stop_event: Any,
+    heartbeat: Any,
+    tracking_checks_after: float,
+) -> bool:
+    """Execute and verify one bounded initialization path in the DDS owner."""
+
+    period = 1.0 / PUBLISH_HZ
+    path_index = 0
+    endpoint_deadline: float | None = None
+    converged_since: float | None = None
+    converged_reference: RobotState | None = None
+    distinct_converged_samples = 0
+    last_converged_capture = float("-inf")
+
+    while not stop_event.is_set():
+        loop_started = time.monotonic()
+        if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
+            raise DeploymentError("Parent heartbeat expired during initialization")
+
+        state = backend.state()
+        now = time.monotonic()
+        if path_index < chunk.length:
+            # Advance exactly once per publisher iteration.  A late loop slows
+            # initialization; it never skips or bursts targets to catch up.
+            backend.set_target(
+                chunk.arm[path_index],
+                chunk.left_hand[path_index],
+                chunk.right_hand[path_index],
+            )
+            path_index += 1
+            if path_index == chunk.length:
+                endpoint_deadline = now + INITIALIZATION_CONVERGENCE_TIMEOUT_S
+
+        if now >= tracking_checks_after:
+            _enforce_tracking(backend, state)
+
+        if endpoint_deadline is not None:
+            arm_error, hand_error = _tracking_errors(backend, state)
+            in_tolerance = (
+                arm_error <= INITIALIZATION_ARM_TOLERANCE_RAD
+                and hand_error <= INITIALIZATION_HAND_TOLERANCE_RAD
+                and (backend.simulation or float(np.max(np.abs(state.arm_dq))) <= INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S)
+            )
+            if in_tolerance:
+                if converged_since is None:
+                    converged_since = now
+                    converged_reference = state
+                    distinct_converged_samples = 0
+                    last_converged_capture = float("-inf")
+                assert converged_reference is not None
+                if _position_drift(state, converged_reference) > INITIALIZATION_MAX_POSITION_DRIFT_RAD:
+                    converged_since = now
+                    converged_reference = state
+                    distinct_converged_samples = 0
+                    last_converged_capture = float("-inf")
+                if state.captured_at > last_converged_capture:
+                    distinct_converged_samples += 1
+                    last_converged_capture = state.captured_at
+                if (
+                    now - converged_since >= INITIALIZATION_CONVERGENCE_DWELL_S
+                    and distinct_converged_samples >= INITIALIZATION_MIN_DISTINCT_SAMPLES
+                ):
+                    return True
+            else:
+                converged_since = None
+                converged_reference = None
+                distinct_converged_samples = 0
+                last_converged_capture = float("-inf")
+            if now > endpoint_deadline:
+                raise DeploymentError(
+                    "Initialization target did not converge: "
+                    f"arm error={arm_error:.3f} rad, hand error={hand_error:.3f} rad"
+                )
+
+        backend.publish()
+        elapsed = time.monotonic() - loop_started
+        stop_event.wait(max(0.0, period - elapsed))
+    return False
+
+
 def _actuator_main(
     simulation: bool,
     network_interface: str | None,
@@ -749,8 +1074,9 @@ def _actuator_main(
                 if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
                     raise DeploymentError("Parent heartbeat expired before arm request")
                 continue
-            if command[0] == "arm":
-                break
+            if not isinstance(command, tuple) or command != ("arm",):
+                raise DeploymentError("Unexpected actuator command before arm request")
+            break
         else:
             return
 
@@ -769,12 +1095,86 @@ def _actuator_main(
         tracking_checks_after = time.monotonic() + TRACKING_GRACE_S
         _status(status_queue, "armed")
 
+        period = 1.0 / PUBLISH_HZ
+        action_period = 1.0 / CONTROL_HZ
+
+        # Initialization is a mandatory state transition.  Until the parent
+        # requests it, hold the measured target while keeping every watchdog
+        # active.  Policy chunks are structurally rejected in this phase.
+        while not stop_event.is_set():
+            loop_started = time.monotonic()
+            if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
+                raise DeploymentError("Parent heartbeat expired before initialization")
+            try:
+                command = command_queue.get_nowait()
+            except queue.Empty:
+                command = None
+            if command is not None:
+                if not isinstance(command, tuple) or len(command) != 3 or command[0] != "initialize":
+                    kind = command[0] if isinstance(command, tuple) and command else None
+                    raise DeploymentError(f"Unexpected actuator command before initialization: {kind!r}")
+                _, created_at, initialization = command
+                if not isinstance(initialization, InitializationSpec):
+                    raise DeploymentError("Malformed initialization command")
+                try:
+                    command_age = time.monotonic() - float(created_at)
+                except (TypeError, ValueError) as exc:
+                    raise DeploymentError("Initialization command timestamp is invalid") from exc
+                if not np.isfinite(command_age) or not 0.0 <= command_age <= INITIALIZATION_COMMAND_MAX_AGE_S:
+                    raise DeploymentError("Initialization command expired before execution")
+                state = _wait_for_initialization_start(backend, stop_event, heartbeat)
+                if state is None:
+                    _status(status_queue, "initialization_cancelled", initialization.mode)
+                    return
+                # Build from the already-published hold target, not directly
+                # from measured q.  This keeps the first initialization command
+                # increment bounded even when normal tracking error is nonzero.
+                command_start = RobotState(
+                    captured_at=state.captured_at,
+                    mode_machine=state.mode_machine,
+                    arm=backend._arm_target.copy(),
+                    arm_dq=state.arm_dq.copy(),
+                    left_hand=backend._left_target.copy(),
+                    right_hand=backend._right_target.copy(),
+                )
+                initialization_chunk = build_initialization_chunk(command_start, initialization)
+                _status(
+                    status_queue,
+                    "initializing",
+                    {
+                        "mode": initialization.mode,
+                        "steps": initialization_chunk.length,
+                        "duration_s": initialization_chunk.length / PUBLISH_HZ,
+                    },
+                )
+                initialized = _execute_initialization(
+                    backend,
+                    initialization_chunk,
+                    stop_event,
+                    heartbeat,
+                    tracking_checks_after,
+                )
+                if not initialized:
+                    _status(status_queue, "initialization_cancelled", initialization.mode)
+                    return
+                tracking_checks_after = time.monotonic()
+                _status(status_queue, "initialized", initialization.mode)
+                break
+
+            state = backend.state()
+            if time.monotonic() >= tracking_checks_after:
+                _enforce_tracking(backend, state)
+            backend.publish()
+            elapsed = time.monotonic() - loop_started
+            stop_event.wait(max(0.0, period - elapsed))
+        else:
+            return
+
         chunk: ActionChunk | None = None
         chunk_sequence = 0
         chunk_index = 0
         next_action_at = 0.0
-        period = 1.0 / PUBLISH_HZ
-        action_period = 1.0 / CONTROL_HZ
+        holding = True
 
         while not stop_event.is_set():
             loop_started = time.monotonic()
@@ -786,15 +1186,89 @@ def _actuator_main(
             except queue.Empty:
                 command = None
             if command is not None:
-                kind = command[0]
-                if kind != "chunk":
-                    raise DeploymentError(f"Unexpected actuator command {kind!r}")
+                kind = command[0] if isinstance(command, tuple) and command else None
+                if kind == "hold":
+                    if not isinstance(command, tuple) or len(command) != 2:
+                        raise DeploymentError("Malformed hold command")
+                    if chunk is not None:
+                        raise DeploymentError("Cannot enter hold before the current chunk completes")
+                    _, created_at = command
+                    try:
+                        command_age = time.monotonic() - float(created_at)
+                    except (TypeError, ValueError) as exc:
+                        raise DeploymentError("Hold command timestamp is invalid") from exc
+                    if not np.isfinite(command_age) or not 0.0 <= command_age <= CHUNK_MAX_AGE_S:
+                        raise DeploymentError("Hold command expired before execution")
+                    state = backend.state()
+                    backend.set_target(state.arm, state.left_hand, state.right_hand)
+                    tracking_checks_after = time.monotonic()
+                    holding = True
+                    _status(status_queue, "holding", last_sequence)
+                    continue
+
+                if kind == "warm_start":
+                    if not isinstance(command, tuple) or len(command) != 3:
+                        raise DeploymentError("Malformed policy warm-start command")
+                    if chunk is not None or not holding:
+                        raise DeploymentError("Policy warm-start requires an acknowledged hold with no active chunk")
+                    _, created_at, warm_start = command
+                    if not isinstance(warm_start, InitializationSpec):
+                        raise DeploymentError("Malformed policy warm-start target")
+                    try:
+                        command_age = time.monotonic() - float(created_at)
+                    except (TypeError, ValueError) as exc:
+                        raise DeploymentError("Policy warm-start timestamp is invalid") from exc
+                    if not np.isfinite(command_age) or not 0.0 <= command_age <= INITIALIZATION_COMMAND_MAX_AGE_S:
+                        raise DeploymentError("Policy warm-start command expired before execution")
+
+                    state = _wait_for_initialization_start(backend, stop_event, heartbeat)
+                    if state is None:
+                        _status(status_queue, "warm_start_cancelled")
+                        return
+                    command_start = RobotState(
+                        captured_at=state.captured_at,
+                        mode_machine=state.mode_machine,
+                        arm=backend._arm_target.copy(),
+                        arm_dq=state.arm_dq.copy(),
+                        left_hand=backend._left_target.copy(),
+                        right_hand=backend._right_target.copy(),
+                    )
+                    warm_start_chunk = build_initialization_chunk(command_start, warm_start)
+                    _status(
+                        status_queue,
+                        "warm_starting",
+                        {
+                            "steps": warm_start_chunk.length,
+                            "duration_s": warm_start_chunk.length / PUBLISH_HZ,
+                        },
+                    )
+                    completed = _execute_initialization(
+                        backend,
+                        warm_start_chunk,
+                        stop_event,
+                        heartbeat,
+                        tracking_checks_after,
+                    )
+                    if not completed:
+                        _status(status_queue, "warm_start_cancelled")
+                        return
+                    tracking_checks_after = time.monotonic()
+                    holding = False
+                    _status(status_queue, "warm_started", warm_start.label)
+                    continue
+
+                if not isinstance(command, tuple) or len(command) != 6 or kind != "chunk":
+                    raise DeploymentError(f"Unexpected or malformed actuator command {kind!r}")
                 if chunk is not None:
                     raise DeploymentError("Received a new chunk before the prior chunk completed")
                 _, sequence, created_at, arm, left, right = command
-                if sequence <= last_sequence:
-                    raise DeploymentError(f"Stale/out-of-order action chunk {sequence}")
-                if time.monotonic() - created_at > CHUNK_MAX_AGE_S:
+                if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence != last_sequence + 1:
+                    raise DeploymentError(f"Stale/out-of-order action chunk {sequence!r}; expected {last_sequence + 1}")
+                try:
+                    chunk_age = time.monotonic() - float(created_at)
+                except (TypeError, ValueError) as exc:
+                    raise DeploymentError("Action chunk timestamp is invalid") from exc
+                if not np.isfinite(chunk_age) or not 0.0 <= chunk_age <= CHUNK_MAX_AGE_S:
                     raise DeploymentError(f"Action chunk {sequence} expired before execution")
                 state = backend.state()
                 proposed = ActionChunk(arm=arm, left_hand=left, right_hand=right)
@@ -803,7 +1277,8 @@ def _actuator_main(
                 chunk_sequence = int(sequence)
                 chunk_index = 0
                 next_action_at = time.monotonic()
-                last_sequence = int(sequence)
+                last_sequence = sequence
+                holding = False
 
             now = time.monotonic()
             if chunk is not None and now >= next_action_at:
@@ -825,17 +1300,7 @@ def _actuator_main(
 
             state = backend.state()
             if now >= tracking_checks_after:
-                arm_error = float(np.max(np.abs(state.arm - backend._arm_target)))
-                hand_error = float(
-                    max(
-                        np.max(np.abs(state.left_hand - backend._left_target)),
-                        np.max(np.abs(state.right_hand - backend._right_target)),
-                    )
-                )
-                if arm_error > MAX_ARM_TRACKING_ERROR_RAD:
-                    raise DeploymentError(f"Arm tracking error is {arm_error:.3f} rad")
-                if hand_error > MAX_HAND_TRACKING_ERROR_RAD:
-                    raise DeploymentError(f"Hand tracking error is {hand_error:.3f} rad")
+                _enforce_tracking(backend, state)
 
             backend.publish()
             elapsed = time.monotonic() - loop_started
@@ -877,6 +1342,13 @@ class SafeG1Dex3Actuator:
             name="groot-g1-dex3-actuator",
         )
         self._sequence = 0
+        self._started = False
+        self._armed = False
+        self._initialized = False
+        self._warm_started = False
+        self._holding = False
+        self._chunk_in_flight = False
+        self._pending_sequence: int | None = None
         self._closed = False
 
     def heartbeat(self) -> None:
@@ -895,32 +1367,108 @@ class SafeG1Dex3Actuator:
                 continue
             if kind == "fault":
                 raise DeploymentError(f"Actuator fault: {value}")
+            if kind == "release_failed":
+                raise DeploymentError(f"Actuator release failed: {value}")
+            if kind == "stopped":
+                raise DeploymentError("Actuator stopped before the requested operation completed")
             if kind == expected and (payload is None or value == payload):
                 return
         raise TimeoutError(f"Timed out waiting for actuator status '{expected}'")
 
     def start(self) -> None:
+        if self._started:
+            raise DeploymentError("Actuator has already been started")
         self._process.start()
         self._wait_status("ready", timeout_s=8.0)
+        self._started = True
 
     def arm(self) -> None:
+        if not self._started or self._armed:
+            raise DeploymentError("Actuator must be started exactly once before arming")
         self.heartbeat()
         self._command_queue.put(("arm",), timeout=0.2)
         self._wait_status("armed", timeout_s=ARM_AUTHORITY_RAMP_S + 3.0)
+        self._armed = True
+
+    def initialize(self, spec: InitializationSpec) -> None:
+        if not self._armed or self._initialized:
+            raise DeploymentError("Actuator must be armed and not yet initialized")
+        validate_initialization_spec(spec)
+        self.assert_healthy()
+        self.heartbeat()
+        try:
+            self._command_queue.put(("initialize", time.monotonic(), spec), timeout=0.2)
+        except queue.Full as exc:
+            raise DeploymentError("Actuator command queue is full; refusing initialization") from exc
+        self._wait_status(
+            "initialized",
+            timeout_s=(
+                INITIALIZATION_START_TIMEOUT_S
+                + INITIALIZATION_MAX_DURATION_S
+                + INITIALIZATION_CONVERGENCE_TIMEOUT_S
+                + 3.0
+            ),
+            payload=spec.mode,
+        )
+        self._initialized = True
+        self._holding = True
 
     def assert_healthy(self) -> None:
+        issue = None
+        try:
+            while True:
+                kind, value = self._status_queue.get_nowait()
+                if kind == "fault":
+                    issue = f"fault: {value}"
+                elif kind == "release_failed":
+                    issue = f"release failed: {value}"
+                elif kind == "stopped" and issue is None:
+                    issue = "stopped"
+        except queue.Empty:
+            pass
+        if issue is not None:
+            raise DeploymentError(f"Actuator process is unhealthy: {issue}")
         if not self._process.is_alive():
-            fault = None
-            try:
-                while True:
-                    kind, value = self._status_queue.get_nowait()
-                    if kind == "fault":
-                        fault = value
-            except queue.Empty:
-                pass
-            raise DeploymentError(f"Actuator process stopped{f': {fault}' if fault else ''}")
+            raise DeploymentError("Actuator process stopped")
+
+    def warm_start(self, chunk: ActionChunk) -> None:
+        """Smoothly reach a first policy target from an acknowledged hold."""
+
+        if not self._initialized or not self._holding or self._chunk_in_flight:
+            raise DeploymentError("Policy warm-start requires initialized HOLD with no chunk in flight")
+        validate_action_chunk(chunk, chunk.arm[0], chunk.left_hand[0], chunk.right_hand[0])
+        target = InitializationSpec(
+            mode="pose-file",
+            label="first policy target",
+            arm=np.ascontiguousarray(chunk.arm[0], dtype=np.float64),
+            left_hand=np.ascontiguousarray(chunk.left_hand[0], dtype=np.float64),
+            right_hand=np.ascontiguousarray(chunk.right_hand[0], dtype=np.float64),
+        )
+        validate_initialization_spec(target)
+        self.assert_healthy()
+        self.heartbeat()
+        try:
+            self._command_queue.put(("warm_start", time.monotonic(), target), timeout=0.2)
+        except queue.Full as exc:
+            raise DeploymentError("Actuator command queue is full; refusing policy warm-start") from exc
+        self._wait_status(
+            "warm_started",
+            timeout_s=(
+                INITIALIZATION_START_TIMEOUT_S
+                + INITIALIZATION_MAX_DURATION_S
+                + INITIALIZATION_CONVERGENCE_TIMEOUT_S
+                + 3.0
+            ),
+            payload=target.label,
+        )
+        self._warm_started = True
+        self._holding = False
 
     def submit(self, chunk: ActionChunk) -> int:
+        if not self._initialized:
+            raise DeploymentError("Actuator must complete initialization before policy actions")
+        if self._chunk_in_flight:
+            raise DeploymentError("A policy chunk is already in flight")
         self.assert_healthy()
         self._sequence += 1
         self.heartbeat()
@@ -936,10 +1484,36 @@ class SafeG1Dex3Actuator:
             self._command_queue.put(command, timeout=0.2)
         except queue.Full as exc:
             raise DeploymentError("Actuator command queue is full; refusing to buffer") from exc
+        self._chunk_in_flight = True
+        self._pending_sequence = self._sequence
+        self._holding = False
         return self._sequence
 
     def wait_completed(self, sequence: int, timeout_s: float) -> None:
+        if not self._chunk_in_flight or sequence != self._pending_sequence:
+            raise DeploymentError(f"Action chunk {sequence} is not the pending sequence")
         self._wait_status("completed", timeout_s=timeout_s, payload=sequence)
+        self._chunk_in_flight = False
+        self._pending_sequence = None
+
+    def hold(self) -> None:
+        """Capture the measured pose and keep publishing it under watchdog control."""
+
+        if not self._initialized:
+            raise DeploymentError("Actuator must complete initialization before HOLD")
+        if self._chunk_in_flight:
+            raise DeploymentError("Cannot enter HOLD before the current action chunk completes")
+        if self._holding:
+            return
+        self.assert_healthy()
+        self.heartbeat()
+        try:
+            self._command_queue.put(("hold", time.monotonic()), timeout=0.2)
+        except queue.Full as exc:
+            raise DeploymentError("Actuator command queue is full; refusing HOLD") from exc
+        self._wait_status("holding", timeout_s=1.0, payload=self._sequence)
+        self._holding = True
+        self._warm_started = False
 
     def close(self) -> None:
         if self._closed:

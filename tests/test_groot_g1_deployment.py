@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import io
+import json
+from pathlib import Path
 import queue
 import sys
+import tempfile
 from types import SimpleNamespace
 from types import ModuleType
 import threading
@@ -13,7 +17,19 @@ from unittest import mock
 import cv2
 import numpy as np
 
-from unitree_lerobot.eval_robot.eval_groot_g1 import validate_args
+from unitree_lerobot.eval_robot.eval_groot_g1 import (
+    _active_command_action,
+    _confirm_while_armed,
+    _confirm_goal_transition,
+    _select_next_goal_while_holding,
+    OperatorRelease,
+    build_parser,
+    confirm_custom_goal,
+    run as run_groot,
+    select_instruction,
+    show_camera_preview,
+    validate_args,
+)
 from unitree_lerobot.eval_robot.groot_client import DeploymentError, MsgSerializer
 from unitree_lerobot.eval_robot.groot_contract import (
     ACTION_KEYS,
@@ -24,8 +40,16 @@ from unitree_lerobot.eval_robot.groot_contract import (
     EXPECTED_EGO_VIEW_SHAPE,
     EXPECTED_JOINT_NAMES,
     EXPECTED_ROBOT_TYPE,
+    INITIAL_POSE_SCHEMA_VERSION,
+    JOINT_LIMIT_MARGIN_RAD,
+    HAND_LIMIT_TOLERANCE_RAD,
+    InitializationSpec,
+    MAX_ARM_STEP_RAD,
+    MAX_HAND_STEP_RAD,
+    MEASURED_LIMIT_TOLERANCE_RAD,
     RGBD_VIDEO_KEYS,
     TASKS,
+    load_initialization_spec,
     make_observation,
     parse_action_chunk,
     validate_model_contract,
@@ -49,6 +73,12 @@ else:
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     CameraImages,
     G1Dex3StateReader,
+    INITIALIZATION_MAX_ARM_STEP_RAD,
+    INITIALIZATION_MAX_HAND_STEP_RAD,
+    INITIALIZATION_MIN_MOVE_S,
+    MAX_ARM_TRACKING_ERROR_RAD,
+    MAX_HAND_TRACKING_ERROR_RAD,
+    PUBLISH_HZ,
     RobotState,
     SafeG1Dex3Actuator,
     SIM_RIGHT_HAND_PERMUTATION,
@@ -56,6 +86,9 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     TeleimagerColourCamera,
     _G1Dex3CommandBackend,
     _actuator_main,
+    _execute_initialization,
+    _wait_for_initialization_start,
+    build_initialization_chunk,
     decode_color_0_rgb,
     request_live_camera_config,
 )
@@ -107,6 +140,7 @@ class FakeBackend:
 
     def __init__(self, _simulation, _network_interface):
         type(self).instance = self
+        self.simulation = _simulation
         self.publishes = 0
         self.released = False
         self.closed = False
@@ -146,6 +180,887 @@ class FakeBackend:
 
 
 class GrootG1DeploymentTests(unittest.TestCase):
+    def test_policy_warm_start_is_default_with_explicit_opt_out(self):
+        parser = build_parser()
+        defaults = parser.parse_args([])
+        self.assertTrue(defaults.policy_warm_start)
+        self.assertFalse(defaults.show_camera)
+        validate_args(defaults)
+        self.assertFalse(parser.parse_args(["--no-policy-warm-start"]).policy_warm_start)
+        self.assertTrue(parser.parse_args(["--show-camera"]).show_camera)
+
+    def test_custom_goal_is_validated_and_mutually_exclusive_with_trained_task(self):
+        parser = build_parser()
+        args = parser.parse_args(["--custom-goal", "  move the cup beside the cylinder.  "])
+        self.assertEqual(
+            select_instruction(args.task, args.custom_goal),
+            ("custom-goal", "move the cup beside the cylinder."),
+        )
+        with self.assertRaisesRegex(DeploymentError, "printable"):
+            select_instruction(None, "bad\ngoal")
+        with mock.patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["--task", "pick-red-cup", "--custom-goal", "another goal"])
+
+        with mock.patch("builtins.input", return_value="YES"):
+            confirm_custom_goal("move the cup beside the cylinder")
+        for response in ("yes", "NO", ""):
+            with (
+                self.subTest(response=response),
+                mock.patch("builtins.input", return_value=response),
+                self.assertRaisesRegex(DeploymentError, "not confirmed"),
+            ):
+                confirm_custom_goal("move the cup beside the cylinder")
+
+        measured = load_initialization_spec("measured", task_name="custom-goal")
+        self.assertEqual(measured.mode, "measured")
+        with self.assertRaisesRegex(DeploymentError, "exact trained tasks"):
+            load_initialization_spec(
+                "pose-file",
+                task_name="custom-goal",
+                pose_file="/does/not/matter.json",
+            )
+
+    def test_camera_preview_shows_exact_policy_rgb_and_depth_views(self):
+        rgb = np.array([[[1, 2, 3], [4, 5, 6]]], dtype=np.uint8)
+        depth = np.array([[[7, 8, 9], [10, 11, 12]]], dtype=np.uint8)
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        with (
+            mock.patch(f"{module}.cv2.imshow") as imshow,
+            mock.patch(f"{module}.cv2.waitKey", return_value=-1),
+        ):
+            show_camera_preview(rgb, depth)
+
+        self.assertEqual(
+            [call.args[0] for call in imshow.call_args_list],
+            ["GR00T input: ego_view", "GR00T input: depth_gray_view"],
+        )
+        np.testing.assert_array_equal(imshow.call_args_list[0].args[1], rgb[..., ::-1])
+        np.testing.assert_array_equal(imshow.call_args_list[1].args[1], depth[..., ::-1])
+
+    def test_camera_preview_q_requests_normal_runner_cleanup(self):
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        with (
+            mock.patch(f"{module}.cv2.imshow"),
+            mock.patch(f"{module}.cv2.waitKey", return_value=ord("q")),
+            self.assertRaisesRegex(DeploymentError, "closed by user"),
+        ):
+            show_camera_preview(np.zeros((1, 1, 3), dtype=np.uint8), None)
+
+    def test_deployment_safety_defaults_are_not_relaxed(self):
+        self.assertEqual(MAX_ARM_STEP_RAD, 0.05)
+        self.assertEqual(MAX_HAND_STEP_RAD, 0.10)
+        self.assertEqual(JOINT_LIMIT_MARGIN_RAD, 0.03)
+        self.assertEqual(HAND_LIMIT_TOLERANCE_RAD, 0.002)
+        self.assertEqual(MEASURED_LIMIT_TOLERANCE_RAD, 0.01)
+        self.assertEqual(MAX_ARM_TRACKING_ERROR_RAD, 0.35)
+        self.assertEqual(MAX_HAND_TRACKING_ERROR_RAD, 0.50)
+
+    def _write_initial_pose(self, directory: str, **overrides):
+        payload = {
+            "schema_version": INITIAL_POSE_SCHEMA_VERSION,
+            "name": "reviewed pick start",
+            "robot_type": EXPECTED_ROBOT_TYPE,
+            "task": "pick-red-cup",
+            "instruction": TASKS["pick-red-cup"],
+            "joint_names": EXPECTED_JOINT_NAMES,
+            "arm": [0.0] * 14,
+            "hands": {"policy": "measured"},
+            "source": {
+                "dataset_path": "/datasets/combined_atomic_only/train",
+                "episode_index": 7,
+                "frame_index": 0,
+            },
+        }
+        payload.update(overrides)
+        path = Path(directory) / "initial_pose.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_initialization_modes_have_explicit_target_semantics(self):
+        measured = load_initialization_spec("measured", task_name="pick-red-cup")
+        self.assertIsInstance(measured, InitializationSpec)
+        self.assertEqual(measured.mode, "measured")
+        self.assertFalse(measured.moves)
+        self.assertIsNone(measured.arm)
+        self.assertIsNone(measured.left_hand)
+        self.assertIsNone(measured.right_hand)
+
+        xr_home = load_initialization_spec("xr-home", task_name="pick-red-cup")
+        self.assertEqual(xr_home.mode, "xr-home")
+        self.assertTrue(xr_home.moves)
+        self.assertTrue(xr_home.moves_hands)
+        np.testing.assert_array_equal(xr_home.arm, np.zeros(14))
+        np.testing.assert_array_equal(xr_home.left_hand, np.zeros(7))
+        np.testing.assert_array_equal(xr_home.right_hand, np.zeros(7))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_initial_pose(directory)
+            pose = load_initialization_spec("pose-file", task_name="pick-red-cup", pose_file=path)
+
+        self.assertEqual(pose.mode, "pose-file")
+        np.testing.assert_array_equal(pose.arm, np.zeros(14))
+        self.assertIsNone(pose.left_hand)
+        self.assertIsNone(pose.right_hand)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_initial_pose(
+                directory,
+                hands={"policy": "explicit", "left": [0.0] * 7, "right": [0.0] * 7},
+            )
+            explicit_hands = load_initialization_spec(
+                "pose-file",
+                task_name="pick-red-cup",
+                pose_file=path,
+            )
+        np.testing.assert_array_equal(explicit_hands.left_hand, np.zeros(7))
+        np.testing.assert_array_equal(explicit_hands.right_hand, np.zeros(7))
+
+    def test_initialization_spec_arguments_are_mutually_consistent(self):
+        with self.assertRaisesRegex(DeploymentError, "requires.*pose"):
+            load_initialization_spec("pose-file", task_name="pick-red-cup")
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_initial_pose(directory)
+            with self.assertRaisesRegex(DeploymentError, "valid only.*pose-file"):
+                load_initialization_spec("measured", task_name="pick-red-cup", pose_file=path)
+
+    def test_pose_file_requires_explicit_complete_and_matching_contract(self):
+        invalid_overrides = {
+            "missing explicit left hand": {"hands": {"policy": "explicit", "right": [0.0] * 7}},
+            "mixed measured/explicit hands": {"hands": {"policy": "measured", "left": [0.0] * 7}},
+            "wrong task": {"task": "put-red-cup"},
+            "wrong robot": {"robot_type": "another_robot"},
+            "wrong joint order": {"joint_names": list(reversed(EXPECTED_JOINT_NAMES))},
+            "wrong arm shape": {"arm": [0.0] * 13},
+            "non-finite hand": {
+                "hands": {
+                    "policy": "explicit",
+                    "left": [0.0] * 7,
+                    "right": [float("nan")] + [0.0] * 6,
+                }
+            },
+            "out-of-range arm": {"arm": [100.0] + [0.0] * 13},
+            "non-absolute dataset": {
+                "source": {
+                    "dataset_path": "relative/train",
+                    "episode_index": 7,
+                    "frame_index": 0,
+                }
+            },
+            "non-start frame": {
+                "source": {
+                    "dataset_path": "/datasets/train",
+                    "episode_index": 7,
+                    "frame_index": 1,
+                }
+            },
+        }
+        for case, overrides in invalid_overrides.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                path = self._write_initial_pose(directory, **overrides)
+                with self.assertRaises(DeploymentError):
+                    load_initialization_spec("pose-file", task_name="pick-red-cup", pose_file=path)
+
+    def test_pose_file_rejects_duplicate_keys_at_every_json_depth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_initial_pose(directory)
+            document = path.read_text(encoding="utf-8")
+            duplicate_root = document.replace(
+                '"name": "reviewed pick start"',
+                '"name": "first", "name": "second"',
+                1,
+            )
+            path.write_text(duplicate_root, encoding="utf-8")
+            with self.assertRaisesRegex(DeploymentError, "duplicate field 'name'"):
+                load_initialization_spec("pose-file", task_name="pick-red-cup", pose_file=path)
+
+            path = self._write_initial_pose(directory)
+            document = path.read_text(encoding="utf-8")
+            duplicate_nested = document.replace(
+                '"episode_index": 7',
+                '"episode_index": 7, "episode_index": 8',
+                1,
+            )
+            path.write_text(duplicate_nested, encoding="utf-8")
+            with self.assertRaisesRegex(DeploymentError, "duplicate field 'episode_index'"):
+                load_initialization_spec("pose-file", task_name="pick-red-cup", pose_file=path)
+
+    def test_initialization_path_is_bounded_and_reaches_every_explicit_target(self):
+        state = RobotState(
+            captured_at=time.monotonic(),
+            mode_machine=5,
+            arm=np.full(14, 0.2),
+            arm_dq=np.zeros(14),
+            left_hand=np.array([0.2, 0.2, 0.2, -0.2, -0.2, -0.2, -0.2]),
+            right_hand=np.array([0.2, 0.2, -0.2, 0.2, 0.2, 0.2, 0.2]),
+        )
+        spec = load_initialization_spec("xr-home", task_name="pick-red-cup")
+
+        path = build_initialization_chunk(state, spec)
+
+        self.assertGreater(path.length, 1)
+        self.assertGreaterEqual(path.length, round(INITIALIZATION_MIN_MOVE_S * PUBLISH_HZ))
+        np.testing.assert_array_equal(path.arm[-1], spec.arm)
+        np.testing.assert_array_equal(path.left_hand[-1], spec.left_hand)
+        np.testing.assert_array_equal(path.right_hand[-1], spec.right_hand)
+        arm_steps = np.diff(np.vstack((state.arm, path.arm)), axis=0)
+        left_steps = np.diff(np.vstack((state.left_hand, path.left_hand)), axis=0)
+        right_steps = np.diff(np.vstack((state.right_hand, path.right_hand)), axis=0)
+        self.assertLessEqual(float(np.max(np.abs(arm_steps))), INITIALIZATION_MAX_ARM_STEP_RAD + 1e-12)
+        self.assertLessEqual(float(np.max(np.abs(left_steps))), INITIALIZATION_MAX_HAND_STEP_RAD + 1e-12)
+        self.assertLessEqual(float(np.max(np.abs(right_steps))), INITIALIZATION_MAX_HAND_STEP_RAD + 1e-12)
+
+    def test_measured_initialization_and_measured_hand_targets_do_not_move(self):
+        state = RobotState(
+            captured_at=time.monotonic(),
+            mode_machine=5,
+            arm=np.linspace(-0.1, 0.1, 14),
+            arm_dq=np.zeros(14),
+            left_hand=np.array([0.1, 0.1, 0.1, -0.1, -0.1, -0.1, -0.1]),
+            right_hand=np.array([0.1, 0.1, -0.1, 0.1, 0.1, 0.1, 0.1]),
+        )
+        measured = load_initialization_spec("measured", task_name="pick-red-cup")
+        measured_path = build_initialization_chunk(state, measured)
+        np.testing.assert_array_equal(measured_path.arm, state.arm[None])
+        np.testing.assert_array_equal(measured_path.left_hand, state.left_hand[None])
+        np.testing.assert_array_equal(measured_path.right_hand, state.right_hand[None])
+
+        with tempfile.TemporaryDirectory() as directory:
+            pose_file = self._write_initial_pose(directory, arm=[0.0] * 14)
+            pose = load_initialization_spec("pose-file", task_name="pick-red-cup", pose_file=pose_file)
+        pose_path = build_initialization_chunk(state, pose)
+        np.testing.assert_array_equal(pose_path.left_hand, np.repeat(state.left_hand[None], pose_path.length, axis=0))
+        np.testing.assert_array_equal(
+            pose_path.right_hand,
+            np.repeat(state.right_hand[None], pose_path.length, axis=0),
+        )
+
+    def test_live_run_discards_preflight_and_infers_fresh_only_after_run_confirmation(self):
+        events = []
+        initial_step_checks = []
+        preflight = SimpleNamespace(length=1, name="discarded-preflight")
+        live = SimpleNamespace(length=1, name="fresh-live")
+
+        class FakePolicy:
+            resets = 0
+
+            def ping(self):
+                return True
+
+            def get_modality_config(self):
+                return {}
+
+            def get_policy_metadata(self):
+                return {}
+
+            def reset(self):
+                self.resets += 1
+                events.append(f"policy.reset:{self.resets}")
+
+            def close(self):
+                events.append("policy.close")
+
+        class FakeReader:
+            def close(self):
+                events.append("reader.close")
+
+        class FakeCamera:
+            config = {
+                "head_camera": {
+                    "type": "fake",
+                    "image_shape": [480, 640],
+                    "binocular": False,
+                    "fps": 30,
+                }
+            }
+
+            def close(self):
+                events.append("camera.close")
+
+        class FakeActuator:
+            def start(self):
+                events.append("actuator.start")
+
+            def arm(self):
+                events.append("actuator.arm")
+
+            def initialize(self, spec):
+                events.append(f"actuator.initialize:{spec.mode}")
+
+            def submit(self, chunk):
+                events.append(f"actuator.submit:{chunk.name}")
+                return 1
+
+            def wait_completed(self, sequence, timeout_s):
+                events.append(f"actuator.completed:{sequence}")
+
+            def close(self):
+                events.append("actuator.close")
+
+        inferred = iter((preflight, live))
+
+        def fake_infer(*_args, **kwargs):
+            chunk = next(inferred)
+            initial_step_checks.append(kwargs.get("validate_initial_step", True))
+            events.append(f"infer:{chunk.name}")
+            return chunk, 0.01
+
+        args = argparse.Namespace(
+            task="pick-red-cup",
+            policy_host="127.0.0.1",
+            policy_port=5555,
+            image_host="camera",
+            network_interface=None,
+            execution_horizon=1,
+            max_chunks=1,
+            initialization="xr-home",
+            initial_pose_file=None,
+            sim=True,
+            actuate=True,
+            allow_unqualified_real=False,
+            confirm_sim_network_isolated=True,
+        )
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        contract = SimpleNamespace(action_horizon=16, video_keys=COLOUR_VIDEO_KEYS, requires_depth=False)
+        with (
+            mock.patch(f"{module}.Gr00tClient", return_value=FakePolicy()),
+            mock.patch(f"{module}.validate_model_contract", return_value=contract),
+            mock.patch(f"{module}.validate_policy_metadata", return_value=None),
+            mock.patch(f"{module}.initialize_dds", side_effect=lambda *_args: events.append("dds.init")),
+            mock.patch(f"{module}.G1Dex3StateReader", return_value=FakeReader()),
+            mock.patch(f"{module}.TeleimagerCamera", return_value=FakeCamera()),
+            mock.patch(f"{module}.SafeG1Dex3Actuator", return_value=FakeActuator()),
+            mock.patch(f"{module}.infer_chunk", side_effect=fake_infer),
+            mock.patch(f"{module}.chunk_delta_summary", return_value="safe"),
+            mock.patch(f"{module}.confirm_actuation", side_effect=lambda *_args: events.append("confirm.ACTUATE")),
+            mock.patch(
+                f"{module}.confirm_initialization",
+                side_effect=lambda *_args: events.append("confirm.INITIALIZE"),
+            ),
+            mock.patch(f"{module}.confirm_policy_start", side_effect=lambda *_args: events.append("confirm.RUN")),
+        ):
+            run_groot(args)
+
+        self.assertEqual(events.count("infer:discarded-preflight"), 1)
+        self.assertEqual(events.count("infer:fresh-live"), 1)
+        self.assertEqual(initial_step_checks, [False, True])
+        self.assertNotIn("actuator.submit:discarded-preflight", events)
+        ordered = [
+            "infer:discarded-preflight",
+            "confirm.ACTUATE",
+            "actuator.start",
+            "actuator.arm",
+            "confirm.INITIALIZE",
+            "actuator.initialize:xr-home",
+            "confirm.RUN",
+            "policy.reset:2",
+            "infer:fresh-live",
+            "actuator.submit:fresh-live",
+        ]
+        positions = [events.index(event) for event in ordered]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_policy_warm_start_smoothly_reaches_first_target_then_resets_and_reinfers(self):
+        events = []
+        initial_step_checks = []
+        preflight = SimpleNamespace(length=1, name="discarded-preflight")
+        warm_start = SimpleNamespace(length=1, name="discarded-warm-start")
+        live = SimpleNamespace(length=1, name="fresh-live")
+
+        class FakePolicy:
+            resets = 0
+
+            def ping(self):
+                return True
+
+            def get_modality_config(self):
+                return {}
+
+            def get_policy_metadata(self):
+                return {}
+
+            def reset(self):
+                self.resets += 1
+                events.append(f"policy.reset:{self.resets}")
+
+            def close(self):
+                events.append("policy.close")
+
+        class FakeReader:
+            def close(self):
+                events.append("reader.close")
+
+        class FakeCamera:
+            config = {
+                "head_camera": {
+                    "type": "fake",
+                    "image_shape": [480, 640],
+                    "binocular": False,
+                    "fps": 30,
+                }
+            }
+
+            def close(self):
+                events.append("camera.close")
+
+        class FakeActuator:
+            def start(self):
+                events.append("actuator.start")
+
+            def arm(self):
+                events.append("actuator.arm")
+
+            def initialize(self, spec):
+                events.append(f"actuator.initialize:{spec.mode}")
+
+            def warm_start(self, chunk):
+                events.append(f"actuator.warm_start:{chunk.name}")
+
+            def submit(self, chunk):
+                events.append(f"actuator.submit:{chunk.name}")
+                return 1
+
+            def wait_completed(self, sequence, timeout_s):
+                events.append(f"actuator.completed:{sequence}")
+
+            def close(self):
+                events.append("actuator.close")
+
+        inferred = iter((preflight, warm_start, live))
+
+        def fake_infer(*_args, **kwargs):
+            chunk = next(inferred)
+            initial_step_checks.append(kwargs.get("validate_initial_step", True))
+            events.append(f"infer:{chunk.name}")
+            return chunk, 0.01
+
+        args = argparse.Namespace(
+            task="pick-red-cup",
+            policy_host="127.0.0.1",
+            policy_port=5555,
+            image_host="camera",
+            network_interface=None,
+            execution_horizon=1,
+            max_chunks=1,
+            initialization="measured",
+            initial_pose_file=None,
+            policy_warm_start=True,
+            sim=True,
+            actuate=True,
+            allow_unqualified_real=False,
+            confirm_sim_network_isolated=True,
+        )
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        contract = SimpleNamespace(action_horizon=16, video_keys=COLOUR_VIDEO_KEYS, requires_depth=False)
+        with (
+            mock.patch(f"{module}.Gr00tClient", return_value=FakePolicy()),
+            mock.patch(f"{module}.validate_model_contract", return_value=contract),
+            mock.patch(f"{module}.validate_policy_metadata", return_value=None),
+            mock.patch(f"{module}.initialize_dds", side_effect=lambda *_args: events.append("dds.init")),
+            mock.patch(f"{module}.G1Dex3StateReader", return_value=FakeReader()),
+            mock.patch(f"{module}.TeleimagerCamera", return_value=FakeCamera()),
+            mock.patch(f"{module}.SafeG1Dex3Actuator", return_value=FakeActuator()),
+            mock.patch(f"{module}.infer_chunk", side_effect=fake_infer),
+            mock.patch(f"{module}.chunk_delta_summary", return_value="large first target"),
+            mock.patch(f"{module}.confirm_actuation", side_effect=lambda *_args: events.append("confirm.ACTUATE")),
+            mock.patch(
+                f"{module}.confirm_initialization", side_effect=lambda *_args: events.append("confirm.INITIALIZE")
+            ),
+            mock.patch(f"{module}.confirm_policy_start", side_effect=lambda *_args: events.append("confirm.RUN")),
+            mock.patch(
+                f"{module}.confirm_policy_warm_start",
+                side_effect=lambda *_args: events.append("confirm.WARMSTART"),
+            ),
+            mock.patch(f"{module}.confirm_policy_resume", side_effect=lambda *_args: events.append("confirm.RESUME")),
+        ):
+            run_groot(args)
+
+        self.assertEqual(initial_step_checks, [False, False, True])
+        self.assertNotIn("actuator.submit:discarded-preflight", events)
+        self.assertNotIn("actuator.submit:discarded-warm-start", events)
+        ordered = [
+            "confirm.RUN",
+            "policy.reset:2",
+            "infer:discarded-warm-start",
+            "confirm.WARMSTART",
+            "actuator.warm_start:discarded-warm-start",
+            "confirm.RESUME",
+            "policy.reset:3",
+            "infer:fresh-live",
+            "actuator.submit:fresh-live",
+        ]
+        positions = [events.index(event) for event in ordered]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_live_runner_holds_then_warm_starts_a_second_goal(self):
+        events = []
+        initial_step_checks = []
+        chunks = iter(
+            SimpleNamespace(length=1, name=name)
+            for name in (
+                "discarded-preflight",
+                "pick-warm-start",
+                "pick-live",
+                "put-warm-start",
+                "put-live",
+            )
+        )
+
+        class FakePolicy:
+            def __init__(self):
+                self.resets = 0
+
+            def ping(self):
+                return True
+
+            def get_modality_config(self):
+                return {}
+
+            def get_policy_metadata(self):
+                return {}
+
+            def reset(self):
+                self.resets += 1
+                events.append(f"policy.reset:{self.resets}")
+
+            def close(self):
+                events.append("policy.close")
+
+        class FakeReader:
+            def close(self):
+                events.append("reader.close")
+
+        class FakeCamera:
+            config = {
+                "head_camera": {
+                    "type": "fake",
+                    "image_shape": [480, 640],
+                    "binocular": False,
+                    "fps": 30,
+                }
+            }
+
+            def close(self):
+                events.append("camera.close")
+
+        class FakeActuator:
+            def __init__(self):
+                self.sequence = 0
+
+            def start(self):
+                events.append("actuator.start")
+
+            def arm(self):
+                events.append("actuator.arm")
+
+            def initialize(self, spec):
+                events.append(f"actuator.initialize:{spec.mode}")
+
+            def warm_start(self, chunk):
+                events.append(f"actuator.warm_start:{chunk.name}")
+
+            def submit(self, chunk):
+                self.sequence += 1
+                events.append(f"actuator.submit:{chunk.name}:{self.sequence}")
+                return self.sequence
+
+            def wait_completed(self, sequence, timeout_s):
+                events.append(f"actuator.completed:{sequence}")
+
+            def hold(self):
+                events.append("actuator.hold")
+
+            def close(self):
+                events.append("actuator.close")
+
+        def fake_infer(*_args, **kwargs):
+            chunk = next(chunks)
+            initial_step_checks.append(kwargs.get("validate_initial_step", True))
+            events.append(f"infer:{chunk.name}")
+            return chunk, 0.01
+
+        args = argparse.Namespace(
+            task="pick-red-cup",
+            custom_goal=None,
+            policy_host="127.0.0.1",
+            policy_port=5555,
+            image_host="camera",
+            network_interface=None,
+            execution_horizon=1,
+            max_chunks=1,
+            initialization="measured",
+            initial_pose_file=None,
+            policy_warm_start=True,
+            show_camera=False,
+            sim=True,
+            actuate=True,
+            allow_unqualified_real=False,
+            confirm_sim_network_isolated=True,
+        )
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        contract = SimpleNamespace(action_horizon=16, video_keys=COLOUR_VIDEO_KEYS, requires_depth=False)
+        with (
+            mock.patch(f"{module}.Gr00tClient", side_effect=lambda *_args: FakePolicy()),
+            mock.patch(f"{module}.validate_model_contract", return_value=contract),
+            mock.patch(f"{module}.validate_policy_metadata", return_value=None),
+            mock.patch(f"{module}.initialize_dds"),
+            mock.patch(f"{module}.G1Dex3StateReader", return_value=FakeReader()),
+            mock.patch(f"{module}.TeleimagerCamera", return_value=FakeCamera()),
+            mock.patch(f"{module}.SafeG1Dex3Actuator", side_effect=lambda *_args: FakeActuator()),
+            mock.patch(f"{module}.infer_chunk", side_effect=fake_infer),
+            mock.patch(f"{module}.chunk_delta_summary", return_value="bounded"),
+            mock.patch(f"{module}.confirm_actuation"),
+            mock.patch(f"{module}.confirm_initialization"),
+            mock.patch(f"{module}.confirm_policy_start"),
+            mock.patch(f"{module}.confirm_policy_warm_start"),
+            mock.patch(f"{module}.confirm_policy_resume"),
+            mock.patch(
+                f"{module}._poll_active_command",
+                side_effect=(None, None, "hold", None, None, None),
+            ),
+            mock.patch(
+                f"{module}._select_next_goal_while_holding",
+                return_value=("put-red-cup", TASKS["put-red-cup"]),
+            ),
+        ):
+            run_groot(args)
+
+        self.assertEqual(initial_step_checks, [False, False, True, False, True])
+        ordered = [
+            "infer:discarded-preflight",
+            "infer:pick-warm-start",
+            "actuator.warm_start:pick-warm-start",
+            "infer:pick-live",
+            "actuator.submit:pick-live:1",
+            "actuator.completed:1",
+            "actuator.hold",
+            "infer:put-warm-start",
+            "actuator.warm_start:put-warm-start",
+            "infer:put-live",
+            "actuator.submit:put-live:2",
+            "actuator.completed:2",
+            "actuator.close",
+        ]
+        positions = [events.index(event) for event in ordered]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("actuator.submit:discarded-preflight:1", events)
+        self.assertNotIn("actuator.submit:pick-warm-start:1", events)
+        self.assertNotIn("actuator.submit:put-warm-start:2", events)
+
+    def test_preflight_keeps_initial_step_validation_for_shadow_and_measured_live_runs(self):
+        class StopAfterPreflight(Exception):
+            pass
+
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        contract = SimpleNamespace(
+            action_horizon=16,
+            video_keys=COLOUR_VIDEO_KEYS,
+            requires_depth=False,
+        )
+        for name, actuate, initialization in (
+            ("shadow measured hold", False, "measured"),
+            ("live measured hold", True, "measured"),
+        ):
+            with self.subTest(name=name):
+                checks = []
+                policy = SimpleNamespace(
+                    ping=lambda: True,
+                    get_modality_config=lambda: {},
+                    get_policy_metadata=lambda: {},
+                    reset=lambda: None,
+                    close=lambda: None,
+                )
+                reader = SimpleNamespace(close=lambda: None)
+                camera = SimpleNamespace(
+                    config={
+                        "head_camera": {
+                            "type": "fake",
+                            "image_shape": [480, 640],
+                            "binocular": False,
+                            "fps": 30,
+                        }
+                    },
+                    close=lambda: None,
+                )
+
+                def record_preflight(*_args, **kwargs):
+                    checks.append(kwargs.get("validate_initial_step", True))
+                    return SimpleNamespace(length=1), 0.01
+
+                args = argparse.Namespace(
+                    task="pick-red-cup",
+                    policy_host="127.0.0.1",
+                    policy_port=5555,
+                    image_host="camera",
+                    network_interface=None,
+                    execution_horizon=1,
+                    max_chunks=1,
+                    initialization=initialization,
+                    initial_pose_file=None,
+                    sim=True,
+                    actuate=actuate,
+                    allow_unqualified_real=False,
+                    confirm_sim_network_isolated=actuate,
+                )
+                confirmation = StopAfterPreflight() if actuate else None
+                with (
+                    mock.patch(f"{module}.Gr00tClient", return_value=policy),
+                    mock.patch(f"{module}.validate_model_contract", return_value=contract),
+                    mock.patch(f"{module}.validate_policy_metadata", return_value=None),
+                    mock.patch(f"{module}.initialize_dds"),
+                    mock.patch(f"{module}.G1Dex3StateReader", return_value=reader),
+                    mock.patch(f"{module}.TeleimagerCamera", return_value=camera),
+                    mock.patch(f"{module}.infer_chunk", side_effect=record_preflight),
+                    mock.patch(f"{module}.chunk_delta_summary", return_value="safe"),
+                    mock.patch(f"{module}.confirm_actuation", side_effect=confirmation),
+                ):
+                    if actuate:
+                        with self.assertRaises(StopAfterPreflight):
+                            run_groot(args)
+                    else:
+                        run_groot(args)
+
+                self.assertEqual(checks, [True])
+
+    def test_armed_confirmation_keeps_watchdog_alive_and_accepts_only_exact_input(self):
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+        )
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        stdin = io.StringIO("RUN\n")
+        with (
+            mock.patch.object(sys, "stdin", stdin),
+            mock.patch(
+                f"{module}.select.select",
+                side_effect=[([], [], []), ([stdin], [], [])],
+            ),
+            mock.patch("builtins.print"),
+        ):
+            _confirm_while_armed(actuator, "ready", "RUN")
+
+        self.assertEqual(actuator.heartbeat.call_count, 2)
+        self.assertEqual(actuator.assert_healthy.call_count, 2)
+
+        stdin = io.StringIO("h\nRUN\n")
+        with (
+            mock.patch.object(sys, "stdin", stdin),
+            mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
+            mock.patch("builtins.print"),
+        ):
+            _confirm_while_armed(actuator, "ready", "RUN")
+
+        stdin = io.StringIO("q\n")
+        with (
+            mock.patch.object(sys, "stdin", stdin),
+            mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
+            mock.patch("builtins.print"),
+            self.assertRaises(OperatorRelease),
+        ):
+            _confirm_while_armed(actuator, "ready", "RUN")
+
+        stdin = io.StringIO("run\n")
+        with (
+            mock.patch.object(sys, "stdin", stdin),
+            mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
+            mock.patch("builtins.print"),
+            self.assertRaisesRegex(DeploymentError, "Expected RUN"),
+        ):
+            _confirm_while_armed(actuator, "ready", "RUN")
+
+    def test_armed_confirmation_timeout_releases_control_flow_without_reading_stdin(self):
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+        )
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        select_mock = mock.Mock()
+        with (
+            mock.patch(f"{module}.OPERATOR_CONFIRMATION_TIMEOUT_S", 0.0),
+            mock.patch(f"{module}.select.select", select_mock),
+            mock.patch("builtins.print"),
+            self.assertRaisesRegex(DeploymentError, "Timed out waiting for RUN"),
+        ):
+            _confirm_while_armed(actuator, "ready", "RUN")
+
+        actuator.heartbeat.assert_called_once_with()
+        actuator.assert_healthy.assert_called_once_with()
+        select_mock.assert_not_called()
+
+    def test_active_terminal_commands_distinguish_powered_hold_from_release(self):
+        for command in ("hold", "HOLD", "h", "H"):
+            with self.subTest(command=command):
+                self.assertEqual(_active_command_action(command), "hold")
+        for command in ("quit", "QUIT", "q", "Q"):
+            with self.subTest(command=command):
+                self.assertEqual(_active_command_action(command), "release")
+        for command in (None, "", "finished", "pick-red-cup"):
+            with self.subTest(command=command):
+                self.assertIsNone(_active_command_action(command))
+
+    def test_goal_transition_prompts_honor_global_hold_and_release_commands(self):
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        actuator = SimpleNamespace(hold=mock.Mock())
+        for response, expected in (("WARMSTART", "continue"), ("h", "hold"), ("q", "release")):
+            with (
+                self.subTest(response=response),
+                mock.patch(f"{module}._readline_while_armed", return_value=response),
+                mock.patch("builtins.print"),
+            ):
+                self.assertEqual(
+                    _confirm_goal_transition(actuator, "transition", "WARMSTART"),
+                    expected,
+                )
+        actuator.hold.assert_called_once_with()
+
+    def test_held_goal_selector_services_heartbeat_and_rejects_unconfirmed_custom_text(self):
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+        )
+        # Stay in HOLD for an explicit h, reject one custom instruction, then
+        # choose the second trained task by its displayed number.
+        stdin = io.StringIO("h\nmove it somewhere novel\nNO\n2\n")
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        with (
+            mock.patch.object(sys, "stdin", stdin),
+            mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
+            mock.patch("builtins.print"),
+        ):
+            selected = _select_next_goal_while_holding(actuator)
+
+        expected_name = list(TASKS)[1]
+        self.assertEqual(selected, (expected_name, TASKS[expected_name]))
+        self.assertEqual(actuator.heartbeat.call_count, 4)
+        self.assertEqual(actuator.assert_healthy.call_count, 4)
+
+        release_actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+        )
+        stdin = io.StringIO("q\n")
+        with (
+            mock.patch.object(sys, "stdin", stdin),
+            mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
+            mock.patch("builtins.print"),
+        ):
+            self.assertIsNone(_select_next_goal_while_holding(release_actuator))
+        release_actuator.heartbeat.assert_called_once_with()
+        release_actuator.assert_healthy.assert_called_once_with()
+
+        custom_release_actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+        )
+        stdin = io.StringIO("move it somewhere novel\nq\n")
+        with (
+            mock.patch.object(sys, "stdin", stdin),
+            mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
+            mock.patch("builtins.print"),
+        ):
+            self.assertIsNone(_select_next_goal_while_holding(custom_release_actuator))
+        self.assertEqual(custom_release_actuator.heartbeat.call_count, 2)
+        self.assertEqual(custom_release_actuator.assert_healthy.call_count, 2)
+
     def test_serializer_is_compatible_with_gr00t_server(self):
         try:
             from gr00t.policy.server_client import MsgSerializer as ServerSerializer
@@ -389,6 +1304,27 @@ class GrootG1DeploymentTests(unittest.TestCase):
             [[TASKS["pick-red-cup"]]],
         )
 
+        with self.assertRaisesRegex(DeploymentError, "allowlist"):
+            make_observation(
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros(14),
+                np.zeros(7),
+                np.zeros(7),
+                "pick up the cylinder",
+            )
+        custom = make_observation(
+            np.zeros((480, 640, 3), dtype=np.uint8),
+            np.zeros(14),
+            np.zeros(7),
+            np.zeros(7),
+            "pick up the cylinder",
+            allow_custom_instruction=True,
+        )
+        self.assertEqual(
+            custom["language"]["annotation.human.task_description"],
+            [["pick up the cylinder"]],
+        )
+
     def test_rgbd_observation_contains_exactly_the_two_checkpoint_views(self):
         depth = np.full((480, 640, 3), 42, dtype=np.uint8)
         observation = make_observation(
@@ -446,6 +1382,35 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
         with self.assertRaisesRegex(DeploymentError, "jump is too large"):
             parse_action_chunk(action, 16, 8, np.zeros(14), np.zeros(7), np.zeros(7))
+
+    def test_discarded_preflight_may_skip_only_the_unexecuted_initial_jump(self):
+        action = valid_action()
+        action["right_arm"][0, :, 0] = 0.20
+
+        chunk = parse_action_chunk(
+            action,
+            16,
+            8,
+            np.zeros(14),
+            np.zeros(7),
+            np.zeros(7),
+            validate_initial_step=False,
+        )
+
+        np.testing.assert_array_equal(chunk.right_hand, np.zeros((8, 7)))
+        self.assertAlmostEqual(chunk.arm[0, 7], 0.20)
+
+        action["right_arm"][0, 1, 0] = 0.30
+        with self.assertRaisesRegex(DeploymentError, "jump is too large"):
+            parse_action_chunk(
+                action,
+                16,
+                8,
+                np.zeros(14),
+                np.zeros(7),
+                np.zeros(7),
+                validate_initial_step=False,
+            )
 
     def test_action_parser_rejects_invalid_unexecuted_tail(self):
         action = valid_action()
@@ -1011,6 +1976,714 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertEqual(FakeBackend.instance.publishes, 0)
         self.assertTrue(FakeBackend.instance.closed)
 
+    def test_actuator_rejects_policy_chunks_until_initialization_completes(self):
+        actuator = object.__new__(SafeG1Dex3Actuator)
+        actuator._initialized = False
+        actuator._command_queue = queue.Queue(maxsize=1)
+
+        with self.assertRaisesRegex(DeploymentError, "complete initialization"):
+            actuator.submit(
+                SimpleNamespace(
+                    arm=np.zeros((1, 14)),
+                    left_hand=np.zeros((1, 7)),
+                    right_hand=np.zeros((1, 7)),
+                )
+            )
+
+        self.assertTrue(actuator._command_queue.empty())
+
+    def test_parent_hold_is_acknowledged_idempotent_and_forbidden_during_a_chunk(self):
+        actuator = object.__new__(SafeG1Dex3Actuator)
+        actuator._initialized = True
+        actuator._holding = False
+        actuator._chunk_in_flight = False
+        actuator._warm_started = True
+        actuator._sequence = 7
+        actuator._command_queue = queue.Queue(maxsize=1)
+
+        with (
+            mock.patch.object(actuator, "assert_healthy") as assert_healthy,
+            mock.patch.object(actuator, "heartbeat") as heartbeat,
+            mock.patch.object(actuator, "_wait_status") as wait_status,
+        ):
+            actuator.hold()
+            kind, created_at = actuator._command_queue.get_nowait()
+            self.assertEqual(kind, "hold")
+            self.assertLessEqual(time.monotonic() - created_at, 0.1)
+            assert_healthy.assert_called_once_with()
+            heartbeat.assert_called_once_with()
+            wait_status.assert_called_once_with("holding", timeout_s=1.0, payload=7)
+            self.assertTrue(actuator._holding)
+            self.assertFalse(actuator._warm_started)
+
+            # Calling HOLD while already held must not enqueue another command.
+            actuator.hold()
+            self.assertTrue(actuator._command_queue.empty())
+            wait_status.assert_called_once()
+
+            actuator._holding = False
+            actuator._chunk_in_flight = True
+            with self.assertRaisesRegex(DeploymentError, "current action chunk completes"):
+                actuator.hold()
+            self.assertTrue(actuator._command_queue.empty())
+
+    def test_child_reports_initializing_then_initialized_before_accepting_actions(self):
+        commands = queue.Queue(maxsize=1)
+        statuses = queue.Queue(maxsize=32)
+        stop = threading.Event()
+        heartbeat = FakeHeartbeat(time.monotonic())
+        with (
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3._G1Dex3CommandBackend",
+                FakeBackend,
+            ),
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.INITIALIZATION_CONVERGENCE_DWELL_S",
+                0.01,
+            ),
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.INITIALIZATION_START_DWELL_S",
+                0.0,
+            ),
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.INITIALIZATION_MIN_DISTINCT_SAMPLES",
+                1,
+            ),
+        ):
+            thread = threading.Thread(
+                target=_actuator_main,
+                args=(True, None, commands, statuses, stop, heartbeat),
+                daemon=True,
+            )
+            thread.start()
+            self.assertEqual(statuses.get(timeout=1.0)[0], "ready")
+            commands.put(("arm",))
+            self.assertEqual(statuses.get(timeout=1.0)[0], "armed")
+            commands.put(
+                (
+                    "initialize",
+                    time.monotonic(),
+                    load_initialization_spec("measured", task_name="pick-red-cup"),
+                )
+            )
+            kind, details = statuses.get(timeout=1.0)
+            self.assertEqual(kind, "initializing")
+            self.assertEqual(details["mode"], "measured")
+            self.assertGreaterEqual(details["steps"], 1)
+            self.assertEqual(statuses.get(timeout=1.0), ("initialized", "measured"))
+
+            warm_start = InitializationSpec(
+                mode="pose-file",
+                label="first policy target",
+                arm=np.zeros(14),
+                left_hand=np.zeros(7),
+                right_hand=np.zeros(7),
+            )
+            commands.put(("warm_start", time.monotonic(), warm_start))
+            kind, details = statuses.get(timeout=1.0)
+            self.assertEqual(kind, "warm_starting")
+            self.assertGreaterEqual(details["steps"], 1)
+            self.assertEqual(statuses.get(timeout=1.0), ("warm_started", "first policy target"))
+
+            commands.put(
+                (
+                    "chunk",
+                    1,
+                    time.monotonic(),
+                    np.zeros((1, 14)),
+                    np.zeros((1, 7)),
+                    np.zeros((1, 7)),
+                )
+            )
+            self.assertEqual(statuses.get(timeout=1.0), ("completed", 1))
+            stop.set()
+            thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(FakeBackend.instance.released)
+        self.assertTrue(FakeBackend.instance.closed)
+
+    def test_child_hold_captures_measured_pose_and_gates_repeated_warm_start(self):
+        class MeasuredPoseBackend(FakeBackend):
+            instance = None
+
+            def __init__(self, simulation, network_interface):
+                super().__init__(simulation, network_interface)
+                type(self).instance = self
+                self.measured_arm = None
+                self.measured_left = None
+                self.measured_right = None
+
+            def state(self):
+                arm = self._arm_target if self.measured_arm is None else self.measured_arm
+                left = self._left_target if self.measured_left is None else self.measured_left
+                right = self._right_target if self.measured_right is None else self.measured_right
+                return RobotState(
+                    captured_at=time.monotonic(),
+                    mode_machine=0,
+                    arm=np.asarray(arm).copy(),
+                    arm_dq=np.zeros(14),
+                    left_hand=np.asarray(left).copy(),
+                    right_hand=np.asarray(right).copy(),
+                )
+
+        commands = queue.Queue(maxsize=1)
+        statuses = queue.Queue(maxsize=32)
+        stop = threading.Event()
+        heartbeat = FakeHeartbeat(time.monotonic())
+        module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+        with (
+            mock.patch(f"{module}._G1Dex3CommandBackend", MeasuredPoseBackend),
+            mock.patch(f"{module}.INITIALIZATION_START_DWELL_S", 0.0),
+            mock.patch(f"{module}.INITIALIZATION_CONVERGENCE_DWELL_S", 0.0),
+            mock.patch(f"{module}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 1),
+        ):
+            thread = threading.Thread(
+                target=_actuator_main,
+                args=(True, None, commands, statuses, stop, heartbeat),
+                daemon=True,
+            )
+            thread.start()
+            self.assertEqual(statuses.get(timeout=1.0)[0], "ready")
+            commands.put(("arm",))
+            self.assertEqual(statuses.get(timeout=1.0)[0], "armed")
+            commands.put(
+                (
+                    "initialize",
+                    time.monotonic(),
+                    load_initialization_spec("measured", task_name="pick-red-cup"),
+                )
+            )
+            self.assertEqual(statuses.get(timeout=1.0)[0], "initializing")
+            self.assertEqual(statuses.get(timeout=1.0), ("initialized", "measured"))
+
+            first_target = InitializationSpec(
+                mode="pose-file",
+                label="first goal target",
+                arm=np.zeros(14),
+                left_hand=np.zeros(7),
+                right_hand=np.zeros(7),
+            )
+            commands.put(("warm_start", time.monotonic(), first_target))
+            self.assertEqual(statuses.get(timeout=1.0)[0], "warm_starting")
+            self.assertEqual(statuses.get(timeout=1.0), ("warm_started", "first goal target"))
+
+            backend = MeasuredPoseBackend.instance
+            backend.measured_arm = np.full(14, 0.012)
+            backend.measured_left = np.array([0.021, 0.021, 0.021, -0.021, -0.021, -0.021, -0.021])
+            backend.measured_right = np.array([0.032, 0.032, -0.032, 0.032, 0.032, 0.032, 0.032])
+            commands.put(("hold", time.monotonic()))
+            self.assertEqual(statuses.get(timeout=1.0), ("holding", 0))
+            np.testing.assert_array_equal(backend._arm_target, backend.measured_arm)
+            np.testing.assert_array_equal(backend._left_target, backend.measured_left)
+            np.testing.assert_array_equal(backend._right_target, backend.measured_right)
+
+            second_target = InitializationSpec(
+                mode="pose-file",
+                label="second goal target",
+                arm=backend.measured_arm.copy(),
+                left_hand=backend.measured_left.copy(),
+                right_hand=backend.measured_right.copy(),
+            )
+            commands.put(("warm_start", time.monotonic(), second_target))
+            self.assertEqual(statuses.get(timeout=1.0)[0], "warm_starting")
+            self.assertEqual(statuses.get(timeout=1.0), ("warm_started", "second goal target"))
+
+            # A third warm-start without another acknowledged HOLD is a child
+            # fault, even though no policy chunk happens to be active.
+            commands.put(("warm_start", time.monotonic(), second_target))
+            kind, detail = statuses.get(timeout=1.0)
+            self.assertEqual(kind, "fault")
+            self.assertIn("requires an acknowledged hold", detail)
+            thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(backend.released)
+        self.assertTrue(backend.closed)
+
+    def test_child_builds_initialization_path_from_held_command_not_offset_measurement(self):
+        class TrackingErrorBackend(FakeBackend):
+            instance = None
+
+            def __init__(self, simulation, network_interface):
+                super().__init__(simulation, network_interface)
+                type(self).instance = self
+                self.initialization_targets = []
+
+            def prepare_measured_hold(self):
+                self._arm_target = np.full(14, 0.1)
+                self._left_target = np.zeros(7)
+                self._right_target = np.zeros(7)
+                return self.state()
+
+            def state(self):
+                return RobotState(
+                    captured_at=time.monotonic(),
+                    mode_machine=0,
+                    # Deliberate 0.02-rad tracking error: safely within the
+                    # dwell tolerance, but far above one init command step.
+                    arm=self._arm_target + 0.02,
+                    arm_dq=np.zeros(14),
+                    left_hand=self._left_target.copy(),
+                    right_hand=self._right_target.copy(),
+                )
+
+            def set_target(self, arm, left, right):
+                super().set_target(arm, left, right)
+                self.initialization_targets.append(np.asarray(arm).copy())
+
+        commands = queue.Queue(maxsize=1)
+        statuses = queue.Queue(maxsize=32)
+        stop = threading.Event()
+        heartbeat = FakeHeartbeat(time.monotonic())
+        initialization = InitializationSpec(
+            mode="pose-file",
+            label="held-target origin test",
+            arm=np.full(14, 0.2),
+            left_hand=None,
+            right_hand=None,
+        )
+        module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+        with (
+            mock.patch(f"{module}._G1Dex3CommandBackend", TrackingErrorBackend),
+            mock.patch(f"{module}.PUBLISH_HZ", 10_000.0),
+            mock.patch(f"{module}.INITIALIZATION_MIN_MOVE_S", 0.0),
+            mock.patch(f"{module}.INITIALIZATION_START_DWELL_S", 0.0),
+            mock.patch(f"{module}.INITIALIZATION_CONVERGENCE_DWELL_S", 0.0),
+            mock.patch(f"{module}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 1),
+        ):
+            thread = threading.Thread(
+                target=_actuator_main,
+                args=(True, None, commands, statuses, stop, heartbeat),
+                daemon=True,
+            )
+            thread.start()
+            self.assertEqual(statuses.get(timeout=1.0)[0], "ready")
+            commands.put(("arm",))
+            self.assertEqual(statuses.get(timeout=1.0)[0], "armed")
+            commands.put(("initialize", time.monotonic(), initialization))
+            self.assertEqual(statuses.get(timeout=1.0)[0], "initializing")
+            self.assertEqual(statuses.get(timeout=1.0), ("initialized", "pose-file"))
+            stop.set()
+            thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        first = TrackingErrorBackend.instance.initialization_targets[0]
+        held = np.full(14, 0.1)
+        self.assertLessEqual(
+            float(np.max(np.abs(first - held))),
+            INITIALIZATION_MAX_ARM_STEP_RAD + 1e-12,
+        )
+        self.assertTrue(TrackingErrorBackend.instance.released)
+        self.assertTrue(TrackingErrorBackend.instance.closed)
+
+    def test_child_faults_and_releases_if_policy_chunk_arrives_before_initialization(self):
+        commands = queue.Queue(maxsize=1)
+        statuses = queue.Queue(maxsize=32)
+        stop = threading.Event()
+        heartbeat = FakeHeartbeat(time.monotonic())
+        with mock.patch(
+            "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3._G1Dex3CommandBackend",
+            FakeBackend,
+        ):
+            thread = threading.Thread(
+                target=_actuator_main,
+                args=(True, None, commands, statuses, stop, heartbeat),
+                daemon=True,
+            )
+            thread.start()
+            self.assertEqual(statuses.get(timeout=1.0)[0], "ready")
+            commands.put(("arm",))
+            self.assertEqual(statuses.get(timeout=1.0)[0], "armed")
+            commands.put(("chunk",))
+            kind, message = statuses.get(timeout=1.0)
+            self.assertEqual(kind, "fault")
+            self.assertIn("before initialization", message.lower())
+            thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(FakeBackend.instance.released)
+        self.assertTrue(FakeBackend.instance.closed)
+
+    def test_stale_initialization_command_faults_and_releases(self):
+        commands = queue.Queue(maxsize=1)
+        statuses = queue.Queue(maxsize=32)
+        stop = threading.Event()
+        heartbeat = FakeHeartbeat(time.monotonic())
+        with mock.patch(
+            "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3._G1Dex3CommandBackend",
+            FakeBackend,
+        ):
+            thread = threading.Thread(
+                target=_actuator_main,
+                args=(True, None, commands, statuses, stop, heartbeat),
+                daemon=True,
+            )
+            thread.start()
+            self.assertEqual(statuses.get(timeout=1.0)[0], "ready")
+            commands.put(("arm",))
+            self.assertEqual(statuses.get(timeout=1.0)[0], "armed")
+            commands.put(
+                (
+                    "initialize",
+                    time.monotonic() - 1.0,
+                    load_initialization_spec("measured", task_name="pick-red-cup"),
+                )
+            )
+            kind, message = statuses.get(timeout=1.0)
+            self.assertEqual(kind, "fault")
+            self.assertIn("expired", message.lower())
+            thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(FakeBackend.instance.released)
+        self.assertTrue(FakeBackend.instance.closed)
+
+    def test_stop_during_initialization_cancels_without_jumping_to_endpoint(self):
+        class TrackingBackend(FakeBackend):
+            instance = None
+
+            def __init__(self, simulation, network_interface):
+                super().__init__(simulation, network_interface)
+                type(self).instance = self
+                self.initialization_arm_targets = []
+
+            def state(self):
+                return RobotState(
+                    captured_at=time.monotonic(),
+                    mode_machine=0,
+                    arm=self._arm_target.copy(),
+                    arm_dq=np.zeros(14),
+                    left_hand=self._left_target.copy(),
+                    right_hand=self._right_target.copy(),
+                )
+
+            def set_target(self, arm, left, right):
+                super().set_target(arm, left, right)
+                self.initialization_arm_targets.append(np.asarray(arm).copy())
+
+        commands = queue.Queue(maxsize=1)
+        statuses = queue.Queue(maxsize=32)
+        stop = threading.Event()
+        heartbeat = FakeHeartbeat(time.monotonic())
+        target = np.full(14, 0.2)
+        initialization = InitializationSpec(
+            mode="pose-file",
+            label="nontrivial test path",
+            arm=target,
+            left_hand=None,
+            right_hand=None,
+        )
+        with (
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3._G1Dex3CommandBackend",
+                TrackingBackend,
+            ),
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.INITIALIZATION_START_DWELL_S",
+                0.0,
+            ),
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.INITIALIZATION_MIN_DISTINCT_SAMPLES",
+                1,
+            ),
+        ):
+            thread = threading.Thread(
+                target=_actuator_main,
+                args=(True, None, commands, statuses, stop, heartbeat),
+                daemon=True,
+            )
+            thread.start()
+            self.assertEqual(statuses.get(timeout=1.0)[0], "ready")
+            commands.put(("arm",))
+            self.assertEqual(statuses.get(timeout=1.0)[0], "armed")
+            commands.put(("initialize", time.monotonic(), initialization))
+            self.assertEqual(statuses.get(timeout=1.0)[0], "initializing")
+
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                targets = TrackingBackend.instance.initialization_arm_targets
+                if targets and float(np.max(np.abs(targets[-1]))) > 0.0:
+                    break
+                time.sleep(0.001)
+            else:
+                self.fail("Initialization did not begin moving")
+            stop.set()
+            self.assertEqual(
+                statuses.get(timeout=1.0),
+                ("initialization_cancelled", "pose-file"),
+            )
+            thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        emitted = np.asarray(TrackingBackend.instance.initialization_arm_targets)
+        self.assertGreater(len(emitted), 0)
+        self.assertLess(float(np.max(emitted[-1])), 0.2)
+        steps = np.diff(np.vstack((np.zeros(14), emitted)), axis=0)
+        self.assertLessEqual(float(np.max(np.abs(steps))), INITIALIZATION_MAX_ARM_STEP_RAD + 1e-12)
+        self.assertTrue(TrackingBackend.instance.released)
+        self.assertTrue(TrackingBackend.instance.closed)
+
+    def test_duplicate_initialization_after_success_faults_and_releases(self):
+        commands = queue.Queue(maxsize=1)
+        statuses = queue.Queue(maxsize=32)
+        stop = threading.Event()
+        heartbeat = FakeHeartbeat(time.monotonic())
+        initialization = load_initialization_spec("measured", task_name="pick-red-cup")
+        with (
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3._G1Dex3CommandBackend",
+                FakeBackend,
+            ),
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.INITIALIZATION_CONVERGENCE_DWELL_S",
+                0.0,
+            ),
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.INITIALIZATION_START_DWELL_S",
+                0.0,
+            ),
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.INITIALIZATION_MIN_DISTINCT_SAMPLES",
+                1,
+            ),
+        ):
+            thread = threading.Thread(
+                target=_actuator_main,
+                args=(True, None, commands, statuses, stop, heartbeat),
+                daemon=True,
+            )
+            thread.start()
+            self.assertEqual(statuses.get(timeout=1.0)[0], "ready")
+            commands.put(("arm",))
+            self.assertEqual(statuses.get(timeout=1.0)[0], "armed")
+            commands.put(("initialize", time.monotonic(), initialization))
+            self.assertEqual(statuses.get(timeout=1.0)[0], "initializing")
+            self.assertEqual(statuses.get(timeout=1.0), ("initialized", "measured"))
+            commands.put(("initialize", time.monotonic(), initialization))
+            kind, message = statuses.get(timeout=1.0)
+            self.assertEqual(kind, "fault")
+            self.assertIn("unexpected", message.lower())
+            self.assertIn("initialize", message.lower())
+            thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(FakeBackend.instance.released)
+        self.assertTrue(FakeBackend.instance.closed)
+
+    def test_child_rejects_malformed_gapped_and_future_action_chunk_protocol(self):
+        arm = np.zeros((1, 14))
+        hand = np.zeros((1, 7))
+        cases = (
+            ("malformed", lambda: ("chunk",), "malformed"),
+            (
+                "gapped sequence",
+                lambda: ("chunk", 2, time.monotonic(), arm, hand, hand),
+                "out-of-order",
+            ),
+            (
+                "future timestamp",
+                lambda: ("chunk", 1, time.monotonic() + 1.0, arm, hand, hand),
+                "expired",
+            ),
+        )
+        initialization = load_initialization_spec("measured", task_name="pick-red-cup")
+        module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+        with (
+            mock.patch(f"{module}._G1Dex3CommandBackend", FakeBackend),
+            mock.patch(f"{module}.INITIALIZATION_START_DWELL_S", 0.0),
+            mock.patch(f"{module}.INITIALIZATION_CONVERGENCE_DWELL_S", 0.0),
+            mock.patch(f"{module}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 1),
+        ):
+            for name, make_command, expected in cases:
+                with self.subTest(name=name):
+                    commands = queue.Queue(maxsize=1)
+                    statuses = queue.Queue(maxsize=32)
+                    stop = threading.Event()
+                    heartbeat = FakeHeartbeat(time.monotonic())
+                    thread = threading.Thread(
+                        target=_actuator_main,
+                        args=(True, None, commands, statuses, stop, heartbeat),
+                        daemon=True,
+                    )
+                    thread.start()
+                    self.assertEqual(statuses.get(timeout=1.0)[0], "ready")
+                    commands.put(("arm",))
+                    self.assertEqual(statuses.get(timeout=1.0)[0], "armed")
+                    commands.put(("initialize", time.monotonic(), initialization))
+                    self.assertEqual(statuses.get(timeout=1.0)[0], "initializing")
+                    self.assertEqual(
+                        statuses.get(timeout=1.0),
+                        ("initialized", "measured"),
+                    )
+                    commands.put(make_command())
+                    kind, message = statuses.get(timeout=1.0)
+                    self.assertEqual(kind, "fault")
+                    self.assertIn(expected, message.lower())
+                    thread.join(timeout=1.0)
+                    self.assertFalse(thread.is_alive())
+                    self.assertTrue(FakeBackend.instance.released)
+                    self.assertTrue(FakeBackend.instance.closed)
+
+    def test_initialization_does_not_report_convergence_while_arm_is_moving(self):
+        class MovingBackend(FakeBackend):
+            def state(self):
+                return RobotState(
+                    captured_at=time.monotonic(),
+                    mode_machine=0,
+                    arm=self._arm_target.copy(),
+                    arm_dq=np.full(14, 0.2),
+                    left_hand=self._left_target.copy(),
+                    right_hand=self._right_target.copy(),
+                )
+
+        backend = MovingBackend(False, None)
+        state = backend.state()
+        chunk = build_initialization_chunk(
+            state,
+            load_initialization_spec("measured", task_name="pick-red-cup"),
+        )
+        with (
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.INITIALIZATION_CONVERGENCE_TIMEOUT_S",
+                0.03,
+            ),
+            self.assertRaisesRegex(DeploymentError, "did not converge"),
+        ):
+            _execute_initialization(
+                backend,
+                chunk,
+                threading.Event(),
+                FakeHeartbeat(time.monotonic()),
+                float("inf"),
+            )
+
+    def test_initialization_start_dwell_defers_until_held_state_is_stationary(self):
+        class SettlingBackend:
+            def __init__(self):
+                self.simulation = False
+                self.calls = 0
+                self.publishes = 0
+                self._arm_target = np.zeros(14)
+                self._left_target = np.zeros(7)
+                self._right_target = np.zeros(7)
+
+            def state(self):
+                self.calls += 1
+                moving = self.calls <= 3
+                return RobotState(
+                    captured_at=time.monotonic(),
+                    mode_machine=0,
+                    arm=self._arm_target.copy(),
+                    arm_dq=np.full(14, 0.2 if moving else 0.0),
+                    left_hand=self._left_target.copy(),
+                    right_hand=self._right_target.copy(),
+                )
+
+            def publish(self):
+                self.publishes += 1
+
+        backend = SettlingBackend()
+        module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+        with (
+            mock.patch(f"{module}.INITIALIZATION_START_DWELL_S", 0.01),
+            mock.patch(f"{module}.INITIALIZATION_START_TIMEOUT_S", 0.2),
+            mock.patch(f"{module}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 2),
+        ):
+            state = _wait_for_initialization_start(
+                backend,
+                threading.Event(),
+                FakeHeartbeat(time.monotonic()),
+            )
+
+        self.assertIsNotNone(state)
+        self.assertGreaterEqual(backend.calls, 5)
+        self.assertGreaterEqual(backend.publishes, 4)
+        self.assertLessEqual(float(np.max(np.abs(state.arm_dq))), 0.1)
+
+    def test_initialization_start_dwell_rejects_persistently_moving_state(self):
+        class MovingBackend:
+            def __init__(self):
+                self.simulation = False
+                self.publishes = 0
+                self._arm_target = np.zeros(14)
+                self._left_target = np.zeros(7)
+                self._right_target = np.zeros(7)
+
+            def state(self):
+                return RobotState(
+                    captured_at=time.monotonic(),
+                    mode_machine=0,
+                    arm=self._arm_target.copy(),
+                    arm_dq=np.full(14, 0.2),
+                    left_hand=self._left_target.copy(),
+                    right_hand=self._right_target.copy(),
+                )
+
+            def publish(self):
+                self.publishes += 1
+
+        backend = MovingBackend()
+        module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+        with (
+            mock.patch(f"{module}.INITIALIZATION_START_DWELL_S", 0.005),
+            mock.patch(f"{module}.INITIALIZATION_START_TIMEOUT_S", 0.03),
+            mock.patch(f"{module}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 1),
+            self.assertRaisesRegex(DeploymentError, "did not become stationary"),
+        ):
+            _wait_for_initialization_start(
+                backend,
+                threading.Event(),
+                FakeHeartbeat(time.monotonic()),
+            )
+
+        self.assertGreater(backend.publishes, 0)
+
+    def test_initialization_start_dwell_rejects_position_drift_inside_tracking_tolerance(self):
+        class DriftingBackend:
+            def __init__(self):
+                self.simulation = False
+                self.calls = 0
+                self.publishes = 0
+                self._arm_target = np.zeros(14)
+                self._left_target = np.zeros(7)
+                self._right_target = np.zeros(7)
+
+            def state(self):
+                self.calls += 1
+                # Each sample remains inside the 0.05 rad initialization
+                # tolerance, but adjacent held poses differ by more than the
+                # independent 0.02 rad stability ceiling.
+                offset = 0.03 if self.calls % 2 == 0 else 0.0
+                return RobotState(
+                    captured_at=time.monotonic(),
+                    mode_machine=0,
+                    arm=self._arm_target + offset,
+                    arm_dq=np.zeros(14),
+                    left_hand=self._left_target.copy(),
+                    right_hand=self._right_target.copy(),
+                )
+
+            def publish(self):
+                self.publishes += 1
+
+        backend = DriftingBackend()
+        module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+        with (
+            mock.patch(f"{module}.INITIALIZATION_START_DWELL_S", 0.02),
+            mock.patch(f"{module}.INITIALIZATION_START_TIMEOUT_S", 0.04),
+            mock.patch(f"{module}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 1),
+            self.assertRaisesRegex(DeploymentError, "did not become stationary"),
+        ):
+            _wait_for_initialization_start(
+                backend,
+                threading.Event(),
+                FakeHeartbeat(time.monotonic()),
+            )
+
+        self.assertGreaterEqual(backend.calls, 3)
+        self.assertGreater(backend.publishes, 0)
+
     def test_dex3_cleanup_uses_unitree_stop_motors_command(self):
         class Publisher:
             def __init__(self):
@@ -1078,7 +2751,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         backend.reader = SimpleNamespace(read=lambda timeout_s: unsafe_state)
         backend._arm_message = SimpleNamespace(mode_machine=None)
 
-        with self.assertRaisesRegex(DeploymentError, "qualified mode 5"):
+        with self.assertRaisesRegex(DeploymentError, "QUALIFIED_REAL_MODE_MACHINE=5"):
             backend.prepare_measured_hold()
 
         self.assertIsNone(backend._arm_message.mode_machine)
@@ -1099,7 +2772,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             left_hand=np.zeros(7),
             right_hand=np.zeros(7),
         )
-        with self.assertRaisesRegex(DeploymentError, "not fresh enough"):
+        with self.assertRaisesRegex(DeploymentError, "PREARM_STATE_MAX_AGE_S"):
             backend_with_state(stale).prepare_measured_hold()
 
         moving = RobotState(
@@ -1110,7 +2783,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             left_hand=np.zeros(7),
             right_hand=np.zeros(7),
         )
-        with self.assertRaisesRegex(DeploymentError, "stationary before arming"):
+        with self.assertRaisesRegex(DeploymentError, "PREARM_MAX_ARM_DQ_RAD_S"):
             backend_with_state(moving).prepare_measured_hold()
 
     def test_actuator_heartbeat_expiry_faults_and_releases(self):
@@ -1166,6 +2839,18 @@ class GrootG1DeploymentTests(unittest.TestCase):
             actuator.close()
 
         self.assertTrue(actuator._closed)
+
+    def test_assert_healthy_surfaces_queued_fault_even_while_child_is_alive(self):
+        actuator = object.__new__(SafeG1Dex3Actuator)
+        actuator._status_queue = queue.Queue()
+        actuator._status_queue.put(("fault", "arm DDS write failed"))
+        actuator._process = SimpleNamespace(is_alive=lambda: True)
+
+        with self.assertRaisesRegex(
+            DeploymentError,
+            "unhealthy.*fault.*arm DDS write failed",
+        ):
+            actuator.assert_healthy()
 
 
 if __name__ == "__main__":
