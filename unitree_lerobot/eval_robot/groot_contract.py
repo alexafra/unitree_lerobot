@@ -18,8 +18,8 @@ from unitree_lerobot.utils.depth_encoding import (
 
 
 TASKS = {
-    "pick-toothpaste": "pick up the cylinder toothepaste.",
-    "put-toothpaste": "put down the cylinder toothepaste.",
+    "pick-toothpaste": "pick up the cylinder toothpaste.",
+    "put-toothpaste": "put down the cylinder toothpaste.",
     "pick-red-cup": "pick up the red cup.",
     "put-red-cup": "put down the red cup.",
 }
