@@ -456,12 +456,10 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
     --max-chunks 1
 ```
 
-First add `--no-policy-warm-start`: type `SIMULATE`; at the `RUN` prompt press Ctrl-C. Next change to
+Type `SIMULATE`; at the `RUN` prompt press Ctrl-C. Next change to
 `--initialization xr-home`, type `SIMULATE` and `INITIALIZE`, then press Ctrl-C at `RUN`.
-Only after both cleanup paths pass should the simulator use the default policy warm-start: type
-`RUN`, inspect the reported first-target delta, type `WARMSTART`, inspect the reached pose,
-then type `RESUME`. The warm-start inference is discarded; the first executed action must
-come from the subsequent reset and fresh observation.
+Only after both cleanup paths pass should the simulator execute a policy action by typing
+`RUN`.
 
 Then expand deliberately:
 
@@ -477,9 +475,6 @@ Simulator pass criteria:
 - [ ] First commanded target begins at the measured hold pose.
 - [ ] Arm joint directions and right-hand permutation are correct.
 - [ ] XR-home motion is smooth and bounded.
-- [ ] Policy warm-start reaches only the first target through the bounded 100 Hz path.
-- [ ] The warm-start chunk is discarded and strict 0.05-rad arm / 0.10-rad hand step checks
-  apply to the fresh post-`RESUME` inference.
 - [ ] Action targets advance at 30 Hz while DDS publishing continues at 100 Hz.
 - [ ] Ctrl-C causes orderly release reporting.
 - [ ] In separate isolated tests, stopping the policy server, camera, and DDS state each
@@ -562,7 +557,7 @@ cd "$HOME/Development/unitree_lerobot"
 conda activate unitree_lerobot
 
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
-    --task pick-red-cup \
+    --task pick-toothpaste \
     --policy-host 127.0.0.1 \
     --image-host 192.168.123.164 \
     --network-interface "$ROBOT_NIC" \
@@ -627,10 +622,6 @@ Before the first policy action, establish a task-valid start by one of these rou
    `--initialization pose-file --initial-pose-file "$INITIAL_POSE_FILE"`.
 2. Manually establish and independently verify an approved task-start pose, then use
    `--initialization measured` so the client acquires authority without changing it.
-3. Experimental/default for actuation: explicitly approve the policy warm-start target.
-   This smoothly approaches that one target, discards the chunk, resets, and re-observes.
-   It remains a joint-space path with no collision awareness, so it requires separate
-   `WARMSTART` and `RESUME` inspections and does not replace scene-specific path review.
 
 For a pose file:
 
@@ -683,21 +674,15 @@ pose-file flag, and there will be no `INITIALIZE` prompt.
 
 ## 15. Qualify normal ending before object contact
 
-Reaching `max-chunks`, typing `quit`/`q`, pressing Ctrl-C, or detecting a fault enters
-cleanup: arm authority is ramped down and Dex3 `stopMotors` is attempted. The subsequent
-physical behavior depends on Unitree's controller and hand firmware, and could allow an
-object to move or fall. By contrast, typing `hold`/`h` at a chunk boundary keeps the client
-alive, captures the measured pose, publishes it at 100 Hz, and stops GR00T requests. That is
-a powered workstation-owned hold, not a passive brake or a fail-safe terminal state.
+Reaching `max-chunks`, pressing Ctrl-C, or detecting a fault enters cleanup: arm authority
+is ramped down and Dex3 `stopMotors` is attempted. This is not a task-level hold state. The
+subsequent physical behavior depends on Unitree's controller and hand firmware, and could
+allow an object to move or fall.
 
 Before contact with a valuable object:
 
 - [ ] End normally via `max-chunks` at a safe empty-hand pose and record arm/hand behavior.
 - [ ] End via Ctrl-C at a safe empty-hand pose and record arm/hand behavior.
-- [ ] Enter `hold`/`h`, verify no further GR00T requests, and measure commanded/measured
-  arm and hand stability while the client remains alive.
-- [ ] From HOLD, select a second goal and verify reset -> fresh inference -> WARMSTART ->
-  discarded chunk -> RESUME -> reset -> fresh strict inference.
 - [ ] Establish whether motion mode retakes or changes the arms after authority release.
 - [ ] Establish whether each hand holds position, relaxes, or otherwise responds after
   `stopMotors`.
@@ -739,12 +724,10 @@ Only after these stages pass should `max-chunks` approach a demonstration's task
 
 ## 17. Task completion and stopping behavior
 
-Current GR00T N1.7 inference does not return a task-complete token. The operator can enter
-powered HOLD with `hold`/`h`; the runner then makes no GR00T requests until a new goal is
-selected. Authority is released and the process exits only when:
+Current GR00T N1.7 inference does not return a task-complete token. The runner stops only
+when:
 
 - `--max-chunks` is reached;
-- the operator types `quit`/`q`;
 - the operator presses Ctrl-C;
 - a validation/watchdog fault occurs; or
 - an exception occurs.
