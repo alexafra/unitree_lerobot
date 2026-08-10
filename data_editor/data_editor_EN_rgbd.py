@@ -686,6 +686,13 @@ class DatasetPlayer(QWidget):
 
         self.setLayout(main_layout)
 
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Tab:
+            self.next_episode()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
     def update_root_dir_label(self):
         self.root_dir_label.setText(f"Current Dataset Path: {self.root_dir}")
 
@@ -706,10 +713,33 @@ class DatasetPlayer(QWidget):
     def update_framerate_label(self):
         if self.measured_fps is None:
             self.fps_label.setText("Measured framerate: N/A")
+            self.fps_label.setStyleSheet("""
+                QLabel {
+                    font-size: 16px;
+                    font-weight: bold;
+                    color: #333;
+                }
+            """)
         else:
             self.fps_label.setText(
                 f"Measured framerate: {self.measured_fps:.2f} FPS"
             )
+            if self.measured_fps < 27:
+                self.fps_label.setStyleSheet("""
+                    QLabel {
+                        font-size: 16px;
+                        font-weight: bold;
+                        color: #c0392b;
+                    }
+                """)
+            else:
+                self.fps_label.setStyleSheet("""
+                    QLabel {
+                        font-size: 16px;
+                        font-weight: bold;
+                        color: #333;
+                    }
+                """)
 
     def set_goal(self, goal, enabled):
         self.current_goal = goal
@@ -720,7 +750,11 @@ class DatasetPlayer(QWidget):
         if not self.current_json_path or not self.goal_edit.isEnabled():
             return
 
-        new_goal = self.goal_edit.text()
+        # Persist the semantic goal, not accidental padding from typing or paste.
+        # ``strip`` removes only leading/trailing whitespace; whitespace inside
+        # the instruction is preserved.
+        new_goal = self.goal_edit.text().strip()
+        self.goal_edit.setText(new_goal)
         if new_goal == self.current_goal:
             return
 
