@@ -85,7 +85,7 @@ INITIAL_POSE_SCHEMA_VERSION = 1
 # These are deliberately fixed deployment ceilings, not tuning flags.  They need
 # hardware qualification before being relaxed.
 MAX_ARM_STEP_RAD = 0.1  # 0.05
-MAX_HAND_STEP_RAD = 0.25  # 0.10
+MAX_HAND_STEP_RAD = 0.20  # 0.10
 JOINT_LIMIT_MARGIN_RAD = 0.03
 HAND_LIMIT_TOLERANCE_RAD = 0.002
 MEASURED_LIMIT_TOLERANCE_RAD = 0.01
