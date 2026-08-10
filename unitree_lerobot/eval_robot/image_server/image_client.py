@@ -30,6 +30,12 @@ import yaml
 import os
 from collections import deque
 import logging_mp
+
+from unitree_lerobot.eval_robot.image_server.rgbd_protocol import (
+    TeleRgbdFrame,
+    unpack_rgbd_packet,
+)
+
 logger_mp = logging_mp.getLogger(__name__)
 logger_mp.setLevel(logging_mp.INFO)
 
@@ -285,23 +291,30 @@ class ZMQ_PublisherManager:
 # ========================================================
 class TeleImage:
     _NOT_SET = object()
-    __slots__ = ['jpg', '_bgr', 'fps']
+    __slots__ = ['jpg', '_bgr', 'fps', 'received_monotonic_ns']
 
-    def __init__(self, fps: float, jpg: Optional[bytes], bgr: Any = _NOT_SET):
+    def __init__(
+        self,
+        fps: float,
+        jpg: Optional[bytes],
+        bgr: Any = _NOT_SET,
+        received_monotonic_ns: Optional[int] = None,
+    ):
         self.fps = fps
         self.jpg = jpg
         self._bgr = bgr
+        self.received_monotonic_ns = received_monotonic_ns
 
     @property
     def bgr(self) -> Optional[np.ndarray]:
         """ Get decoded BGR image if decoding is enabled and data is available."""
         # state 1: decoding disabled
         if self._bgr is TeleImage._NOT_SET:
-            logger_mp.warning(f"[TeleImager] Accessing .bgr but decoding was DISABLED.")
+            logger_mp.warning("[TeleImager] Accessing .bgr but decoding was DISABLED.")
             return None
         # state 2: decoding enabled but no data
         if self._bgr is None:
-            logger_mp.debug(f"[TeleImager] Accessing .bgr but no image data received.")
+            logger_mp.debug("[TeleImager] Accessing .bgr but no image data received.")
             return None
         # state 3: decoding enabled and data available
         return self._bgr
@@ -393,12 +406,26 @@ class ZMQ_SubscriberThread(threading.Thread):
             The latest message as a TeleImage object containing raw bytes, decoded BGR image (if enabled), and FPS.
         """
         current_fps = self._fps_monitor.fps
-        jpg_data = self._jpg_3ring_buffer.read()
+        received = self._jpg_3ring_buffer.read()
+        if received is None:
+            jpg_data = None
+            received_monotonic_ns = None
+        else:
+            jpg_data, received_monotonic_ns = received
         if not self._request_bgr:
-            return TeleImage(fps=current_fps, jpg=jpg_data)
+            return TeleImage(
+                fps=current_fps,
+                jpg=jpg_data,
+                received_monotonic_ns=received_monotonic_ns,
+            )
 
         bgr_data = self._bgr_3ring_buffer.read()
-        return TeleImage(fps=current_fps, jpg=jpg_data, bgr=bgr_data)
+        return TeleImage(
+            fps=current_fps,
+            jpg=jpg_data,
+            bgr=bgr_data,
+            received_monotonic_ns=received_monotonic_ns,
+        )
 
     def stop(self) -> None:
         """Stop the subscriber thread gracefully."""
@@ -429,7 +456,7 @@ class ZMQ_SubscriberThread(threading.Thread):
                         # receive the latest message
                         img_bytes = self._socket.recv()
                         # write to 3-ring-buffer
-                        self._jpg_3ring_buffer.write(img_bytes)
+                        self._jpg_3ring_buffer.write((img_bytes, time.monotonic_ns()))
                         # enqueue for decoding if needed
                         if self._request_bgr:
                             try:
@@ -675,36 +702,57 @@ class ZMQ_Requester:
 # image client
 # ========================================================
 class ImageClient:
-    def __init__(self, host="192.168.123.164", request_port=60000, request_bgr: bool = False):
+    def __init__(
+        self,
+        host="192.168.123.164",
+        request_port=60000,
+        request_bgr: bool = False,
+        request_rgbd: bool = False,
+    ):
         """
         Args:
             server_address:   IP address of image host server
             request_port:     TCP port for camera configuration request
             request_bgr:      Whether to request BGR decoding for subscribers
+            request_rgbd:     Subscribe to the atomic head RGBD stream instead of
+                              the legacy head-colour stream
         """
         self._host = host
         self._request_port = request_port
         self._request_bgr = request_bgr
+        self._request_rgbd = request_rgbd
+        self._last_rgbd_fps = 0.0
+        self._closed = False
+        self._requester = None
 
         # subscriber and requester setup
         self._subscriber_manager = ZMQ_SubscriberManager.get_instance()
-        self._requester  = ZMQ_Requester(self._host, self._request_port)
-        self._cam_config = self._requester.request()
+        try:
+            self._requester = ZMQ_Requester(self._host, self._request_port)
+            self._cam_config = self._requester.request()
+            if self._cam_config is None:
+                raise RuntimeError("Failed to get camera configuration.")
 
-        if self._cam_config is None:
-            raise RuntimeError("Failed to get camera configuration.")
-        
-        if self._cam_config['head_camera']['enable_zmq']:
-            self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'], request_bgr=self._request_bgr)
+            head_config = self._cam_config['head_camera']
+            if self._request_rgbd:
+                rgbd_port = head_config.get('rgbd_zmq_port')
+                if rgbd_port is None:
+                    raise RuntimeError("Head camera has no rgbd_zmq_port")
+                self._subscriber_manager.subscribe(self._host, rgbd_port, request_bgr=False)
+            elif head_config['enable_zmq']:
+                self._subscriber_manager.subscribe(self._host, head_config['zmq_port'], request_bgr=self._request_bgr)
 
-        if self._cam_config['left_wrist_camera']['enable_zmq']:
-            self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
+            if self._cam_config['left_wrist_camera']['enable_zmq']:
+                self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
 
-        if self._cam_config['right_wrist_camera']['enable_zmq']:
-            self._subscriber_manager.subscribe(self._host, self._cam_config['right_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
+            if self._cam_config['right_wrist_camera']['enable_zmq']:
+                self._subscriber_manager.subscribe(self._host, self._cam_config['right_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
 
-        if not self._cam_config['head_camera']['enable_zmq'] and not self._cam_config['head_camera']['enable_webrtc']:
-            logger_mp.warning("[Image Client] NOTICE! Head camera is not enabled on both ZMQ and WebRTC.")
+            if not self._request_rgbd and not head_config['enable_zmq'] and not head_config['enable_webrtc']:
+                logger_mp.warning("[Image Client] NOTICE! Head camera is not enabled on both ZMQ and WebRTC.")
+        except Exception:
+            self.close()
+            raise
 
     # --------------------------------------------------------
     # public api
@@ -713,7 +761,29 @@ class ImageClient:
         return self._cam_config
 
     def get_head_frame(self):
+        if self._request_rgbd:
+            raise RuntimeError("This ImageClient requested RGBD; use get_head_rgbd_frame()")
         return self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'], request_bgr=self._request_bgr)
+
+    def get_head_rgbd_frame(self) -> Optional[TeleRgbdFrame]:
+        if not self._request_rgbd:
+            raise RuntimeError("This ImageClient did not request the RGBD stream")
+        port = self._cam_config['head_camera'].get('rgbd_zmq_port')
+        if port is None:
+            raise RuntimeError("Head camera has no rgbd_zmq_port")
+        message = self._subscriber_manager.subscribe(self._host, port, request_bgr=False)
+        self._last_rgbd_fps = message.fps
+        if message.jpg is None:
+            return None
+        return unpack_rgbd_packet(
+            message.jpg,
+            received_monotonic_ns=message.received_monotonic_ns,
+        )
+
+    def get_head_rgbd_fps(self) -> float:
+        if not self._request_rgbd:
+            raise RuntimeError("This ImageClient did not request the RGBD stream")
+        return self._last_rgbd_fps
     
     def get_left_wrist_frame(self):
         return self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
@@ -722,7 +792,14 @@ class ImageClient:
         return self._subscriber_manager.subscribe(self._host, self._cam_config['right_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
         
     def close(self):
-        self._subscriber_manager.close()
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._subscriber_manager.close()
+        finally:
+            if self._requester is not None:
+                self._requester.close()
         logger_mp.info("Image client has been closed.")
 
 class LocalCamera:

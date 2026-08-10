@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a colour-only GR00T policy on a G1-29 with Dex3 hands.
+"""Run a supported colour or colour+aligned-depth GR00T policy on G1/Dex3.
 
 The default is read-only shadow mode.  ``--actuate`` creates a separate,
 watchdog-owning DDS actuator process only after model, camera, state, and action
@@ -24,6 +24,7 @@ from unitree_lerobot.eval_robot.groot_contract import (
     MAX_EXECUTION_HORIZON,
     TASKS,
     ActionChunk,
+    ModelContract,
     make_observation,
     parse_action_chunk,
     validate_model_contract,
@@ -32,7 +33,7 @@ from unitree_lerobot.eval_robot.groot_contract import (
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     G1Dex3StateReader,
     SafeG1Dex3Actuator,
-    TeleimagerColourCamera,
+    TeleimagerCamera,
     initialize_dds,
 )
 
@@ -113,9 +114,9 @@ def confirm_actuation(simulation: bool, task_name: str, instruction: str) -> Non
 def infer_chunk(
     policy: Gr00tClient,
     state_reader: G1Dex3StateReader,
-    camera: TeleimagerColourCamera,
+    camera: TeleimagerCamera,
     instruction: str,
-    model_horizon: int,
+    model_contract: ModelContract,
     execution_horizon: int,
     actuator: SafeG1Dex3Actuator | None = None,
     camera_timeout_s: float = 0.5,
@@ -125,11 +126,19 @@ def infer_chunk(
     state = state_reader.read(timeout_s=0.5)
     if actuator is not None:
         actuator.heartbeat()
-    rgb = camera.read_rgb(timeout_s=camera_timeout_s)
+    images = camera.read(timeout_s=camera_timeout_s)
     if actuator is not None:
         actuator.heartbeat()
 
-    observation = make_observation(rgb, state.arm, state.left_hand, state.right_hand, instruction)
+    observation = make_observation(
+        images.rgb,
+        state.arm,
+        state.left_hand,
+        state.right_hand,
+        instruction,
+        video_keys=model_contract.video_keys,
+        depth_gray=images.depth_gray,
+    )
     started = time.monotonic()
     action = policy.get_action(observation)
     inference_s = time.monotonic() - started
@@ -137,7 +146,7 @@ def infer_chunk(
         actuator.assert_healthy()
     chunk = parse_action_chunk(
         action,
-        model_horizon=model_horizon,
+        model_horizon=model_contract.action_horizon,
         execution_horizon=execution_horizon,
         current_arm=state.arm,
         current_left=state.left_hand,
@@ -166,7 +175,7 @@ def run(args: argparse.Namespace) -> None:
     image_host = args.image_host or ("127.0.0.1" if args.sim else "192.168.123.164")
 
     policy: Gr00tClient | None = None
-    camera: TeleimagerColourCamera | None = None
+    camera: TeleimagerCamera | None = None
     state_reader: G1Dex3StateReader | None = None
     actuator: SafeG1Dex3Actuator | None = None
     cleanup_error: Exception | None = None
@@ -174,21 +183,25 @@ def run(args: argparse.Namespace) -> None:
         policy = Gr00tClient(args.policy_host, args.policy_port)
         if not policy.ping():
             raise DeploymentError(f"GR00T server at {args.policy_host}:{args.policy_port} did not answer ping")
-        validate_policy_metadata(policy.get_policy_metadata())
         contract = validate_model_contract(policy.get_modality_config())
+        depth_encoding = validate_policy_metadata(
+            policy.get_policy_metadata(),
+            requires_depth=contract.requires_depth,
+        )
         if args.execution_horizon > contract.action_horizon:
             raise DeploymentError(
                 f"Checkpoint action horizon is only {contract.action_horizon}, but "
                 f"{args.execution_horizon} steps were requested"
             )
         LOGGER.info(
-            "GR00T contract verified: ego_view + four G1/Dex3 state/action keys, horizon %d",
+            "GR00T contract verified: video=%s + four G1/Dex3 state/action keys, horizon %d",
+            ",".join(contract.video_keys),
             contract.action_horizon,
         )
 
         initialize_dds(args.sim, args.network_interface)
         state_reader = G1Dex3StateReader(simulation=args.sim)
-        camera = TeleimagerColourCamera(image_host)
+        camera = TeleimagerCamera(image_host, depth_encoding=depth_encoding)
         head = camera.config["head_camera"]
         LOGGER.info(
             "TeleImager config: host=%s type=%s shape=%s binocular=%s fps=%s",
@@ -207,7 +220,7 @@ def run(args: argparse.Namespace) -> None:
             state_reader,
             camera,
             instruction,
-            contract.action_horizon,
+            contract,
             args.execution_horizon,
             camera_timeout_s=3.0,
         )
@@ -232,7 +245,7 @@ def run(args: argparse.Namespace) -> None:
                     state_reader,
                     camera,
                     instruction,
-                    contract.action_horizon,
+                    contract,
                     args.execution_horizon,
                 )
                 LOGGER.info(
@@ -258,7 +271,7 @@ def run(args: argparse.Namespace) -> None:
                 state_reader,
                 camera,
                 instruction,
-                contract.action_horizon,
+                contract,
                 args.execution_horizon,
                 actuator,
             )
@@ -293,7 +306,7 @@ def run(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Colour-only GR00T runner for Unitree G1-29 + Dex3")
+    parser = argparse.ArgumentParser(description="Colour/RGBD GR00T runner for Unitree G1-29 + Dex3")
     parser.add_argument("--task", choices=tuple(TASKS), help="Trained task ID; omit for a menu")
     parser.add_argument("--policy-host", default="127.0.0.1")
     parser.add_argument("--policy-port", type=int, default=5555)

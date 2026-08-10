@@ -8,6 +8,11 @@ from typing import Any
 import numpy as np
 
 from unitree_lerobot.eval_robot.groot_client import DeploymentError
+from unitree_lerobot.utils.depth_encoding import (
+    DEPTH_ENCODING,
+    DEPTH_OUTPUT_KEY,
+    DEPTH_SOURCE_KEY,
+)
 
 
 TASKS = {
@@ -17,13 +22,18 @@ TASKS = {
     "put-red-cup": "put down the red cup.",
 }
 
-VIDEO_KEYS = ("ego_view",)
+COLOUR_VIDEO_KEYS = ("ego_view",)
+RGBD_VIDEO_KEYS = ("ego_view", DEPTH_OUTPUT_KEY)
+SUPPORTED_VIDEO_KEYS = (COLOUR_VIDEO_KEYS, RGBD_VIDEO_KEYS)
+# Backwards-compatible public name used by existing callers/tests.
+VIDEO_KEYS = COLOUR_VIDEO_KEYS
 STATE_KEYS = ("left_arm", "right_arm", "left_hand", "right_hand")
 ACTION_KEYS = STATE_KEYS
 LANGUAGE_KEYS = ("annotation.human.task_description",)
 EXPECTED_TRAINING_TAG = "new_embodiment"
 EXPECTED_ROBOT_TYPE = "Unitree_G1_Dex3_HeadOnly"
 EXPECTED_EGO_VIEW_SHAPE = [480, 640, 3]
+EXPECTED_DEPTH_VIEW_SHAPE = [480, 640, 3]
 EXPECTED_ACTION_OUTPUT_CONTRACT = {
     "semantics": "absolute_joint_position",
     "use_relative_action": True,
@@ -127,6 +137,17 @@ RIGHT_HAND_UPPER = np.array(
 @dataclass(frozen=True)
 class ModelContract:
     action_horizon: int
+    video_keys: tuple[str, ...] = COLOUR_VIDEO_KEYS
+
+    @property
+    def requires_depth(self) -> bool:
+        return self.video_keys == RGBD_VIDEO_KEYS
+
+
+@dataclass(frozen=True)
+class DepthEncodingContract:
+    near_m: float
+    far_m: float
 
 
 @dataclass(frozen=True)
@@ -140,7 +161,51 @@ class ActionChunk:
         return int(self.arm.shape[0])
 
 
-def validate_policy_metadata(metadata: dict[str, Any]) -> None:
+def _validate_depth_metadata(contract: dict[str, Any]) -> DepthEncodingContract:
+    video_shapes = contract.get("video_shapes")
+    if not isinstance(video_shapes, dict):
+        raise DeploymentError("Deployment dataset contract has no video_shapes for the RGBD model")
+    expected_shapes = {
+        "ego_view": EXPECTED_EGO_VIEW_SHAPE,
+        DEPTH_OUTPUT_KEY: EXPECTED_DEPTH_VIEW_SHAPE,
+    }
+    for key, expected_shape in expected_shapes.items():
+        if video_shapes.get(key) != expected_shape:
+            raise DeploymentError(
+                f"Deployment dataset contract mismatch for video_shapes.{key}: "
+                f"got {video_shapes.get(key)!r}, expected {expected_shape!r}"
+            )
+
+    encoding = contract.get("depth_encoding")
+    if not isinstance(encoding, dict):
+        raise DeploymentError("Deployment dataset contract has no depth_encoding for the RGBD model")
+    expected = {
+        "source_key": DEPTH_SOURCE_KEY,
+        "feature_key": f"observation.images.{DEPTH_OUTPUT_KEY}",
+        "encoding": DEPTH_ENCODING,
+        "invalid_value": 0,
+        "valid_value_range": [1, 255],
+    }
+    for field, value in expected.items():
+        if encoding.get(field) != value:
+            raise DeploymentError(
+                f"Unsupported depth encoding for {field}: got {encoding.get(field)!r}, expected {value!r}"
+            )
+    try:
+        near_m = float(encoding["near_m"])
+        far_m = float(encoding["far_m"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DeploymentError("Depth encoding near_m/far_m are missing or non-numeric") from exc
+    if not np.isfinite(near_m) or not np.isfinite(far_m) or near_m < 0.0 or far_m <= near_m:
+        raise DeploymentError(f"Invalid depth encoding bounds: near_m={near_m!r}, far_m={far_m!r}")
+    return DepthEncodingContract(near_m=near_m, far_m=far_m)
+
+
+def validate_policy_metadata(
+    metadata: dict[str, Any],
+    *,
+    requires_depth: bool = False,
+) -> DepthEncodingContract | None:
     if metadata.get("protocol_version") != 1:
         raise DeploymentError(f"Unsupported GR00T deployment protocol {metadata.get('protocol_version')!r}")
     if metadata.get("embodiment_tag") != EXPECTED_TRAINING_TAG:
@@ -176,6 +241,15 @@ def validate_policy_metadata(metadata: dict[str, Any]) -> None:
                 "Unsupported checkpoint action output contract for "
                 f"{field}: got {action_output.get(field)!r}, expected {value!r}"
             )
+    if requires_depth:
+        return _validate_depth_metadata(contract)
+    video_shapes = contract.get("video_shapes")
+    if isinstance(video_shapes, dict) and video_shapes.get("ego_view") != EXPECTED_EGO_VIEW_SHAPE:
+        raise DeploymentError(
+            "Deployment dataset contract mismatch for video_shapes.ego_view: "
+            f"got {video_shapes.get('ego_view')!r}, expected {EXPECTED_EGO_VIEW_SHAPE!r}"
+        )
+    return None
 
 
 def _config_field(config: dict[str, Any], modality: str, field: str) -> Any:
@@ -187,21 +261,23 @@ def _config_field(config: dict[str, Any], modality: str, field: str) -> Any:
 
 
 def validate_model_contract(config: dict[str, Any]) -> ModelContract:
-    """Fail closed unless the server describes this G1/Dex3 colour contract."""
+    """Accept only the explicitly supported G1/Dex3 colour or RGBD contracts."""
 
     expected = {
-        "video": VIDEO_KEYS,
         "state": STATE_KEYS,
         "action": ACTION_KEYS,
         "language": LANGUAGE_KEYS,
     }
+    video_keys = tuple(_config_field(config, "video", "modality_keys"))
+    if video_keys not in SUPPORTED_VIDEO_KEYS:
+        raise DeploymentError(
+            f"Unsupported video keys from GR00T server: {video_keys}; expected exactly "
+            f"{COLOUR_VIDEO_KEYS} or {RGBD_VIDEO_KEYS}."
+        )
     for modality, keys in expected.items():
         actual = tuple(_config_field(config, modality, "modality_keys"))
         if actual != keys:
-            raise DeploymentError(
-                f"Unsupported {modality} keys from GR00T server: {actual}; expected {keys}. "
-                "Use the G1 Dex3 colour-only checkpoint or add an explicit hardware adapter."
-            )
+            raise DeploymentError(f"Unsupported {modality} keys from GR00T server: {actual}; expected {keys}.")
 
     for modality in ("video", "state", "language"):
         delta_indices = list(_config_field(config, modality, "delta_indices"))
@@ -232,7 +308,7 @@ def validate_model_contract(config: dict[str, Any]) -> ModelContract:
             )
         if state_key not in (None, key):
             raise DeploymentError(f"Action '{key}' refers to unexpected state key {state_key!r}")
-    return ModelContract(action_horizon=len(action_indices))
+    return ModelContract(action_horizon=len(action_indices), video_keys=video_keys)
 
 
 def make_observation(
@@ -241,8 +317,11 @@ def make_observation(
     left_hand: np.ndarray,
     right_hand: np.ndarray,
     instruction: str,
+    *,
+    video_keys: tuple[str, ...] = COLOUR_VIDEO_KEYS,
+    depth_gray: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Build the batched input declared by the G1 Dex3 colour modality config."""
+    """Build exactly the video/state/language inputs selected by the checkpoint."""
 
     rgb = np.asarray(rgb)
     arm = np.asarray(arm)
@@ -261,8 +340,24 @@ def make_observation(
     if instruction not in TASKS.values():
         raise DeploymentError("Instruction is not in the trained task allowlist")
 
+    if video_keys not in SUPPORTED_VIDEO_KEYS:
+        raise DeploymentError(f"Cannot build an observation for unsupported video keys {video_keys}")
+    video = {"ego_view": np.ascontiguousarray(rgb)[None, None]}
+    if video_keys == RGBD_VIDEO_KEYS:
+        if depth_gray is None:
+            raise DeploymentError("RGBD checkpoint requires depth_gray_view")
+        depth_gray = np.asarray(depth_gray)
+        if list(depth_gray.shape) != EXPECTED_DEPTH_VIEW_SHAPE or depth_gray.dtype != np.uint8:
+            raise DeploymentError(
+                "Expected uint8 depth_gray_view with shape "
+                f"{tuple(EXPECTED_DEPTH_VIEW_SHAPE)}, got {depth_gray.shape} {depth_gray.dtype}"
+            )
+        video[DEPTH_OUTPUT_KEY] = np.ascontiguousarray(depth_gray)[None, None]
+    elif depth_gray is not None:
+        raise DeploymentError("Colour-only checkpoint must not receive depth_gray_view")
+
     return {
-        "video": {"ego_view": np.ascontiguousarray(rgb)[None, None]},
+        "video": video,
         "state": {
             "left_arm": arm[:7].astype(np.float32)[None, None],
             "right_arm": arm[7:].astype(np.float32)[None, None],

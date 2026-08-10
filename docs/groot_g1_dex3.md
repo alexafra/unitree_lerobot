@@ -18,7 +18,20 @@ Use the same TeleImager server and `cam_config_server.yaml` used while recording
 python -m teleimager.image_server --rs
 ```
 
-The runner requires a fresh response from TeleImager's configuration server, requires `head_camera.enable_zmq` and an advertised 30 FPS, verifies each fresh JPEG against `head_camera.image_shape`, applies the configured binocular `color_0` crop, and converts BGR to RGB. It does not trust the requester's local YAML fallback or silently reuse TeleImager's last decoded BGR frame after a stream timeout. The rolling measured FPS check proves continuing packets only; TeleImager messages do not expose a capture timestamp or sequence number, so exact frame age and sustained 30 FPS still need hardware qualification.
+The runner requires a fresh response from TeleImager's configuration server, `head_camera.enable_zmq`, and an advertised 30 FPS. A colour-only checkpoint uses the existing JPEG stream. It verifies each fresh JPEG against `head_camera.image_shape`, applies the configured binocular `color_0` crop, and converts BGR to RGB.
+
+For a checkpoint whose exact video keys are `ego_view, depth_gray_view`, the runner automatically requires the updated atomic RGBD stream:
+
+```yaml
+head_camera:
+  enable_depth: true
+  rgbd_protocol: teleimager-rgbd-v1
+  rgbd_zmq_port: 5560
+```
+
+Each RGBD packet contains one JPEG and one aligned uint16 depth PNG from the same RealSense capture, with one sequence number. The client rejects corrupt packets, repeated sequences, and a sequence regression caused by a server restart. It reads the live RealSense scale from TeleImager and applies the checkpoint dataset's saved fixed-metric `depth_encoding` (`near_m`, `far_m`, invalid zero and replicated grayscale channels). It does not use `raw_depth_0`, does not encode video during deployment, and does not require a lossless aligned-depth sidecar in the LeRobot dataset.
+
+Neither path trusts the requester's local-YAML fallback or silently reuses a cached frame after transport timeout.
 
 ## 2. Start GR00T on the GPU PC
 
@@ -34,7 +47,15 @@ uv run --no-sync python gr00t/eval/run_gr00t_server.py \
     --port 5555
 ```
 
-`--deployment-dataset-path` reads only `meta/info.json`, and the server requires that path to be the single training dataset recorded inside the selected checkpoint's `experiment_cfg/config.yaml`. It lets the client verify the training data's robot type, 30 Hz control rate, exact ordered 28 joint names, and 480x640 RGB contract. The client also verifies the server's ordered modality keys, history/horizon, and the checkpoint processor contract: this model must decode its relative left/right arm outputs back to absolute joint positions before returning them. A mismatched checkpoint, depth model, different hand ordering, another frame rate, undecoded relative action, or another embodiment fails before command publishers are constructed.
+For the colour+depth checkpoint, change only `--model-path`:
+
+```bash
+--model-path "$HOME/Development/Models/combined_gray_depth_batch_32_acc_1_0908_2/checkpoint-10000"
+```
+
+The model's saved modality config selects the camera path automatically. There is no `--depth` or `--grayscale` deployment flag.
+
+`--deployment-dataset-path` reads only `meta/info.json`, and the server requires that path to be the single training dataset recorded inside the selected checkpoint's `experiment_cfg/config.yaml`. It lets the client verify the training data's robot type, 30 Hz control rate, exact ordered 28 joint names, video shapes, and (when selected by the model) saved depth-encoding semantics. The client also verifies the server's ordered modality keys, history/horizon, and the checkpoint processor contract: this model must decode its relative left/right arm outputs back to absolute joint positions before returning them. A mismatched video layout, different hand ordering, another frame rate, unsupported depth encoding, undecoded relative action, or another embodiment fails before command publishers are constructed.
 
 `NEW_EMBODIMENT` alone is not treated as a hardware identity; it is only the generic tag used for this fine-tune.
 
@@ -80,6 +101,8 @@ Shadow mode constructs state/camera subscribers only; it does not construct DDS 
 ## 4. IsaacLab loop verification
 
 This is optional transport and control-loop verification. It is not evidence that the policy learned the simulator scene.
+
+The current IsaacLab TeleImager path supplies colour only. Use the colour-only checkpoint for this loop unless the simulator camera server is separately extended to publish the same atomic aligned-depth contract.
 
 Start the local Unitree IsaacLab G1-29/Dex3 task:
 

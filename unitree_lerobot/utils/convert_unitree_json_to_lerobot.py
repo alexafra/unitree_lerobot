@@ -35,6 +35,16 @@ from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from unitree_lerobot.utils.constants import ROBOT_CONFIGS
+from unitree_lerobot.utils.depth_encoding import (
+    DEFAULT_DEPTH_FAR_M,
+    DEFAULT_DEPTH_NEAR_M,
+    DEFAULT_DEPTH_SCALE_M_PER_UNIT,
+    DEPTH_COLOR_SOURCE_KEY,
+    DEPTH_ENCODING,
+    DEPTH_OUTPUT_KEY,
+    DEPTH_SOURCE_KEY,
+    encode_depth_gray_rgb,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -47,12 +57,6 @@ class DatasetConfig:
 
 
 DEFAULT_DATASET_CONFIG = DatasetConfig()
-DEFAULT_DEPTH_SCALE_M_PER_UNIT = 0.001
-DEFAULT_DEPTH_NEAR_M = 0.25
-DEFAULT_DEPTH_FAR_M = 1.0
-DEPTH_SOURCE_KEY = "depth_0"
-DEPTH_COLOR_SOURCE_KEY = "color_0"
-DEPTH_OUTPUT_KEY = "depth_gray_view"
 
 
 class JsonDataset:
@@ -265,19 +269,12 @@ class JsonDataset:
                     f"got shape={depth_u16.shape}, dtype={depth_u16.dtype}"
                 )
 
-            depth_m = depth_u16.astype(np.float32) * depth_scale
-            valid = depth_u16 != 0
-
-            normalized = np.clip(
-                (depth_m - self.depth_near_m) / (self.depth_far_m - self.depth_near_m),
-                0.0,
-                1.0,
+            depth_rgb = encode_depth_gray_rgb(
+                depth_u16,
+                scale_m_per_unit=depth_scale,
+                near_m=self.depth_near_m,
+                far_m=self.depth_far_m,
             )
-
-            gray = np.zeros_like(depth_u16, dtype=np.uint8)
-            gray[valid] = 1 + np.round(254 * normalized[valid]).astype(np.uint8)
-
-            depth_rgb = np.repeat(gray[..., None], 3, axis=-1)
 
             images[output_key].append(depth_rgb)
 
@@ -515,7 +512,7 @@ def json_to_lerobot(
         dataset.meta.info["depth_encoding"] = {
             "source_key": DEPTH_SOURCE_KEY,
             "feature_key": f"observation.images.{DEPTH_OUTPUT_KEY}",
-            "encoding": "linear_grayscale_replicated_rgb",
+            "encoding": DEPTH_ENCODING,
             "default_scale_m_per_unit": DEFAULT_DEPTH_SCALE_M_PER_UNIT,
             "near_m": depth_near_m,
             "far_m": depth_far_m,

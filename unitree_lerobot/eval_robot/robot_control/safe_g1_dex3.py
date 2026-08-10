@@ -23,13 +23,17 @@ import numpy as np
 import zmq
 
 from unitree_lerobot.eval_robot.groot_client import DeploymentError
+from unitree_lerobot.eval_robot.image_server.rgbd_protocol import RGBD_PROTOCOL
 from unitree_lerobot.eval_robot.groot_contract import (
     ActionChunk,
     CONTROL_HZ,
+    DepthEncodingContract,
+    EXPECTED_DEPTH_VIEW_SHAPE,
     EXPECTED_EGO_VIEW_SHAPE,
     validate_action_chunk,
     validate_measured_state,
 )
+from unitree_lerobot.utils.depth_encoding import encode_depth_gray_rgb
 
 
 LOGGER = logging.getLogger(__name__)
@@ -60,6 +64,7 @@ PREARM_MIN_DISTINCT_SAMPLES = 5
 SIM_RIGHT_HAND_PERMUTATION = np.array([0, 1, 2, 5, 6, 3, 4], dtype=np.int64)
 TELEIMAGER_CONFIG_PORT = 60000
 TELEIMAGER_CONFIG_TIMEOUT_S = 1.0
+RGBD_MAX_RECEIVE_AGE_S = 0.15
 
 
 @dataclass(frozen=True)
@@ -70,6 +75,13 @@ class RobotState:
     arm_dq: np.ndarray
     left_hand: np.ndarray
     right_hand: np.ndarray
+
+
+@dataclass(frozen=True)
+class CameraImages:
+    rgb: np.ndarray
+    depth_gray: np.ndarray | None = None
+    sequence: int | None = None
 
 
 def initialize_dds(simulation: bool, network_interface: str | None) -> None:
@@ -167,10 +179,7 @@ class G1Dex3StateReader:
                 subscriber.Close()
 
 
-def decode_color_0_rgb(frame: Any, camera_config: dict[str, Any]) -> np.ndarray:
-    """Decode a fresh TeleImage JPEG and reproduce recorded camera ``color_0``."""
-
-    jpg = getattr(frame, "jpg", None)
+def _decode_color_jpeg_rgb(jpg: bytes | None, camera_config: dict[str, Any]) -> np.ndarray:
     if not jpg:
         raise TimeoutError("Head-camera transport has no fresh JPEG")
     encoded = np.frombuffer(jpg, dtype=np.uint8)
@@ -197,6 +206,23 @@ def decode_color_0_rgb(frame: Any, camera_config: dict[str, Any]) -> np.ndarray:
             f"Decoded color_0 shape {rgb.shape} does not match the training contract {tuple(EXPECTED_EGO_VIEW_SHAPE)}"
         )
     return rgb
+
+
+def decode_color_0_rgb(frame: Any, camera_config: dict[str, Any]) -> np.ndarray:
+    """Decode a fresh TeleImage JPEG and reproduce recorded camera ``color_0``."""
+
+    return _decode_color_jpeg_rgb(getattr(frame, "jpg", None), camera_config)
+
+
+def _decode_depth_png_u16(encoded_png: bytes) -> np.ndarray:
+    depth = cv2.imdecode(np.frombuffer(encoded_png, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if depth is None:
+        raise DeploymentError("RGBD packet contains an undecodable aligned-depth PNG")
+    if depth.dtype != np.uint16 or depth.ndim != 2:
+        raise DeploymentError(
+            f"RGBD aligned depth must decode to an HxW uint16 image; got shape={depth.shape}, dtype={depth.dtype}"
+        )
+    return depth
 
 
 def request_live_camera_config(
@@ -233,31 +259,87 @@ def request_live_camera_config(
         context.term()
 
 
-class TeleimagerColourCamera:
-    """Client for the existing robot/simulator TeleImager server."""
+def _validate_live_head_config(
+    config: dict[str, Any],
+    *,
+    requires_depth: bool,
+) -> tuple[int, float | None]:
+    head = config.get("head_camera")
+    if not isinstance(head, dict):
+        raise DeploymentError("TeleImager configuration has no head_camera object")
+    if not head.get("enable_zmq", False):
+        raise DeploymentError("TeleImager head-camera ZMQ stream is disabled")
+    try:
+        fps = float(head["fps"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DeploymentError("TeleImager head camera has no numeric FPS") from exc
+    if not np.isfinite(fps) or fps != CONTROL_HZ:
+        raise DeploymentError(
+            f"TeleImager head camera is configured for {head.get('fps')!r} FPS; "
+            f"the training contract requires {CONTROL_HZ:g} FPS"
+        )
 
-    def __init__(self, host: str):
+    port_key = "zmq_port"
+    depth_scale: float | None = None
+    if requires_depth:
+        if str(head.get("type", "")).lower() != "realsense":
+            raise DeploymentError("RGBD checkpoint requires a RealSense TeleImager head camera")
+        if not head.get("enable_depth", False):
+            raise DeploymentError("RGBD checkpoint requires TeleImager aligned depth")
+        if head.get("binocular", False):
+            raise DeploymentError("RGBD checkpoint does not support a binocular head-camera layout")
+        if head.get("rgbd_protocol") != RGBD_PROTOCOL:
+            raise DeploymentError(
+                f"RGBD checkpoint requires rgbd_protocol={RGBD_PROTOCOL!r}; got {head.get('rgbd_protocol')!r}"
+            )
+        port_key = "rgbd_zmq_port"
+        try:
+            depth_scale = float(head["depth_scale_m_per_unit"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DeploymentError("TeleImager has no valid live RealSense depth scale") from exc
+        if not np.isfinite(depth_scale) or depth_scale <= 0.0:
+            raise DeploymentError(f"TeleImager reported invalid depth scale {depth_scale!r}")
+    try:
+        port = int(head[port_key])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DeploymentError(f"TeleImager has no valid {port_key}") from exc
+    if not 1 <= port <= 65535:
+        raise DeploymentError(f"TeleImager reported invalid {port_key} {port!r}")
+    return port, depth_scale
+
+
+class TeleimagerCamera:
+    """TeleImager client selected automatically for colour or atomic RGBD."""
+
+    def __init__(self, host: str, depth_encoding: DepthEncodingContract | None = None):
         from unitree_lerobot.eval_robot.image_server.image_client import ImageClient
 
         self._client = None
+        self._depth_encoding = depth_encoding
+        self._requires_depth = depth_encoding is not None
+        self._last_rgbd_sequence: int | None = None
         live_config = request_live_camera_config(host)
-        self._client = ImageClient(host=host, request_bgr=False)
+        stream_port, depth_scale = _validate_live_head_config(
+            live_config,
+            requires_depth=self._requires_depth,
+        )
+        if depth_scale is not None:
+            self._depth_scale_m_per_unit = depth_scale
+        try:
+            self._client = ImageClient(
+                host=host,
+                request_bgr=False,
+                request_rgbd=self._requires_depth,
+            )
+        except Exception:
+            self.close()
+            raise
         self.config = self._client.get_cam_config()
         if self.config != live_config:
             self.close()
             raise DeploymentError("TeleImager ImageClient config differs from the config returned by the live server")
-        head = self.config.get("head_camera", {})
-        if not head.get("enable_zmq", False):
-            self.close()
-            raise DeploymentError("TeleImager head-camera ZMQ stream is disabled")
-        if float(head.get("fps", 0.0)) != CONTROL_HZ:
-            self.close()
-            raise DeploymentError(
-                f"TeleImager head camera is configured for {head.get('fps')!r} FPS; "
-                f"the training contract requires {CONTROL_HZ:g} FPS"
-            )
         try:
-            stream_key = (host, int(head["zmq_port"]))
+            stream_key = (host, stream_port)
             self._head_subscriber = self._client._subscriber_manager._subscriber_threads[stream_key]
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             self.close()
@@ -267,13 +349,18 @@ class TeleimagerColourCamera:
             raise DeploymentError("TeleImager head subscriber stopped during startup")
         self._reported_stream_fps = False
 
+    def _assert_subscriber_alive(self) -> None:
+        if not self._head_subscriber.is_alive():
+            raise DeploymentError("TeleImager head subscriber stopped")
+
     def read_rgb(self, timeout_s: float = 3.0) -> np.ndarray:
+        if getattr(self, "_requires_depth", False):
+            raise DeploymentError("RGBD camera must be read atomically with read()")
         deadline = time.monotonic() + timeout_s
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             try:
-                if not self._head_subscriber.is_alive():
-                    raise DeploymentError("TeleImager head subscriber stopped")
+                self._assert_subscriber_alive()
                 frame = self._client.get_head_frame()
                 try:
                     measured_fps = float(getattr(frame, "fps", 0.0))
@@ -291,16 +378,79 @@ class TeleimagerColourCamera:
                 time.sleep(0.01)
         raise TimeoutError(f"Timed out waiting for a fresh TeleImager frame ({last_error})")
 
+    def _read_rgbd(self, timeout_s: float) -> CameraImages:
+        deadline = time.monotonic() + timeout_s
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                self._assert_subscriber_alive()
+                frame = self._client.get_head_rgbd_frame()
+                if frame is None:
+                    raise TimeoutError("TeleImager RGBD transport has no fresh packet")
+                try:
+                    measured_fps = float(self._client.get_head_rgbd_fps())
+                except (TypeError, ValueError) as exc:
+                    raise TimeoutError("TeleImager RGBD stream FPS is not numeric") from exc
+                if not np.isfinite(measured_fps) or measured_fps <= 0.0:
+                    raise TimeoutError("TeleImager RGBD stream has not established a live rolling FPS")
+                if frame.received_monotonic_ns is None:
+                    raise DeploymentError("TeleImager RGBD packet has no local receive timestamp")
+                age_s = (time.monotonic_ns() - frame.received_monotonic_ns) / 1_000_000_000.0
+                if age_s < 0.0 or age_s > RGBD_MAX_RECEIVE_AGE_S:
+                    raise TimeoutError(f"TeleImager RGBD packet is stale ({age_s:.3f}s old)")
+                if self._last_rgbd_sequence is not None:
+                    if frame.sequence < self._last_rgbd_sequence:
+                        raise DeploymentError(
+                            "TeleImager RGBD sequence regressed from "
+                            f"{self._last_rgbd_sequence} to {frame.sequence}; restart the policy runner"
+                        )
+                    if frame.sequence == self._last_rgbd_sequence:
+                        raise TimeoutError(f"TeleImager RGBD sequence {frame.sequence} is not new")
+
+                rgb = _decode_color_jpeg_rgb(frame.color_jpeg, self.config)
+                depth_u16 = _decode_depth_png_u16(frame.aligned_depth_png)
+                if list(depth_u16.shape) != EXPECTED_DEPTH_VIEW_SHAPE[:2]:
+                    raise DeploymentError(
+                        f"Aligned depth shape {depth_u16.shape} does not match the training contract "
+                        f"{tuple(EXPECTED_DEPTH_VIEW_SHAPE[:2])}"
+                    )
+                assert self._depth_encoding is not None
+                try:
+                    depth_gray = encode_depth_gray_rgb(
+                        depth_u16,
+                        scale_m_per_unit=self._depth_scale_m_per_unit,
+                        near_m=self._depth_encoding.near_m,
+                        far_m=self._depth_encoding.far_m,
+                    )
+                except ValueError as exc:
+                    raise DeploymentError(f"Could not encode aligned depth: {exc}") from exc
+                self._last_rgbd_sequence = frame.sequence
+                if not self._reported_stream_fps:
+                    LOGGER.info("TeleImager atomic RGBD stream is live at %.1f measured FPS", measured_fps)
+                    self._reported_stream_fps = True
+                return CameraImages(rgb=rgb, depth_gray=depth_gray, sequence=frame.sequence)
+            except TimeoutError as exc:
+                last_error = exc
+                time.sleep(0.005)
+            except (TypeError, ValueError) as exc:
+                raise DeploymentError(f"Invalid TeleImager RGBD packet: {exc}") from exc
+        raise TimeoutError(f"Timed out waiting for a fresh TeleImager RGBD frame ({last_error})")
+
+    def read(self, timeout_s: float = 3.0) -> CameraImages:
+        if self._requires_depth:
+            return self._read_rgbd(timeout_s)
+        return CameraImages(rgb=self.read_rgb(timeout_s=timeout_s))
+
     def close(self) -> None:
         client = getattr(self, "_client", None)
         if client is not None:
             self._client = None
-            try:
-                client.close()
-            finally:
-                requester = getattr(client, "_requester", None)
-                if requester is not None:
-                    requester.close()
+            client.close()
+
+
+# Existing colour-only imports remain valid.  The default constructor still
+# selects the legacy head-colour stream.
+TeleimagerColourCamera = TeleimagerCamera
 
 
 class _G1Dex3CommandBackend:

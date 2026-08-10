@@ -17,10 +17,14 @@ from unitree_lerobot.eval_robot.eval_groot_g1 import validate_args
 from unitree_lerobot.eval_robot.groot_client import DeploymentError, MsgSerializer
 from unitree_lerobot.eval_robot.groot_contract import (
     ACTION_KEYS,
+    COLOUR_VIDEO_KEYS,
+    DepthEncodingContract,
     EXPECTED_ACTION_OUTPUT_CONTRACT,
+    EXPECTED_DEPTH_VIEW_SHAPE,
     EXPECTED_EGO_VIEW_SHAPE,
     EXPECTED_JOINT_NAMES,
     EXPECTED_ROBOT_TYPE,
+    RGBD_VIDEO_KEYS,
     TASKS,
     make_observation,
     parse_action_chunk,
@@ -28,22 +32,42 @@ from unitree_lerobot.eval_robot.groot_contract import (
     validate_policy_metadata,
     validate_measured_state,
 )
+from unitree_lerobot.eval_robot.image_server.rgbd_protocol import (
+    RGBD_PROTOCOL,
+    TeleRgbdFrame,
+    pack_rgbd_packet,
+    unpack_rgbd_packet,
+)
+
+try:
+    from unitree_lerobot.eval_robot.image_server import image_client as image_client_module
+except ModuleNotFoundError as exc:
+    image_client_module = None
+    image_client_import_error_message = str(exc)
+else:
+    image_client_import_error_message = ""
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
+    CameraImages,
     G1Dex3StateReader,
     RobotState,
     SafeG1Dex3Actuator,
     SIM_RIGHT_HAND_PERMUTATION,
+    TeleimagerCamera,
     TeleimagerColourCamera,
     _G1Dex3CommandBackend,
     _actuator_main,
     decode_color_0_rgb,
     request_live_camera_config,
 )
+from unitree_lerobot.utils.depth_encoding import encode_depth_gray_rgb
 
 
-def modality_config(action_horizon: int = 16):
+def modality_config(action_horizon: int = 16, *, rgbd: bool = False):
     return {
-        "video": {"delta_indices": [0], "modality_keys": ["ego_view"]},
+        "video": {
+            "delta_indices": [0],
+            "modality_keys": list(RGBD_VIDEO_KEYS if rgbd else COLOUR_VIDEO_KEYS),
+        },
         "state": {"delta_indices": [0], "modality_keys": list(ACTION_KEYS)},
         "action": {
             "delta_indices": list(range(action_horizon)),
@@ -128,7 +152,10 @@ class GrootG1DeploymentTests(unittest.TestCase):
         except ImportError as exc:
             self.skipTest(f"Isaac-GR00T is not installed in this environment: {exc}")
         value = {
-            "video": {"ego_view": np.zeros((1, 1, 4, 5, 3), dtype=np.uint8)},
+            "video": {
+                "ego_view": np.zeros((1, 1, 4, 5, 3), dtype=np.uint8),
+                "depth_gray_view": np.full((1, 1, 4, 5, 3), 42, dtype=np.uint8),
+            },
             "state": {"left_arm": np.arange(7, dtype=np.float32)[None, None]},
         }
 
@@ -136,6 +163,10 @@ class GrootG1DeploymentTests(unittest.TestCase):
         np.testing.assert_array_equal(decoded_by_server["state"]["left_arm"], value["state"]["left_arm"])
         decoded_by_client = MsgSerializer.from_bytes(ServerSerializer.to_bytes(value))
         np.testing.assert_array_equal(decoded_by_client["video"]["ego_view"], value["video"]["ego_view"])
+        np.testing.assert_array_equal(
+            decoded_by_client["video"]["depth_gray_view"],
+            value["video"]["depth_gray_view"],
+        )
 
     def test_server_modality_config_round_trips_without_client_gr00t_types(self):
         try:
@@ -143,11 +174,13 @@ class GrootG1DeploymentTests(unittest.TestCase):
             from gr00t.policy.server_client import MsgSerializer as ServerSerializer
         except ImportError as exc:
             self.skipTest(f"Isaac-GR00T is not installed in this environment: {exc}")
-        config = {name: ModalityConfig(**value) for name, value in modality_config().items()}
-
-        decoded = MsgSerializer.from_bytes(ServerSerializer.to_bytes(config))
-
-        self.assertEqual(validate_model_contract(decoded).action_horizon, 16)
+        for rgbd in (False, True):
+            with self.subTest(rgbd=rgbd):
+                config = {name: ModalityConfig(**value) for name, value in modality_config(rgbd=rgbd).items()}
+                decoded = MsgSerializer.from_bytes(ServerSerializer.to_bytes(config))
+                contract = validate_model_contract(decoded)
+                self.assertEqual(contract.action_horizon, 16)
+                self.assertEqual(contract.requires_depth, rgbd)
 
     def test_model_contract_rejects_a_different_embodiment_layout(self):
         config = modality_config()
@@ -155,6 +188,17 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
         with self.assertRaisesRegex(DeploymentError, "Unsupported state keys"):
             validate_model_contract(config)
+
+    def test_model_contract_accepts_only_the_exact_ordered_rgbd_views(self):
+        contract = validate_model_contract(modality_config(rgbd=True))
+
+        self.assertTrue(contract.requires_depth)
+        self.assertEqual(contract.video_keys, RGBD_VIDEO_KEYS)
+
+        reversed_config = modality_config(rgbd=True)
+        reversed_config["video"]["modality_keys"].reverse()
+        with self.assertRaisesRegex(DeploymentError, "Unsupported video keys"):
+            validate_model_contract(reversed_config)
 
     def test_policy_metadata_requires_the_explicit_g1_training_tag(self):
         metadata = {
@@ -167,9 +211,24 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 "observation_state_names": EXPECTED_JOINT_NAMES,
                 "action_names": EXPECTED_JOINT_NAMES,
                 "ego_view_shape": EXPECTED_EGO_VIEW_SHAPE,
+                "video_shapes": {
+                    "ego_view": EXPECTED_EGO_VIEW_SHAPE,
+                    "depth_gray_view": EXPECTED_DEPTH_VIEW_SHAPE,
+                },
+                "depth_encoding": {
+                    "source_key": "depth_0",
+                    "feature_key": "observation.images.depth_gray_view",
+                    "encoding": "linear_grayscale_replicated_rgb",
+                    "near_m": 0.25,
+                    "far_m": 1.0,
+                    "invalid_value": 0,
+                    "valid_value_range": [1, 255],
+                },
             },
         }
         validate_policy_metadata(metadata)
+        depth_contract = validate_policy_metadata(metadata, requires_depth=True)
+        self.assertEqual(depth_contract, DepthEncodingContract(near_m=0.25, far_m=1.0))
         with self.assertRaisesRegex(DeploymentError, "deployment protocol"):
             validate_policy_metadata({**metadata, "protocol_version": 2})
         with self.assertRaisesRegex(DeploymentError, "no deployment dataset contract"):
@@ -179,6 +238,21 @@ class GrootG1DeploymentTests(unittest.TestCase):
                     "embodiment_tag": "new_embodiment",
                     "action_output_contract": EXPECTED_ACTION_OUTPUT_CONTRACT,
                 }
+            )
+        with self.assertRaisesRegex(DeploymentError, "Unsupported depth encoding"):
+            validate_policy_metadata(
+                {
+                    **metadata,
+                    "dataset_contract": {
+                        **metadata["dataset_contract"],
+                        "depth_encoding": {
+                            **metadata["dataset_contract"]["depth_encoding"],
+                            "near_m": 0.25,
+                            "encoding": "per_frame_normalized",
+                        },
+                    },
+                },
+                requires_depth=True,
             )
         with self.assertRaisesRegex(DeploymentError, "requires GR00T training tag"):
             validate_policy_metadata({**metadata, "embodiment_tag": "unitree_g1_sonic"})
@@ -315,6 +389,32 @@ class GrootG1DeploymentTests(unittest.TestCase):
             [[TASKS["pick-red-cup"]]],
         )
 
+    def test_rgbd_observation_contains_exactly_the_two_checkpoint_views(self):
+        depth = np.full((480, 640, 3), 42, dtype=np.uint8)
+        observation = make_observation(
+            np.zeros((480, 640, 3), dtype=np.uint8),
+            np.zeros(14),
+            np.zeros(7),
+            np.zeros(7),
+            TASKS["pick-red-cup"],
+            video_keys=RGBD_VIDEO_KEYS,
+            depth_gray=depth,
+        )
+
+        self.assertEqual(tuple(observation["video"]), RGBD_VIDEO_KEYS)
+        self.assertEqual(observation["video"]["depth_gray_view"].shape, (1, 1, 480, 640, 3))
+        np.testing.assert_array_equal(observation["video"]["depth_gray_view"][0, 0], depth)
+
+        with self.assertRaisesRegex(DeploymentError, "requires depth_gray_view"):
+            make_observation(
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros(14),
+                np.zeros(7),
+                np.zeros(7),
+                TASKS["pick-red-cup"],
+                video_keys=RGBD_VIDEO_KEYS,
+            )
+
     def test_action_parser_combines_arm_order_and_keeps_execution_prefix(self):
         action = valid_action()
         action["left_arm"][:] = 0.01
@@ -369,6 +469,272 @@ class GrootG1DeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(TimeoutError, "fresh JPEG"):
             decode_color_0_rgb(stale, config)
 
+    def test_atomic_rgbd_packet_round_trips_and_decodes_both_images(self):
+        bgr = np.zeros((4, 5, 3), dtype=np.uint8)
+        bgr[:, :] = [1, 2, 3]
+        depth = np.array(
+            [[0, 250, 625, 1000, 1200]] * 4,
+            dtype=np.uint16,
+        )
+        color_ok, color_jpeg = cv2.imencode(".jpg", bgr)
+        depth_ok, depth_png = cv2.imencode(".png", depth)
+        self.assertTrue(color_ok and depth_ok)
+
+        packet = pack_rgbd_packet(17, 123456, color_jpeg.tobytes(), depth_png.tobytes())
+        frame = unpack_rgbd_packet(packet, received_monotonic_ns=654321)
+
+        self.assertEqual(len(packet) - len(color_jpeg) - len(depth_png), 40)
+        self.assertEqual(frame.sequence, 17)
+        self.assertEqual(frame.server_capture_monotonic_ns, 123456)
+        self.assertEqual(frame.received_monotonic_ns, 654321)
+        decoded_bgr = cv2.imdecode(np.frombuffer(frame.color_jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        decoded_depth = cv2.imdecode(
+            np.frombuffer(frame.aligned_depth_png, dtype=np.uint8),
+            cv2.IMREAD_UNCHANGED,
+        )
+        self.assertEqual(decoded_bgr.shape, bgr.shape)
+        np.testing.assert_array_equal(decoded_depth, depth)
+
+    def test_atomic_rgbd_packet_rejects_corruption_and_extra_bytes(self):
+        packet = pack_rgbd_packet(1, 2, b"jpeg", b"png")
+
+        for corrupt in (packet[:20], b"BADMAGIC" + packet[8:], packet + b"extra"):
+            with self.subTest(length=len(corrupt)):
+                with self.assertRaises(ValueError):
+                    unpack_rgbd_packet(corrupt)
+
+    def test_image_client_rgbd_mode_subscribes_only_the_atomic_head_port(self):
+        if image_client_module is None:
+            self.skipTest(f"TeleImager client dependencies are unavailable: {image_client_import_error_message}")
+        config = {
+            "head_camera": {
+                "enable_zmq": True,
+                "enable_webrtc": False,
+                "zmq_port": 5555,
+                "rgbd_zmq_port": 5560,
+            },
+            "left_wrist_camera": {"enable_zmq": False},
+            "right_wrist_camera": {"enable_zmq": False},
+        }
+        packet = pack_rgbd_packet(4, 5, b"jpeg", b"png")
+
+        class FakeRequester:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def request(self):
+                return config
+
+            def close(self):
+                pass
+
+        class FakeManager:
+            def __init__(self):
+                self.calls = []
+
+            def subscribe(self, host, port, request_bgr=False):
+                self.calls.append((host, port, request_bgr))
+                return image_client_module.TeleImage(
+                    fps=30.0,
+                    jpg=packet,
+                    received_monotonic_ns=10,
+                )
+
+            def close(self):
+                pass
+
+        manager = FakeManager()
+        with (
+            mock.patch.object(image_client_module, "ZMQ_Requester", FakeRequester),
+            mock.patch.object(
+                image_client_module.ZMQ_SubscriberManager,
+                "get_instance",
+                return_value=manager,
+            ),
+        ):
+            client = image_client_module.ImageClient(host="camera", request_rgbd=True)
+            with self.assertRaisesRegex(RuntimeError, "use get_head_rgbd_frame"):
+                client.get_head_frame()
+            frame = client.get_head_rgbd_frame()
+
+        self.assertEqual(manager.calls, [("camera", 5560, False), ("camera", 5560, False)])
+        self.assertEqual(frame.sequence, 4)
+        self.assertEqual(frame.received_monotonic_ns, 10)
+
+    def test_image_client_missing_rgbd_port_closes_requester_and_manager(self):
+        if image_client_module is None:
+            self.skipTest(f"TeleImager client dependencies are unavailable: {image_client_import_error_message}")
+        config = {
+            "head_camera": {"enable_zmq": True, "enable_webrtc": False, "zmq_port": 5555},
+            "left_wrist_camera": {"enable_zmq": False},
+            "right_wrist_camera": {"enable_zmq": False},
+        }
+
+        class FakeRequester:
+            instance = None
+
+            def __init__(self, *_args, **_kwargs):
+                type(self).instance = self
+                self.closed = False
+
+            def request(self):
+                return config
+
+            def close(self):
+                self.closed = True
+
+        class FakeManager:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        manager = FakeManager()
+        with (
+            mock.patch.object(image_client_module, "ZMQ_Requester", FakeRequester),
+            mock.patch.object(
+                image_client_module.ZMQ_SubscriberManager,
+                "get_instance",
+                return_value=manager,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no rgbd_zmq_port"):
+                image_client_module.ImageClient(host="camera", request_rgbd=True)
+
+        self.assertTrue(FakeRequester.instance.closed)
+        self.assertTrue(manager.closed)
+
+    def test_image_client_subscribe_failure_closes_partial_resources(self):
+        if image_client_module is None:
+            self.skipTest(f"TeleImager client dependencies are unavailable: {image_client_import_error_message}")
+        config = {
+            "head_camera": {
+                "enable_zmq": True,
+                "enable_webrtc": False,
+                "zmq_port": 5555,
+                "rgbd_zmq_port": 5560,
+            },
+            "left_wrist_camera": {"enable_zmq": False},
+            "right_wrist_camera": {"enable_zmq": False},
+        }
+
+        class FakeRequester:
+            instance = None
+
+            def __init__(self, *_args, **_kwargs):
+                type(self).instance = self
+                self.closed = False
+
+            def request(self):
+                return config
+
+            def close(self):
+                self.closed = True
+
+        class FailingManager:
+            def __init__(self):
+                self.closed = False
+
+            def subscribe(self, *_args, **_kwargs):
+                raise ConnectionError("subscriber startup failed")
+
+            def close(self):
+                self.closed = True
+
+        manager = FailingManager()
+        with (
+            mock.patch.object(image_client_module, "ZMQ_Requester", FakeRequester),
+            mock.patch.object(
+                image_client_module.ZMQ_SubscriberManager,
+                "get_instance",
+                return_value=manager,
+            ),
+        ):
+            with self.assertRaisesRegex(ConnectionError, "subscriber startup failed"):
+                image_client_module.ImageClient(host="camera", request_rgbd=True)
+
+        self.assertTrue(FakeRequester.instance.closed)
+        self.assertTrue(manager.closed)
+
+    def test_rgbd_camera_encodes_atomic_aligned_depth_and_requires_a_new_sequence(self):
+        bgr = np.zeros((480, 640, 3), dtype=np.uint8)
+        depth = np.full((480, 640), 625, dtype=np.uint16)
+        color_ok, color_jpeg = cv2.imencode(".jpg", bgr)
+        depth_ok, depth_png = cv2.imencode(".png", depth)
+        self.assertTrue(color_ok and depth_ok)
+        frame = TeleRgbdFrame(
+            sequence=9,
+            server_capture_monotonic_ns=1,
+            received_monotonic_ns=time.monotonic_ns(),
+            color_jpeg=color_jpeg.tobytes(),
+            aligned_depth_png=depth_png.tobytes(),
+        )
+
+        camera = object.__new__(TeleimagerCamera)
+        camera._requires_depth = True
+        camera._depth_encoding = DepthEncodingContract(near_m=0.25, far_m=1.0)
+        camera._depth_scale_m_per_unit = 0.001
+        camera._last_rgbd_sequence = None
+        camera._reported_stream_fps = False
+        camera._head_subscriber = SimpleNamespace(is_alive=lambda: True)
+
+        class FakeRgbdClient:
+            def __init__(self):
+                self.fps_calls = 0
+
+            def get_head_rgbd_frame(self):
+                return frame
+
+            def get_head_rgbd_fps(self):
+                self.fps_calls += 1
+                return 0.0 if self.fps_calls == 1 else 30.0
+
+        camera._client = FakeRgbdClient()
+        camera.config = {
+            "head_camera": {
+                "image_shape": [480, 640],
+                "binocular": False,
+            }
+        }
+
+        images = camera.read(timeout_s=0.05)
+
+        self.assertIsInstance(images, CameraImages)
+        self.assertEqual(images.sequence, 9)
+        self.assertEqual(camera._client.fps_calls, 2)
+        self.assertTrue(camera._reported_stream_fps)
+        expected = encode_depth_gray_rgb(
+            depth,
+            scale_m_per_unit=0.001,
+            near_m=0.25,
+            far_m=1.0,
+        )
+        np.testing.assert_array_equal(images.depth_gray, expected)
+        with self.assertRaisesRegex(TimeoutError, "not new"):
+            camera.read(timeout_s=0.015)
+
+    def test_rgbd_camera_fails_closed_on_server_sequence_regression(self):
+        frame = TeleRgbdFrame(
+            sequence=3,
+            server_capture_monotonic_ns=1,
+            received_monotonic_ns=time.monotonic_ns(),
+            color_jpeg=b"unused",
+            aligned_depth_png=b"unused",
+        )
+        camera = object.__new__(TeleimagerCamera)
+        camera._requires_depth = True
+        camera._last_rgbd_sequence = 8
+        camera._reported_stream_fps = False
+        camera._head_subscriber = SimpleNamespace(is_alive=lambda: True)
+        camera._client = SimpleNamespace(
+            get_head_rgbd_frame=lambda: frame,
+            get_head_rgbd_fps=lambda: 30.0,
+        )
+
+        with self.assertRaisesRegex(DeploymentError, "sequence regressed"):
+            camera.read(timeout_s=0.05)
+
     def test_camera_config_request_refuses_local_fallback_on_live_timeout(self):
         class FakeSocket:
             def __init__(self):
@@ -421,6 +787,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 "enable_zmq": True,
                 "fps": 30,
                 "image_shape": [480, 640],
+                "zmq_port": 5555,
             }
         }
         stale_config = {
@@ -428,6 +795,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 "enable_zmq": True,
                 "fps": 30,
                 "image_shape": [720, 1280],
+                "zmq_port": 5555,
             }
         }
 
@@ -459,6 +827,41 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 TeleimagerColourCamera("camera-host")
 
         self.assertTrue(FakeImageClient.instance.closed)
+
+    def test_rgbd_camera_rejects_missing_atomic_port_before_constructing_client(self):
+        live_config = {
+            "head_camera": {
+                "enable_zmq": True,
+                "fps": 30,
+                "image_shape": [480, 640],
+                "type": "realsense",
+                "enable_depth": True,
+                "binocular": False,
+                "rgbd_protocol": RGBD_PROTOCOL,
+                "depth_scale_m_per_unit": 0.001,
+            }
+        }
+
+        class FakeImageClient:
+            calls = 0
+
+            def __init__(self, **_kwargs):
+                type(self).calls += 1
+
+        module_name = "unitree_lerobot.eval_robot.image_server.image_client"
+        fake_module = ModuleType(module_name)
+        fake_module.ImageClient = FakeImageClient
+        with (
+            mock.patch.dict(sys.modules, {module_name: fake_module}),
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.request_live_camera_config",
+                return_value=live_config,
+            ),
+        ):
+            with self.assertRaisesRegex(DeploymentError, "no valid rgbd_zmq_port"):
+                TeleimagerCamera("camera-host", DepthEncodingContract(near_m=0.25, far_m=1.0))
+
+        self.assertEqual(FakeImageClient.calls, 0)
 
     def test_camera_waits_for_a_live_rolling_stream_rate(self):
         bgr = np.zeros((480, 640, 3), dtype=np.uint8)
