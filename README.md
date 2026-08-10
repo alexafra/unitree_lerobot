@@ -275,7 +275,8 @@ If you want to use multi-GPU training, please refer to the details [here](https:
 For an Isaac-GR00T N1.7 checkpoint controlling a G1-29 with Dex3 hands, use the
 [guarded GR00T deployment guide](docs/groot_g1_dex3.md). Its default shadow mode is
 publisher-free; real actuation remains explicitly fail-closed pending hardware
-qualification.
+qualification. For the split GPU-PC/Wi-Fi/laptop/PC2 topology, follow the
+[laptop shadow-mode checklist](docs/groot_g1_laptop_shadow.md).
 
 To test your trained model on a real robot, you can use the eval_g1.py script located in the eval_robot folder. Here’s how to run it:
 
