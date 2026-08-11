@@ -43,6 +43,7 @@ from unitree_lerobot.eval_robot.eval_groot_g1 import (
 from unitree_lerobot.eval_robot.groot_client import DeploymentError, MsgSerializer
 from unitree_lerobot.eval_robot.groot_contract import (
     ACTION_KEYS,
+    ActionChunk,
     COLOUR_VIDEO_KEYS,
     DepthEncodingContract,
     EXPECTED_ACTION_OUTPUT_CONTRACT,
@@ -3537,20 +3538,79 @@ class GrootG1DeploymentTests(unittest.TestCase):
             state,
             load_initialization_spec("measured", task_name="pick-red-cup"),
         )
-        with (
-            mock.patch(
-                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.INITIALIZATION_CONVERGENCE_TIMEOUT_S",
-                0.03,
-            ),
-            self.assertRaisesRegex(DeploymentError, "did not converge"),
+        with mock.patch(
+            "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.INITIALIZATION_CONVERGENCE_TIMEOUT_S",
+            0.03,
         ):
-            _execute_initialization(
+            with self.assertRaisesRegex(DeploymentError, "did not converge") as raised:
+                _execute_initialization(
+                    backend,
+                    chunk,
+                    threading.Event(),
+                    FakeHeartbeat(time.monotonic()),
+                    float("inf"),
+                )
+        message = str(raised.exception)
+        self.assertIn("kLeftShoulderPitch", message)
+        self.assertIn("measured minus target=+0.000 rad", message)
+        self.assertIn("max arm dq=0.200 rad/s", message)
+
+    def test_initialization_allows_real_arm_to_settle_after_three_seconds(self):
+        class Clock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+        class AdvancingEvent:
+            def is_set(self):
+                return False
+
+            def wait(self, timeout):
+                clock.now += timeout
+                heartbeat.value = clock.now
+
+        class SlowlySettlingBackend(FakeBackend):
+            def __init__(self):
+                super().__init__(False, None)
+
+            def state(self):
+                settling = clock.now < 3.2
+                return RobotState(
+                    captured_at=clock.now,
+                    mode_machine=0,
+                    arm=self._arm_target + (0.064 if settling else 0.0),
+                    arm_dq=np.full(14, 0.02 if settling else 0.0),
+                    left_hand=self._left_target.copy(),
+                    right_hand=self._right_target.copy(),
+                )
+
+        clock = Clock()
+        heartbeat = FakeHeartbeat(clock.now)
+        backend = SlowlySettlingBackend()
+        chunk = ActionChunk(
+            arm=np.zeros((1, 14)),
+            left_hand=np.zeros((1, 7)),
+            right_hand=np.zeros((1, 7)),
+        )
+        module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+        with (
+            mock.patch(f"{module}.time.monotonic", clock.monotonic),
+            mock.patch(f"{module}.PUBLISH_HZ", 10.0),
+            mock.patch(f"{module}.INITIALIZATION_CONVERGENCE_DWELL_S", 0.2),
+            mock.patch(f"{module}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 2),
+        ):
+            initialized = _execute_initialization(
                 backend,
                 chunk,
-                threading.Event(),
-                FakeHeartbeat(time.monotonic()),
+                AdvancingEvent(),
+                heartbeat,
                 float("inf"),
             )
+
+        self.assertTrue(initialized)
+        self.assertGreater(clock.now, 3.0)
+        self.assertLess(clock.now, 10.0)
 
     def test_initialization_start_dwell_defers_until_held_state_is_stationary(self):
         class SettlingBackend:

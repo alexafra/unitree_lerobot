@@ -103,7 +103,7 @@ INITIALIZATION_MIN_MOVE_S = 0.50
 INITIALIZATION_MAX_DURATION_S = 30.0
 INITIALIZATION_START_TIMEOUT_S = 3.0
 INITIALIZATION_START_DWELL_S = 0.50
-INITIALIZATION_CONVERGENCE_TIMEOUT_S = 3.0
+INITIALIZATION_CONVERGENCE_TIMEOUT_S = 10.0
 INITIALIZATION_CONVERGENCE_DWELL_S = 0.50
 INITIALIZATION_MIN_DISTINCT_SAMPLES = 5
 INITIALIZATION_ARM_TOLERANCE_RAD = 0.05
@@ -1595,9 +1595,15 @@ def _execute_initialization(
                 distinct_converged_samples = 0
                 last_converged_capture = float("-inf")
             if now > endpoint_deadline:
+                _, arm_joint, arm_name, arm_delta = _largest_named_value(
+                    (("arm", state.arm - backend._arm_target, ARM_JOINT_NAMES),)
+                )
                 raise DeploymentError(
                     "Initialization target did not converge: "
-                    f"arm error={arm_error:.3f} rad, hand error={hand_error:.3f} rad"
+                    f"arm error={arm_error:.3f} rad at joint {arm_joint} ({arm_name}), "
+                    f"measured minus target={arm_delta:+.3f} rad, "
+                    f"max arm dq={float(np.max(np.abs(state.arm_dq))):.3f} rad/s, "
+                    f"hand error={hand_error:.3f} rad"
                 )
 
         backend.publish()
