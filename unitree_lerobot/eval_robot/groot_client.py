@@ -124,13 +124,57 @@ class Gr00tClient:
             raise DeploymentError("GR00T server returned invalid policy metadata")
         return response
 
-    def get_action(self, observation: dict[str, Any]) -> dict[str, Any]:
-        response = self.call("get_action", {"observation": observation, "options": None})
+    def get_action(
+        self,
+        observation: dict[str, Any],
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        response = self.call("get_action", {"observation": observation, "options": options})
         if not isinstance(response, (list, tuple)) or len(response) != 2:
             raise DeploymentError("GR00T server returned an invalid action response")
         action, info = response
         if not isinstance(action, dict) or not isinstance(info, dict):
             raise DeploymentError("GR00T server returned invalid action/info objects")
+        if isinstance(options, dict) and options.get("inference_mode") == "rtc":
+            previous_action = options.get("rtc_previous_action")
+            if not isinstance(previous_action, dict) or not previous_action:
+                raise DeploymentError("Local RTC request has no physical previous-action tail")
+            if any(
+                not isinstance(value, np.ndarray) or value.ndim != 3
+                for value in previous_action.values()
+            ):
+                raise DeploymentError("Local RTC previous-action tail has an invalid shape")
+            tail_horizons = {int(value.shape[1]) for value in previous_action.values()}
+            if len(tail_horizons) != 1:
+                raise DeploymentError("Local RTC previous-action tail has inconsistent shapes")
+            expected = {
+                "rtc_applied": True,
+                "rtc_previous_action_horizon": next(iter(tail_horizons)),
+                "rtc_overlap_steps": options.get("rtc_overlap_steps"),
+                "rtc_frozen_steps": options.get("rtc_frozen_steps"),
+            }
+            mismatched = {
+                key: (info.get(key), value)
+                for key, value in expected.items()
+                if info.get(key) != value
+            }
+            try:
+                ramp_rate = float(info["rtc_ramp_rate"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DeploymentError("GR00T server omitted the applied RTC ramp rate") from exc
+            requested_ramp_rate = options.get("rtc_ramp_rate")
+            if requested_ramp_rate is not None and not np.isclose(
+                ramp_rate,
+                float(requested_ramp_rate),
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                mismatched["rtc_ramp_rate"] = (ramp_rate, requested_ramp_rate)
+            if mismatched or not np.isfinite(ramp_rate) or ramp_rate <= 0.0:
+                raise DeploymentError(
+                    "GR00T server did not acknowledge the requested RTC conditioning: "
+                    f"mismatched={mismatched}, rtc_ramp_rate={ramp_rate!r}"
+                )
         return action
 
     def close(self) -> None:

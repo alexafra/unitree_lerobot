@@ -90,6 +90,15 @@ TELEIMAGER_CONFIG_TIMEOUT_S = 1.0
 RGBD_MAX_RECEIVE_AGE_S = 0.15
 
 
+class RtcTerminalEvent(DeploymentError):
+    """The child has already entered powered HOLD or completed its RTC budget."""
+
+    def __init__(self, outcome: str, detail: Any):
+        super().__init__(f"RTC {outcome}: {detail}")
+        self.outcome = outcome
+        self.detail = detail
+
+
 @dataclass(frozen=True)
 class RobotState:
     captured_at: float
@@ -105,6 +114,15 @@ class CameraImages:
     rgb: np.ndarray
     depth_gray: np.ndarray | None = None
     sequence: int | None = None
+
+
+@dataclass(frozen=True)
+class RtcExecutionSnapshot:
+    sequence: int
+    action_index: int
+    plan_length: int
+    total_actions: int
+    action_budget: int
 
 
 def _largest_named_value(
@@ -1175,6 +1193,9 @@ def _actuator_main(
         chunk_index = 0
         next_action_at = 0.0
         holding = True
+        rtc_mode = False
+        rtc_total_actions = 0
+        rtc_action_budget = 0
 
         while not stop_event.is_set():
             loop_started = time.monotonic()
@@ -1190,7 +1211,7 @@ def _actuator_main(
                 if kind == "hold":
                     if not isinstance(command, tuple) or len(command) != 2:
                         raise DeploymentError("Malformed hold command")
-                    if chunk is not None:
+                    if chunk is not None and not rtc_mode:
                         raise DeploymentError("Cannot enter hold before the current chunk completes")
                     _, created_at = command
                     try:
@@ -1201,6 +1222,9 @@ def _actuator_main(
                         raise DeploymentError("Hold command expired before execution")
                     state = backend.state()
                     backend.set_target(state.arm, state.left_hand, state.right_hand)
+                    chunk = None
+                    chunk_index = 0
+                    rtc_mode = False
                     tracking_checks_after = time.monotonic()
                     holding = True
                     _status(status_queue, "holding", last_sequence)
@@ -1257,28 +1281,238 @@ def _actuator_main(
                     _status(status_queue, "warm_started", warm_start.label)
                     continue
 
-                if not isinstance(command, tuple) or len(command) != 6 or kind != "chunk":
+                if kind == "rtc_snapshot":
+                    if not isinstance(command, tuple) or len(command) != 2:
+                        raise DeploymentError("Malformed RTC snapshot command")
+                    _, expected_sequence = command
+                    if (
+                        not rtc_mode
+                        or chunk is None
+                        or isinstance(expected_sequence, bool)
+                        or not isinstance(expected_sequence, int)
+                        or expected_sequence != chunk_sequence
+                    ):
+                        _status(status_queue, "rtc_rejected", "snapshot has no matching active plan")
+                        continue
+                    if chunk_index >= chunk.length:
+                        state = backend.state()
+                        backend.set_target(state.arm, state.left_hand, state.right_hand)
+                        tracking_checks_after = time.monotonic()
+                        terminal_kind = "rtc_completed" if rtc_total_actions >= rtc_action_budget else "rtc_underrun"
+                        _status(status_queue, terminal_kind, rtc_total_actions)
+                        chunk = None
+                        chunk_index = 0
+                        rtc_mode = False
+                        holding = True
+                        continue
+                    _status(
+                        status_queue,
+                        "rtc_snapshot",
+                        {
+                            "sequence": chunk_sequence,
+                            "action_index": chunk_index,
+                            "plan_length": chunk.length,
+                            "total_actions": rtc_total_actions,
+                            "action_budget": rtc_action_budget,
+                        },
+                    )
+                    # Do not continue: an action that is due in this publisher
+                    # iteration must still advance after the snapshot.  The
+                    # replacement path accounts for that action in its child-
+                    # measured delay.
+
+                elif kind == "rtc_start":
+                    if not isinstance(command, tuple) or len(command) != 8:
+                        raise DeploymentError("Malformed RTC start command")
+                    _, sequence, created_at, action_budget, arm, left, right, expected_horizon = command
+                    if chunk is not None or rtc_mode:
+                        raise DeploymentError("RTC can start only with no active plan")
+                    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence != last_sequence + 1:
+                        raise DeploymentError(f"Stale/out-of-order RTC plan {sequence!r}; expected {last_sequence + 1}")
+                    if isinstance(action_budget, bool) or not isinstance(action_budget, int) or action_budget < 1:
+                        raise DeploymentError("RTC action budget must be a positive integer")
+                    try:
+                        plan_age = time.monotonic() - float(created_at)
+                    except (TypeError, ValueError) as exc:
+                        raise DeploymentError("RTC plan timestamp is invalid") from exc
+                    if not np.isfinite(plan_age) or not 0.0 <= plan_age <= CHUNK_MAX_AGE_S:
+                        raise DeploymentError(f"RTC plan {sequence} expired before execution")
+                    proposed = ActionChunk(arm=arm, left_hand=left, right_hand=right)
+                    if proposed.length != expected_horizon:
+                        raise DeploymentError("RTC plan length changed in transit")
+                    state = backend.state()
+                    validate_action_chunk(proposed, state.arm, state.left_hand, state.right_hand)
+                    chunk = proposed
+                    chunk_sequence = int(sequence)
+                    chunk_index = 0
+                    next_action_at = time.monotonic()
+                    last_sequence = sequence
+                    holding = False
+                    rtc_mode = True
+                    rtc_total_actions = 0
+                    rtc_action_budget = action_budget
+                    _status(status_queue, "rtc_started", sequence)
+
+                elif kind == "rtc_replace":
+                    if not isinstance(command, tuple) or len(command) != 10:
+                        raise DeploymentError("Malformed RTC replacement command")
+                    (
+                        _,
+                        sequence,
+                        created_at,
+                        expected_sequence,
+                        request_index,
+                        expected_overlap,
+                        arm,
+                        left,
+                        right,
+                        expected_horizon,
+                    ) = command
+                    if rtc_mode and rtc_total_actions >= rtc_action_budget:
+                        state = backend.state()
+                        backend.set_target(state.arm, state.left_hand, state.right_hand)
+                        chunk = None
+                        chunk_index = 0
+                        rtc_mode = False
+                        holding = True
+                        tracking_checks_after = time.monotonic()
+                        _status(status_queue, "rtc_completed", rtc_total_actions)
+                        continue
+                    stale = (
+                        not rtc_mode
+                        or chunk is None
+                        or expected_sequence != chunk_sequence
+                        or isinstance(request_index, bool)
+                        or not isinstance(request_index, int)
+                        or request_index < 0
+                        or request_index > chunk_index
+                        or expected_overlap != (chunk.length - request_index)
+                    )
+                    if stale:
+                        state = backend.state()
+                        backend.set_target(state.arm, state.left_hand, state.right_hand)
+                        chunk = None
+                        chunk_index = 0
+                        rtc_mode = False
+                        holding = True
+                        tracking_checks_after = time.monotonic()
+                        _status(status_queue, "rtc_rejected", "stale plan generation or request index")
+                        continue
+                    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence != last_sequence + 1:
+                        raise DeploymentError(f"Stale/out-of-order RTC plan {sequence!r}; expected {last_sequence + 1}")
+                    try:
+                        plan_age = time.monotonic() - float(created_at)
+                    except (TypeError, ValueError) as exc:
+                        raise DeploymentError("RTC replacement timestamp is invalid") from exc
+                    if not np.isfinite(plan_age) or not 0.0 <= plan_age <= CHUNK_MAX_AGE_S:
+                        raise DeploymentError(f"RTC replacement {sequence} expired before execution")
+
+                    replacement = ActionChunk(arm=arm, left_hand=left, right_hand=right)
+                    if replacement.length != expected_horizon:
+                        raise DeploymentError("RTC replacement length changed in transit")
+                    # Validate every predicted target and internal step, including
+                    # the portion that elapsed during inference.
+                    try:
+                        validate_action_chunk(
+                            replacement,
+                            replacement.arm[0],
+                            replacement.left_hand[0],
+                            replacement.right_hand[0],
+                        )
+                    except DeploymentError as exc:
+                        state = backend.state()
+                        backend.set_target(state.arm, state.left_hand, state.right_hand)
+                        chunk = None
+                        chunk_index = 0
+                        rtc_mode = False
+                        holding = True
+                        tracking_checks_after = time.monotonic()
+                        _status(status_queue, "rtc_rejected", f"invalid replacement plan: {exc}")
+                        continue
+                    elapsed_actions = chunk_index - request_index
+                    if elapsed_actions >= expected_overlap or elapsed_actions >= replacement.length:
+                        state = backend.state()
+                        backend.set_target(state.arm, state.left_hand, state.right_hand)
+                        chunk = None
+                        chunk_index = 0
+                        rtc_mode = False
+                        holding = True
+                        tracking_checks_after = time.monotonic()
+                        _status(
+                            status_queue,
+                            "rtc_underrun",
+                            {
+                                "sequence": expected_sequence,
+                                "elapsed_actions": elapsed_actions,
+                                "overlap": expected_overlap,
+                            },
+                        )
+                        continue
+
+                    suffix = ActionChunk(
+                        arm=np.ascontiguousarray(replacement.arm[elapsed_actions:]),
+                        left_hand=np.ascontiguousarray(replacement.left_hand[elapsed_actions:]),
+                        right_hand=np.ascontiguousarray(replacement.right_hand[elapsed_actions:]),
+                    )
+                    # Command slew is target-to-target. Measured tracking lag is
+                    # independently bounded by _enforce_tracking below.
+                    try:
+                        validate_action_chunk(
+                            suffix,
+                            backend._arm_target,
+                            backend._left_target,
+                            backend._right_target,
+                        )
+                    except DeploymentError as exc:
+                        state = backend.state()
+                        backend.set_target(state.arm, state.left_hand, state.right_hand)
+                        chunk = None
+                        chunk_index = 0
+                        rtc_mode = False
+                        holding = True
+                        tracking_checks_after = time.monotonic()
+                        _status(status_queue, "rtc_rejected", f"unsafe handoff boundary: {exc}")
+                        continue
+                    chunk = replacement
+                    chunk_sequence = int(sequence)
+                    chunk_index = elapsed_actions
+                    last_sequence = sequence
+                    holding = False
+                    _status(
+                        status_queue,
+                        "rtc_replaced",
+                        {
+                            "sequence": sequence,
+                            "action_index": elapsed_actions,
+                            "previous_sequence": expected_sequence,
+                        },
+                    )
+
+                elif not isinstance(command, tuple) or len(command) != 6 or kind != "chunk":
                     raise DeploymentError(f"Unexpected or malformed actuator command {kind!r}")
-                if chunk is not None:
+                elif chunk is not None:
                     raise DeploymentError("Received a new chunk before the prior chunk completed")
-                _, sequence, created_at, arm, left, right = command
-                if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence != last_sequence + 1:
-                    raise DeploymentError(f"Stale/out-of-order action chunk {sequence!r}; expected {last_sequence + 1}")
-                try:
-                    chunk_age = time.monotonic() - float(created_at)
-                except (TypeError, ValueError) as exc:
-                    raise DeploymentError("Action chunk timestamp is invalid") from exc
-                if not np.isfinite(chunk_age) or not 0.0 <= chunk_age <= CHUNK_MAX_AGE_S:
-                    raise DeploymentError(f"Action chunk {sequence} expired before execution")
-                state = backend.state()
-                proposed = ActionChunk(arm=arm, left_hand=left, right_hand=right)
-                validate_action_chunk(proposed, state.arm, state.left_hand, state.right_hand)
-                chunk = proposed
-                chunk_sequence = int(sequence)
-                chunk_index = 0
-                next_action_at = time.monotonic()
-                last_sequence = sequence
-                holding = False
+                else:
+                    _, sequence, created_at, arm, left, right = command
+                    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence != last_sequence + 1:
+                        raise DeploymentError(
+                            f"Stale/out-of-order action chunk {sequence!r}; expected {last_sequence + 1}"
+                        )
+                    try:
+                        chunk_age = time.monotonic() - float(created_at)
+                    except (TypeError, ValueError) as exc:
+                        raise DeploymentError("Action chunk timestamp is invalid") from exc
+                    if not np.isfinite(chunk_age) or not 0.0 <= chunk_age <= CHUNK_MAX_AGE_S:
+                        raise DeploymentError(f"Action chunk {sequence} expired before execution")
+                    state = backend.state()
+                    proposed = ActionChunk(arm=arm, left_hand=left, right_hand=right)
+                    validate_action_chunk(proposed, state.arm, state.left_hand, state.right_hand)
+                    chunk = proposed
+                    chunk_sequence = int(sequence)
+                    chunk_index = 0
+                    next_action_at = time.monotonic()
+                    last_sequence = sequence
+                    holding = False
 
             now = time.monotonic()
             if chunk is not None and now >= next_action_at:
@@ -1291,12 +1525,40 @@ def _actuator_main(
                         chunk.right_hand[chunk_index],
                     )
                     chunk_index += 1
+                    if rtc_mode:
+                        rtc_total_actions += 1
+                        if rtc_total_actions >= rtc_action_budget:
+                            # The completion status is emitted on the next 30 Hz
+                            # boundary, after the final target has occupied one
+                            # complete controller period.
+                            chunk_index = chunk.length
                     # Keep the 30 Hz phase on the 100 Hz publication loop.  A
                     # lateness ceiling above prevents burst catch-up after a stall.
                     next_action_at += action_period
                 else:
-                    _status(status_queue, "completed", chunk_sequence)
-                    chunk = None
+                    if rtc_mode:
+                        state = backend.state()
+                        backend.set_target(state.arm, state.left_hand, state.right_hand)
+                        tracking_checks_after = time.monotonic()
+                        if rtc_total_actions >= rtc_action_budget:
+                            _status(status_queue, "rtc_completed", rtc_total_actions)
+                        else:
+                            _status(
+                                status_queue,
+                                "rtc_underrun",
+                                {
+                                    "sequence": chunk_sequence,
+                                    "elapsed_actions": chunk_index,
+                                    "overlap": 0,
+                                },
+                            )
+                        chunk = None
+                        chunk_index = 0
+                        rtc_mode = False
+                        holding = True
+                    else:
+                        _status(status_queue, "completed", chunk_sequence)
+                        chunk = None
 
             state = backend.state()
             if now >= tracking_checks_after:
@@ -1349,13 +1611,15 @@ class SafeG1Dex3Actuator:
         self._holding = False
         self._chunk_in_flight = False
         self._pending_sequence: int | None = None
+        self._rtc_active = False
+        self._rtc_terminal: tuple[str, Any] | None = None
         self._closed = False
 
     def heartbeat(self) -> None:
         with self._heartbeat.get_lock():
             self._heartbeat.value = time.monotonic()
 
-    def _wait_status(self, expected: str, timeout_s: float, payload: Any = None) -> None:
+    def _wait_status(self, expected: str, timeout_s: float, payload: Any = None) -> Any:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             self.heartbeat()
@@ -1371,8 +1635,22 @@ class SafeG1Dex3Actuator:
                 raise DeploymentError(f"Actuator release failed: {value}")
             if kind == "stopped":
                 raise DeploymentError("Actuator stopped before the requested operation completed")
+            if kind in {"rtc_underrun", "rtc_rejected"} and kind != expected:
+                self._rtc_terminal = ("hold", value)
+                self._chunk_in_flight = False
+                self._pending_sequence = None
+                self._rtc_active = False
+                self._holding = True
+                raise RtcTerminalEvent("hold", value)
+            if kind == "rtc_completed" and kind != expected:
+                self._rtc_terminal = ("complete", value)
+                self._chunk_in_flight = False
+                self._pending_sequence = None
+                self._rtc_active = False
+                self._holding = True
+                raise RtcTerminalEvent("complete", value)
             if kind == expected and (payload is None or value == payload):
-                return
+                return value
         raise TimeoutError(f"Timed out waiting for actuator status '{expected}'")
 
     def start(self) -> None:
@@ -1424,6 +1702,10 @@ class SafeG1Dex3Actuator:
                     issue = f"release failed: {value}"
                 elif kind == "stopped" and issue is None:
                     issue = "stopped"
+                elif kind == "rtc_completed":
+                    self._rtc_terminal = ("complete", value)
+                elif kind in {"rtc_underrun", "rtc_rejected"}:
+                    self._rtc_terminal = ("hold", value)
         except queue.Empty:
             pass
         if issue is not None:
@@ -1489,6 +1771,146 @@ class SafeG1Dex3Actuator:
         self._holding = False
         return self._sequence
 
+    def start_rtc(self, plan: ActionChunk, *, action_budget: int) -> int:
+        """Start one full-horizon plan under the child-owned RTC scheduler."""
+
+        if not self._initialized:
+            raise DeploymentError("Actuator must complete initialization before RTC")
+        if self._chunk_in_flight or self._rtc_active:
+            raise DeploymentError("An action plan is already active")
+        if isinstance(action_budget, bool) or not isinstance(action_budget, int) or action_budget < 1:
+            raise DeploymentError("RTC action budget must be a positive integer")
+        validate_action_chunk(plan, plan.arm[0], plan.left_hand[0], plan.right_hand[0])
+        self.assert_healthy()
+        next_sequence = self._sequence + 1
+        self.heartbeat()
+        command = (
+            "rtc_start",
+            next_sequence,
+            time.monotonic(),
+            action_budget,
+            plan.arm,
+            plan.left_hand,
+            plan.right_hand,
+            plan.length,
+        )
+        try:
+            self._command_queue.put(command, timeout=0.2)
+        except queue.Full as exc:
+            raise DeploymentError("Actuator command queue is full; refusing RTC plan") from exc
+        self._wait_status("rtc_started", timeout_s=1.0, payload=next_sequence)
+        self._sequence = next_sequence
+        self._chunk_in_flight = True
+        self._pending_sequence = next_sequence
+        self._rtc_active = True
+        self._rtc_terminal = None
+        self._holding = False
+        return next_sequence
+
+    def rtc_snapshot(self) -> RtcExecutionSnapshot:
+        """Obtain the child scheduler's exact active plan index."""
+
+        if not self._rtc_active or not self._chunk_in_flight or self._pending_sequence is None:
+            raise DeploymentError("There is no active RTC plan to snapshot")
+        event = self.poll_rtc_event()
+        if event is not None:
+            raise RtcTerminalEvent(*event)
+        self.heartbeat()
+        try:
+            self._command_queue.put(("rtc_snapshot", self._pending_sequence), timeout=0.2)
+        except queue.Full as exc:
+            raise DeploymentError("Actuator command queue is full; refusing RTC snapshot") from exc
+        value = self._wait_status("rtc_snapshot", timeout_s=0.5)
+        if not isinstance(value, dict):
+            raise DeploymentError("Actuator returned a malformed RTC snapshot")
+        try:
+            snapshot = RtcExecutionSnapshot(
+                sequence=int(value["sequence"]),
+                action_index=int(value["action_index"]),
+                plan_length=int(value["plan_length"]),
+                total_actions=int(value["total_actions"]),
+                action_budget=int(value["action_budget"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DeploymentError("Actuator returned an incomplete RTC snapshot") from exc
+        if snapshot.sequence != self._pending_sequence:
+            raise DeploymentError("RTC snapshot generation changed unexpectedly")
+        return snapshot
+
+    def replace_rtc(
+        self,
+        plan: ActionChunk,
+        *,
+        expected_sequence: int,
+        request_index: int,
+        expected_overlap: int,
+    ) -> tuple[int, int]:
+        """Atomically replace the unconsumed plan at the next 30 Hz action slot."""
+
+        if not self._rtc_active or expected_sequence != self._pending_sequence:
+            raise DeploymentError("RTC response is stale for the active plan generation")
+        validate_action_chunk(plan, plan.arm[0], plan.left_hand[0], plan.right_hand[0])
+        event = self.poll_rtc_event()
+        if event is not None:
+            raise RtcTerminalEvent(*event)
+        next_sequence = self._sequence + 1
+        self.heartbeat()
+        command = (
+            "rtc_replace",
+            next_sequence,
+            time.monotonic(),
+            expected_sequence,
+            request_index,
+            expected_overlap,
+            plan.arm,
+            plan.left_hand,
+            plan.right_hand,
+            plan.length,
+        )
+        try:
+            self._command_queue.put(command, timeout=0.2)
+        except queue.Full as exc:
+            raise DeploymentError("Actuator command queue is full; refusing RTC replacement") from exc
+        value = self._wait_status("rtc_replaced", timeout_s=0.5)
+        if not isinstance(value, dict) or value.get("sequence") != next_sequence:
+            raise DeploymentError("Actuator returned a malformed RTC replacement acknowledgment")
+        try:
+            action_index = int(value["action_index"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DeploymentError("RTC replacement acknowledgment has no action index") from exc
+        self._sequence = next_sequence
+        self._pending_sequence = next_sequence
+        return next_sequence, action_index
+
+    def poll_rtc_event(self) -> tuple[str, Any] | None:
+        """Poll completion/HOLD/fault without allowing a worker to touch actuator state."""
+
+        event = self._rtc_terminal
+        self._rtc_terminal = None
+        try:
+            while True:
+                kind, value = self._status_queue.get_nowait()
+                if kind == "fault":
+                    raise DeploymentError(f"Actuator fault: {value}")
+                if kind == "release_failed":
+                    raise DeploymentError(f"Actuator release failed: {value}")
+                if kind == "stopped":
+                    raise DeploymentError("Actuator stopped during RTC")
+                if kind == "rtc_completed":
+                    event = ("complete", value)
+                elif kind in {"rtc_underrun", "rtc_rejected"}:
+                    event = ("hold", value)
+        except queue.Empty:
+            pass
+        if event is not None:
+            self._chunk_in_flight = False
+            self._pending_sequence = None
+            self._rtc_active = False
+            self._holding = True
+        if not self._process.is_alive():
+            raise DeploymentError("Actuator process stopped")
+        return event
+
     def wait_completed(self, sequence: int, timeout_s: float) -> None:
         if not self._chunk_in_flight or sequence != self._pending_sequence:
             raise DeploymentError(f"Action chunk {sequence} is not the pending sequence")
@@ -1501,7 +1923,7 @@ class SafeG1Dex3Actuator:
 
         if not self._initialized:
             raise DeploymentError("Actuator must complete initialization before HOLD")
-        if self._chunk_in_flight:
+        if self._chunk_in_flight and not self._rtc_active:
             raise DeploymentError("Cannot enter HOLD before the current action chunk completes")
         if self._holding:
             return
@@ -1514,6 +1936,9 @@ class SafeG1Dex3Actuator:
         self._wait_status("holding", timeout_s=1.0, payload=self._sequence)
         self._holding = True
         self._warm_started = False
+        self._chunk_in_flight = False
+        self._pending_sequence = None
+        self._rtc_active = False
 
     def close(self) -> None:
         if self._closed:

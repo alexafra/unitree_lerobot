@@ -9,12 +9,16 @@ preflight checks and an interactive confirmation.
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
+import queue
 import select
 import signal
 import sys
+import threading
 import time
 
 import cv2
@@ -32,11 +36,14 @@ from unitree_lerobot.eval_robot.groot_contract import (
     load_initialization_spec,
     make_observation,
     parse_action_chunk,
+    parse_action_plan,
+    validate_action_chunk,
     validate_model_contract,
     validate_policy_metadata,
 )
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     G1Dex3StateReader,
+    RtcTerminalEvent,
     SafeG1Dex3Actuator,
     TeleimagerCamera,
     initialize_dds,
@@ -49,10 +56,101 @@ OPERATOR_CONFIRMATION_TIMEOUT_S = 60.0
 PREVIEW_WINDOWS = ("GR00T input: ego_view", "GR00T input: depth_gray_view")
 HOLD_COMMANDS = {"hold", "h"}
 EXIT_COMMANDS = {"quit", "q"}
+RTC_MIN_MODEL_HORIZON = 32
+RTC_DELAY_HISTORY = 8
 
 
 class OperatorRelease(Exception):
     """Internal control flow for an orderly operator-requested release."""
+
+
+@dataclass(frozen=True)
+class _RtcRequest:
+    generation: int
+    observation: dict[str, object]
+    options: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _RtcResponse:
+    generation: int
+    action: dict[str, object] | None
+    inference_s: float
+    error: BaseException | None
+
+
+class _RtcInferenceWorker:
+    """Daemon whose ZeroMQ client is created and used only in its own thread."""
+
+    def __init__(self, host: str, port: int):
+        self._host = host
+        self._port = port
+        self._requests: queue.Queue[_RtcRequest | None] = queue.Queue(maxsize=1)
+        self._responses: queue.Queue[_RtcResponse] = queue.Queue()
+        self._lock = threading.Lock()
+        self._busy = False
+        self._closing = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="groot-rtc-inference", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        client: Gr00tClient | None = None
+        try:
+            while True:
+                request = self._requests.get()
+                if request is None:
+                    return
+                started = time.monotonic()
+                try:
+                    if client is None:
+                        client = Gr00tClient(self._host, self._port)
+                    action = client.get_action(request.observation, request.options)
+                except BaseException as exc:
+                    response = _RtcResponse(request.generation, None, time.monotonic() - started, exc)
+                else:
+                    response = _RtcResponse(request.generation, action, time.monotonic() - started, None)
+                self._responses.put(response)
+                with self._lock:
+                    self._busy = False
+                if self._closing.is_set():
+                    return
+        finally:
+            if client is not None:
+                client.close()
+
+    def submit(self, request: _RtcRequest) -> None:
+        with self._lock:
+            if self._busy:
+                raise DeploymentError("An RTC inference request is already active")
+            self._busy = True
+        try:
+            self._requests.put_nowait(request)
+        except queue.Full as exc:
+            with self._lock:
+                self._busy = False
+            raise DeploymentError("RTC inference request queue is full") from exc
+
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return self._busy
+
+    def poll(self) -> _RtcResponse | None:
+        try:
+            return self._responses.get_nowait()
+        except queue.Empty:
+            return None
+
+    def close(self, *, wait: bool) -> None:
+        self._closing.set()
+        try:
+            self._requests.put_nowait(None)
+        except queue.Full:
+            # A bounded request is in flight. The daemon may finish after an
+            # immediate q/Ctrl-C release; it cannot keep the process alive.
+            pass
+        if wait:
+            self._thread.join(timeout=6.0)
 
 
 def select_instruction(task_name: str | None, custom_goal: str | None = None) -> tuple[str, str]:
@@ -150,6 +248,17 @@ def validate_args(args: argparse.Namespace) -> None:
         raise DeploymentError("Moving initialization modes require --actuate")
     if getattr(args, "custom_goal", None) is not None and initialization == "pose-file":
         raise DeploymentError("--custom-goal cannot use a task-bound --initialization pose-file")
+    inference_mode = getattr(args, "inference_mode", "synchronous")
+    if inference_mode not in {"synchronous", "rtc"}:
+        raise DeploymentError("--inference-mode must be synchronous or rtc")
+    rtc_frozen_steps = getattr(args, "rtc_frozen_steps", None)
+    if rtc_frozen_steps is not None and rtc_frozen_steps < 1:
+        raise DeploymentError("--rtc-frozen-steps must be at least 1")
+    rtc_ramp_rate = getattr(args, "rtc_ramp_rate", None)
+    if rtc_ramp_rate is not None and (not np.isfinite(rtc_ramp_rate) or rtc_ramp_rate <= 0.0):
+        raise DeploymentError("--rtc-ramp-rate must be a finite positive number")
+    if inference_mode != "rtc" and (rtc_frozen_steps is not None or rtc_ramp_rate is not None):
+        raise DeploymentError("RTC tuning options require --inference-mode rtc")
 
 
 def confirm_actuation(simulation: bool, task_name: str, instruction: str) -> None:
@@ -389,19 +498,16 @@ def close_camera_preview() -> None:
             pass
 
 
-def infer_chunk(
-    policy: Gr00tClient,
+def capture_policy_observation(
     state_reader: G1Dex3StateReader,
     camera: TeleimagerCamera,
     instruction: str,
     model_contract: ModelContract,
-    execution_horizon: int,
     actuator: SafeG1Dex3Actuator | None = None,
     camera_timeout_s: float = 0.5,
-    validate_initial_step: bool = True,
     show_camera: bool = False,
     allow_custom_instruction: bool = False,
-) -> tuple[ActionChunk, float]:
+) -> tuple[dict[str, object], object]:
     if actuator is not None:
         actuator.heartbeat()
     state = state_reader.read(timeout_s=0.5)
@@ -423,6 +529,32 @@ def infer_chunk(
         depth_gray=images.depth_gray,
         allow_custom_instruction=allow_custom_instruction,
     )
+    return observation, state
+
+
+def infer_chunk(
+    policy: Gr00tClient,
+    state_reader: G1Dex3StateReader,
+    camera: TeleimagerCamera,
+    instruction: str,
+    model_contract: ModelContract,
+    execution_horizon: int,
+    actuator: SafeG1Dex3Actuator | None = None,
+    camera_timeout_s: float = 0.5,
+    validate_initial_step: bool = True,
+    show_camera: bool = False,
+    allow_custom_instruction: bool = False,
+) -> tuple[ActionChunk, float]:
+    observation, state = capture_policy_observation(
+        state_reader,
+        camera,
+        instruction,
+        model_contract,
+        actuator,
+        camera_timeout_s,
+        show_camera,
+        allow_custom_instruction,
+    )
     started = time.monotonic()
     action = policy.get_action(observation)
     inference_s = time.monotonic() - started
@@ -438,6 +570,46 @@ def infer_chunk(
         validate_initial_step=validate_initial_step,
     )
     return chunk, inference_s
+
+
+def infer_plan(
+    policy: Gr00tClient,
+    state_reader: G1Dex3StateReader,
+    camera: TeleimagerCamera,
+    instruction: str,
+    model_contract: ModelContract,
+    actuator: SafeG1Dex3Actuator | None = None,
+    camera_timeout_s: float = 0.5,
+    validate_initial_step: bool = True,
+    show_camera: bool = False,
+    allow_custom_instruction: bool = False,
+) -> tuple[ActionChunk, float]:
+    observation, state = capture_policy_observation(
+        state_reader,
+        camera,
+        instruction,
+        model_contract,
+        actuator,
+        camera_timeout_s,
+        show_camera,
+        allow_custom_instruction,
+    )
+    started = time.monotonic()
+    action = policy.get_action(observation)
+    inference_s = time.monotonic() - started
+    if actuator is not None:
+        actuator.assert_healthy()
+    return (
+        parse_action_plan(
+            action,
+            model_horizon=model_contract.action_horizon,
+            current_arm=state.arm,
+            current_left=state.left_hand,
+            current_right=state.right_hand,
+            validate_initial_step=validate_initial_step,
+        ),
+        inference_s,
+    )
 
 
 def chunk_delta_summary(chunk: ActionChunk, state_reader: G1Dex3StateReader) -> str:
@@ -583,6 +755,428 @@ def _run_active_goal(
     return "complete"
 
 
+def _rtc_previous_action(plan: ActionChunk, start_index: int) -> dict[str, np.ndarray]:
+    return {
+        "left_arm": np.ascontiguousarray(plan.arm[start_index:, :7], dtype=np.float32)[None],
+        "right_arm": np.ascontiguousarray(plan.arm[start_index:, 7:], dtype=np.float32)[None],
+        "left_hand": np.ascontiguousarray(plan.left_hand[start_index:], dtype=np.float32)[None],
+        "right_hand": np.ascontiguousarray(plan.right_hand[start_index:], dtype=np.float32)[None],
+    }
+
+
+def _rtc_options(
+    plan: ActionChunk,
+    start_index: int,
+    frozen_steps: int,
+    ramp_rate: float | None,
+) -> dict[str, object]:
+    overlap = plan.length - start_index
+    options: dict[str, object] = {
+        "inference_mode": "rtc",
+        "rtc_previous_action": _rtc_previous_action(plan, start_index),
+        "rtc_overlap_steps": overlap,
+        "rtc_frozen_steps": frozen_steps,
+    }
+    if ramp_rate is not None:
+        options["rtc_ramp_rate"] = ramp_rate
+    return options
+
+
+def _drain_rtc_worker(
+    worker: _RtcInferenceWorker,
+    actuator: SafeG1Dex3Actuator,
+) -> None:
+    deadline = time.monotonic() + 6.0
+    while worker.busy and time.monotonic() < deadline:
+        actuator.heartbeat()
+        actuator.assert_healthy()
+        time.sleep(0.01)
+    while worker.poll() is not None:
+        pass
+    # If the timeout-bounded request still has not returned, do not spend a
+    # second blocking join interval without servicing the actuator heartbeat.
+    # The daemon owns its ZMQ socket and will close it when the request exits.
+    worker.close(wait=not worker.busy)
+
+
+def _run_active_goal_rtc(
+    policy: Gr00tClient,
+    state_reader: G1Dex3StateReader,
+    camera: TeleimagerCamera,
+    actuator: SafeG1Dex3Actuator,
+    task_name: str,
+    instruction: str,
+    contract: ModelContract,
+    args: argparse.Namespace,
+    *,
+    allow_custom_instruction: bool,
+) -> str:
+    """Run child-timed asynchronous RTC while the main thread services safety."""
+
+    plan, initial_inference_s = infer_plan(
+        policy,
+        state_reader,
+        camera,
+        instruction,
+        contract,
+        actuator,
+        show_camera=getattr(args, "show_camera", False),
+        allow_custom_instruction=allow_custom_instruction,
+    )
+    action_budget = args.execution_horizon * args.max_chunks
+    current_sequence = actuator.start_rtc(plan, action_budget=action_budget)
+    current_plan = plan
+    # Store the post-capture part of recent delays. Each request adds its own
+    # measured capture delay exactly once when selecting the frozen prefix.
+    response_delay_history: deque[int] = deque(maxlen=RTC_DELAY_HISTORY)
+    response_delay_history.append(max(1, int(np.ceil(initial_inference_s * CONTROL_HZ)) + 1))
+    worker = _RtcInferenceWorker(args.policy_host, args.policy_port)
+    pending: dict[str, object] | None = None
+    request_count = 0
+    handoff_count = 0
+    next_snapshot_at = 0.0
+
+    LOGGER.info(
+        "RTC live plan started for %r: horizon=%d, minimum execution=%d, action budget=%d",
+        task_name,
+        plan.length,
+        args.execution_horizon,
+        action_budget,
+    )
+    try:
+        while True:
+            actuator.heartbeat()
+            event = actuator.poll_rtc_event()
+            if event is not None:
+                outcome, detail = event
+                if outcome == "complete":
+                    LOGGER.info(
+                        "RTC goal %r completed %d actions with %d requests and %d handoffs",
+                        task_name,
+                        action_budget,
+                        request_count,
+                        handoff_count,
+                    )
+                    return "complete"
+                LOGGER.error("RTC plan underrun/rejection; child entered powered HOLD: %s", detail)
+                _drain_rtc_worker(worker, actuator)
+                return "hold"
+
+            command_action = _active_command_action(_poll_active_command())
+            if command_action == "hold":
+                actuator.hold()
+                LOGGER.warning("Goal %r entered powered HOLD; pending RTC result will be discarded", task_name)
+                _drain_rtc_worker(worker, actuator)
+                return "hold"
+            if command_action == "release":
+                LOGGER.warning("Operator requested orderly authority release during RTC")
+                worker.close(wait=False)
+                return "release"
+
+            response = worker.poll()
+            if response is not None:
+                if pending is None or response.generation != pending["sequence"]:
+                    actuator.hold()
+                    LOGGER.error("Stale RTC inference generation was discarded; entered powered HOLD")
+                    _drain_rtc_worker(worker, actuator)
+                    return "hold"
+                if response.error is not None or response.action is None:
+                    actuator.hold()
+                    LOGGER.error("RTC inference failed; entered powered HOLD: %s", response.error)
+                    _drain_rtc_worker(worker, actuator)
+                    return "hold"
+                reference_state = pending["state"]
+                try:
+                    replacement = parse_action_plan(
+                        response.action,
+                        model_horizon=contract.action_horizon,
+                        current_arm=reference_state.arm,
+                        current_left=reference_state.left_hand,
+                        current_right=reference_state.right_hand,
+                        # B[0] is aligned to the old commanded tail, while the child
+                        # independently validates the actual old-target -> B[k]
+                        # handoff after measuring how many actions elapsed.
+                        validate_initial_step=False,
+                    )
+                    current_sequence, actual_delay = actuator.replace_rtc(
+                        replacement,
+                        expected_sequence=int(pending["sequence"]),
+                        request_index=int(pending["request_index"]),
+                        expected_overlap=int(pending["overlap"]),
+                    )
+                except RtcTerminalEvent as exc:
+                    if exc.outcome == "hold":
+                        _drain_rtc_worker(worker, actuator)
+                        return "hold"
+                    return "complete"
+                except (DeploymentError, TimeoutError) as exc:
+                    LOGGER.error("RTC response validation/handoff failed; entering powered HOLD: %s", exc)
+                    actuator.hold()
+                    _drain_rtc_worker(worker, actuator)
+                    return "hold"
+                current_plan = replacement
+                capture_actions = int(pending["capture_actions"])
+                response_delay_history.append(max(1, actual_delay - capture_actions))
+                handoff_count += 1
+                LOGGER.info(
+                    "RTC handoff %d for %r: actual delay=%d actions (%.3fs inference), new index=%d",
+                    handoff_count,
+                    task_name,
+                    actual_delay,
+                    response.inference_s,
+                    actual_delay,
+                )
+                pending = None
+                continue
+
+            now = time.monotonic()
+            if pending is None and now >= next_snapshot_at:
+                next_snapshot_at = now + 0.01
+                try:
+                    snapshot = actuator.rtc_snapshot()
+                except RtcTerminalEvent as exc:
+                    if exc.outcome == "hold":
+                        _drain_rtc_worker(worker, actuator)
+                        return "hold"
+                    return "complete"
+                if snapshot.sequence != current_sequence:
+                    actuator.hold()
+                    LOGGER.error("RTC child generation changed without an acknowledged handoff")
+                    _drain_rtc_worker(worker, actuator)
+                    return "hold"
+                if snapshot.total_actions < snapshot.action_budget and snapshot.action_index >= args.execution_horizon:
+                    request_snapshot = snapshot
+                    # Camera and DDS sockets remain on the main thread. The
+                    # pre-capture index is the RTC origin, so child-measured k
+                    # includes observation capture as real end-to-end latency.
+                    observation, reference_state = capture_policy_observation(
+                        state_reader,
+                        camera,
+                        instruction,
+                        contract,
+                        actuator,
+                        show_camera=getattr(args, "show_camera", False),
+                        allow_custom_instruction=allow_custom_instruction,
+                    )
+                    try:
+                        post_capture_snapshot = actuator.rtc_snapshot()
+                    except RtcTerminalEvent as exc:
+                        if exc.outcome == "hold":
+                            _drain_rtc_worker(worker, actuator)
+                            return "hold"
+                        return "complete"
+                    if (
+                        post_capture_snapshot.sequence != current_sequence
+                        or post_capture_snapshot.action_index >= current_plan.length
+                    ):
+                        continue
+                    overlap = current_plan.length - request_snapshot.action_index
+                    configured_frozen = getattr(args, "rtc_frozen_steps", None)
+                    frozen_steps = (
+                        int(configured_frozen)
+                        if configured_frozen is not None
+                        else max(response_delay_history)
+                        + (post_capture_snapshot.action_index - request_snapshot.action_index)
+                    )
+                    if not 1 <= frozen_steps <= overlap:
+                        actuator.hold()
+                        LOGGER.error(
+                            "RTC has only %d overlapping actions but needs %d frozen latency actions; entered HOLD",
+                            overlap,
+                            frozen_steps,
+                        )
+                        _drain_rtc_worker(worker, actuator)
+                        return "hold"
+                    request_count += 1
+                    worker.submit(
+                        _RtcRequest(
+                            generation=request_snapshot.sequence,
+                            observation=observation,
+                            options=_rtc_options(
+                                current_plan,
+                                request_snapshot.action_index,
+                                frozen_steps,
+                                getattr(args, "rtc_ramp_rate", None),
+                            ),
+                        )
+                    )
+                    pending = {
+                        "sequence": request_snapshot.sequence,
+                        "request_index": request_snapshot.action_index,
+                        "overlap": overlap,
+                        "capture_actions": (post_capture_snapshot.action_index - request_snapshot.action_index),
+                        "state": reference_state,
+                    }
+                    LOGGER.info(
+                        "RTC request %d launched at plan index %d with overlap=%d, frozen=%d",
+                        request_count,
+                        request_snapshot.action_index,
+                        overlap,
+                        frozen_steps,
+                    )
+            time.sleep(0.002)
+    finally:
+        if worker.busy:
+            worker.close(wait=False)
+        else:
+            worker.close(wait=True)
+
+
+def _run_shadow_rtc(
+    initial_plan: ActionChunk,
+    initial_inference_s: float,
+    state_reader: G1Dex3StateReader,
+    camera: TeleimagerCamera,
+    instruction: str,
+    contract: ModelContract,
+    args: argparse.Namespace,
+    *,
+    allow_custom_instruction: bool,
+) -> None:
+    """Exercise RTC transport/conditioning against a publisher-free virtual clock."""
+
+    LOGGER.warning(
+        "RTC SHADOW uses a virtual 30 Hz action clock and sends no commands. The robot state "
+        "does not follow predictions, so this validates timing/protocol—not closed-loop RTC quality."
+    )
+    action_budget = args.execution_horizon * args.max_chunks
+    plan = initial_plan
+    plan_index = 0
+    total_actions = 0
+    generation = 1
+    request_count = 0
+    handoff_count = 0
+    pending: dict[str, object] | None = None
+    response_delay_history: deque[int] = deque(
+        [max(1, int(np.ceil(initial_inference_s * CONTROL_HZ)) + 1)],
+        maxlen=RTC_DELAY_HISTORY,
+    )
+    worker = _RtcInferenceWorker(args.policy_host, args.policy_port)
+    next_action_at = time.monotonic() + 1.0 / CONTROL_HZ
+    try:
+        while total_actions < action_budget:
+            now = time.monotonic()
+            while now >= next_action_at and total_actions < action_budget:
+                if plan_index >= plan.length:
+                    raise DeploymentError("RTC shadow action buffer underrun")
+                plan_index += 1
+                total_actions += 1
+                next_action_at += 1.0 / CONTROL_HZ
+
+            response = worker.poll()
+            if response is not None:
+                if pending is None or response.generation != pending["generation"]:
+                    raise DeploymentError("RTC shadow received a stale inference generation")
+                if response.error is not None or response.action is None:
+                    raise DeploymentError(f"RTC shadow inference failed: {response.error}")
+                reference_state = pending["state"]
+                replacement = parse_action_plan(
+                    response.action,
+                    model_horizon=contract.action_horizon,
+                    current_arm=reference_state.arm,
+                    current_left=reference_state.left_hand,
+                    current_right=reference_state.right_hand,
+                    validate_initial_step=False,
+                )
+                actual_delay = plan_index - int(pending["request_index"])
+                if actual_delay < 0 or actual_delay >= int(pending["overlap"]):
+                    raise DeploymentError("RTC shadow response exhausted its previous-action overlap before handoff")
+                suffix = ActionChunk(
+                    arm=np.ascontiguousarray(replacement.arm[actual_delay:]),
+                    left_hand=np.ascontiguousarray(replacement.left_hand[actual_delay:]),
+                    right_hand=np.ascontiguousarray(replacement.right_hand[actual_delay:]),
+                )
+                previous_index = max(0, plan_index - 1)
+                validate_action_chunk(
+                    suffix,
+                    plan.arm[previous_index],
+                    plan.left_hand[previous_index],
+                    plan.right_hand[previous_index],
+                )
+                plan = replacement
+                plan_index = actual_delay
+                generation += 1
+                capture_actions = int(pending["capture_actions"])
+                response_delay_history.append(max(1, actual_delay - capture_actions))
+                handoff_count += 1
+                LOGGER.info(
+                    "RTC shadow handoff %d: delay=%d actions, inference=%.3fs",
+                    handoff_count,
+                    actual_delay,
+                    response.inference_s,
+                )
+                pending = None
+
+            if pending is None and total_actions < action_budget and plan_index >= args.execution_horizon:
+                request_index = plan_index
+                observation, reference_state = capture_policy_observation(
+                    state_reader,
+                    camera,
+                    instruction,
+                    contract,
+                    show_camera=getattr(args, "show_camera", False),
+                    allow_custom_instruction=allow_custom_instruction,
+                )
+                # Account for virtual actions that elapsed while camera capture
+                # blocked. As in live RTC, the request remains conditioned on
+                # the tail unconsumed at the pre-capture reference time.
+                now = time.monotonic()
+                while now >= next_action_at and total_actions < action_budget:
+                    if plan_index >= plan.length:
+                        raise DeploymentError("RTC shadow action buffer underrun during observation capture")
+                    plan_index += 1
+                    total_actions += 1
+                    next_action_at += 1.0 / CONTROL_HZ
+                if total_actions >= action_budget:
+                    break
+                capture_actions = plan_index - request_index
+                overlap = plan.length - request_index
+                configured_frozen = getattr(args, "rtc_frozen_steps", None)
+                frozen_steps = (
+                    int(configured_frozen)
+                    if configured_frozen is not None
+                    else max(response_delay_history) + capture_actions
+                )
+                if not 1 <= frozen_steps <= overlap:
+                    raise DeploymentError(f"RTC shadow has overlap={overlap}, insufficient for frozen={frozen_steps}")
+                request_count += 1
+                worker.submit(
+                    _RtcRequest(
+                        generation=generation,
+                        observation=observation,
+                        options=_rtc_options(
+                            plan,
+                            request_index,
+                            frozen_steps,
+                            getattr(args, "rtc_ramp_rate", None),
+                        ),
+                    )
+                )
+                pending = {
+                    "generation": generation,
+                    "request_index": request_index,
+                    "overlap": overlap,
+                    "capture_actions": capture_actions,
+                    "state": reference_state,
+                }
+                LOGGER.info(
+                    "RTC shadow request %d: index=%d overlap=%d frozen=%d",
+                    request_count,
+                    request_index,
+                    overlap,
+                    frozen_steps,
+                )
+            time.sleep(0.001)
+        LOGGER.info(
+            "RTC shadow completed %d virtual actions with %d requests and %d handoffs",
+            total_actions,
+            request_count,
+            handoff_count,
+        )
+    finally:
+        worker.close(wait=True)
+
+
 def run(args: argparse.Namespace) -> None:
     validate_args(args)
     repository_root = Path(__file__).resolve().parents[2]
@@ -612,8 +1206,9 @@ def run(args: argparse.Namespace) -> None:
         if not policy.ping():
             raise DeploymentError(f"GR00T server at {args.policy_host}:{args.policy_port} did not answer ping")
         contract = validate_model_contract(policy.get_modality_config())
+        policy_metadata = policy.get_policy_metadata()
         depth_encoding = validate_policy_metadata(
-            policy.get_policy_metadata(),
+            policy_metadata,
             requires_depth=contract.requires_depth,
         )
         if args.execution_horizon > contract.action_horizon:
@@ -621,6 +1216,34 @@ def run(args: argparse.Namespace) -> None:
                 f"Checkpoint action horizon is only {contract.action_horizon}, but "
                 f"{args.execution_horizon} steps were requested"
             )
+        inference_mode = getattr(args, "inference_mode", "synchronous")
+        if inference_mode == "rtc" and contract.action_horizon < RTC_MIN_MODEL_HORIZON:
+            raise DeploymentError(
+                f"RTC requires a checkpoint trained for at least {RTC_MIN_MODEL_HORIZON} actions; "
+                f"this checkpoint exposes {contract.action_horizon}. Use synchronous mode."
+            )
+        rtc_frozen_steps = getattr(args, "rtc_frozen_steps", None)
+        first_overlap = contract.action_horizon - args.execution_horizon
+        if inference_mode == "rtc" and rtc_frozen_steps is not None and rtc_frozen_steps > first_overlap:
+            raise DeploymentError(
+                f"--rtc-frozen-steps={rtc_frozen_steps} cannot fit the first RTC overlap of "
+                f"{first_overlap} actions (model horizon {contract.action_horizon} minus "
+                f"execution horizon {args.execution_horizon})"
+            )
+        if inference_mode == "rtc":
+            rtc_capability = policy_metadata.get("rtc")
+            expected_rtc = {
+                "protocol_version": 1,
+                "physical_action_tail": True,
+                "backend": "pytorch",
+            }
+            if not isinstance(rtc_capability, dict) or any(
+                rtc_capability.get(key) != value for key, value in expected_rtc.items()
+            ):
+                raise DeploymentError(
+                    "GR00T server does not advertise the required RTC physical-tail protocol "
+                    "and PyTorch backend; restart it with the RTC-capable server code"
+                )
         LOGGER.info(
             "GR00T contract verified: video=%s + four G1/Dex3 state/action keys, horizon %d",
             ",".join(contract.video_keys),
@@ -643,23 +1266,35 @@ def run(args: argparse.Namespace) -> None:
         # Complete one observation -> server -> validated action pass while no
         # command publisher exists.  This output is deliberately discarded.
         policy.reset()
-        preflight, inference_s = infer_chunk(
-            policy,
-            state_reader,
-            camera,
-            instruction,
-            contract,
-            args.execution_horizon,
-            camera_timeout_s=3.0,
-            show_camera=getattr(args, "show_camera", False),
-            allow_custom_instruction=allow_custom_instruction,
-            # Shadow never executes or warm-starts this result, so its passive
-            # measured pose is not a meaningful execution reference.  Skip
-            # only measured-q -> action[0]; parsing still enforces every
-            # shape/finite/range check and every action[t-1] -> action[t] step.
-            validate_initial_step=args.actuate
-            and not (initialization.moves or getattr(args, "policy_warm_start", False)),
-        )
+        preflight_validation = args.actuate and not (initialization.moves or getattr(args, "policy_warm_start", False))
+        if inference_mode == "rtc":
+            preflight, inference_s = infer_plan(
+                policy,
+                state_reader,
+                camera,
+                instruction,
+                contract,
+                camera_timeout_s=3.0,
+                show_camera=getattr(args, "show_camera", False),
+                allow_custom_instruction=allow_custom_instruction,
+                validate_initial_step=preflight_validation,
+            )
+        else:
+            preflight, inference_s = infer_chunk(
+                policy,
+                state_reader,
+                camera,
+                instruction,
+                contract,
+                args.execution_horizon,
+                camera_timeout_s=3.0,
+                show_camera=getattr(args, "show_camera", False),
+                allow_custom_instruction=allow_custom_instruction,
+                # Shadow never executes or warm-starts this result, so its passive
+                # measured pose is not a meaningful execution reference. Skip only
+                # measured-q -> action[0]; all remaining checks stay enabled.
+                validate_initial_step=preflight_validation,
+            )
         LOGGER.info(
             "Publisher-free preflight passed in %.3fs: %s",
             inference_s,
@@ -668,6 +1303,18 @@ def run(args: argparse.Namespace) -> None:
 
         if not args.actuate:
             LOGGER.info("SHADOW MODE: no command publishers were created")
+            if inference_mode == "rtc":
+                _run_shadow_rtc(
+                    preflight,
+                    inference_s,
+                    state_reader,
+                    camera,
+                    instruction,
+                    contract,
+                    args,
+                    allow_custom_instruction=allow_custom_instruction,
+                )
+                return
             LOGGER.info(
                 "Shadow chunk 1/%d: inference %.3fs, %s",
                 args.max_chunks,
@@ -716,7 +1363,7 @@ def run(args: argparse.Namespace) -> None:
         # warm-starts from the held pose, discards that chunk, then resets again.
         if sys.stdin.isatty():
             print(
-                "\nACTIVE GOAL CONTROLS: hold or h enters powered HOLD at a chunk boundary; "
+                "\nACTIVE GOAL CONTROLS: hold or h enters powered HOLD; "
                 "quit or q releases authority and exits. Ctrl-C also releases from any state."
             )
 
@@ -737,7 +1384,8 @@ def run(args: argparse.Namespace) -> None:
             if preparation == "hold":
                 outcome = "hold"
             else:
-                outcome = _run_active_goal(
+                runner = _run_active_goal_rtc if inference_mode == "rtc" else _run_active_goal
+                outcome = runner(
                     policy,
                     state_reader,
                     camera,
@@ -810,6 +1458,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--execution-horizon", type=int, default=8)
     parser.add_argument("--max-chunks", type=int, default=1)
+    parser.add_argument(
+        "--inference-mode",
+        choices=("synchronous", "rtc"),
+        default="synchronous",
+        help="Blocking chunk execution (default) or experimental asynchronous Real-Time Chunking",
+    )
+    parser.add_argument(
+        "--rtc-frozen-steps",
+        type=int,
+        help=(
+            "Conservative total RTC delay budget in 30 Hz actions, including observation capture, "
+            "serialization/network, inference, parsing, and handoff; default estimates recent timings"
+        ),
+    )
+    parser.add_argument(
+        "--rtc-ramp-rate",
+        type=float,
+        help="Optional RTC denoising ramp override (default: checkpoint model configuration)",
+    )
     parser.add_argument(
         "--initialization",
         choices=INITIALIZATION_MODES,

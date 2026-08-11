@@ -268,12 +268,45 @@ baseline. The ping result measures small-packet network latency only; the GR00T 
 timing is the more useful test of image-transfer performance.
 
 `--execution-horizon 8` does not make one inference request eight times larger or make
-the model predict only eight actions. The checkpoint returns its full trained chunk
-(currently 16 actions), the client validates all 16, and shadow mode evaluates the
-first eight before requesting another chunk. It intentionally waits `8/30 = 0.267 s`
-between shadow requests, so the replan interval includes that wait plus inference time.
+the model predict only eight actions. The checkpoint returns its full configured chunk,
+the client validates the full response, and synchronous shadow evaluates the first eight
+before requesting another chunk. It intentionally waits `8/30 = 0.267 s` between shadow
+requests, so the replan interval includes that wait plus inference time.
 
-## 8. Shadow pass/fail checklist
+## 8. Optional RTC wire/timing shadow
+
+After the synchronous network baseline passes, a checkpoint exposing at least 32 actions
+can exercise the RTC v1 request protocol without publishers:
+
+```bash
+RTC_SHADOW_LOG="laptop_rtc_shadow_h8_c100.log"
+
+python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --task pick-red-cup \
+    --policy-host 127.0.0.1 \
+    --policy-port 5555 \
+    --image-host 192.168.123.164 \
+    --network-interface "$ROBOT_NIC" \
+    --inference-mode rtc \
+    --execution-horizon 8 \
+    --max-chunks 100 \
+    2>&1 | tee "$RTC_SHADOW_LOG"
+```
+
+RTC shadow uses a virtual 30 Hz action clock. For each request it captures the
+pre-capture virtual plan index, sends that still-unconsumed physical tail, and measures
+how many virtual actions elapse through camera capture, Wi-Fi/SSH, inference, parsing and
+handoff. It sends no commands and the physical robot state does not follow the virtual
+plan, so this tests capability negotiation, serialization, latency budget, stale reply
+handling and buffer underrun—not RTC motion smoothness or task quality.
+
+Leave `--rtc-frozen-steps` unset for this first measurement so the client estimates the
+post-capture delay and adds each request's observed capture cost once. Save the request
+index, overlap, frozen prefix, inference time, actual elapsed actions and handoff logs.
+An overlap exhaustion is a useful failed timing result; it must never silently become an
+independent asynchronous chunk.
+
+## 9. Shadow pass/fail checklist
 
 - [ ] GPU server remains bound to `127.0.0.1:5555`.
 - [ ] Laptop SSH tunnel is stable for the entire test.
@@ -299,7 +332,7 @@ command mapping, gains, collision safety, publisher-loss behavior, or physical r
 See [the full validation checklist](groot_g1_pipeline_validation_checklist.md) before any
 real actuation.
 
-## Paste-ready summary for Codex on the laptop
+## 10. Paste-ready summary for Codex on the laptop
 
 Paste the following into a Codex session running in the laptop's
 `~/Development/unitree_lerobot` checkout:
@@ -325,7 +358,9 @@ Use docs/groot_g1_laptop_shadow.md as the runbook. Help me:
 4. run the 100-chunk, horizon-8 shadow latency test and preserve its log;
 5. calculate mean/median/p95/p99/max request latency and observed replan rate;
 6. compare it with the same-PC reference (mean ~0.142 s, p95 ~0.188 s, max ~0.198 s);
-7. stop on any contract/camera/state/action error and diagnose it without weakening
+7. only after synchronous shadow passes, optionally run the documented 32+-action RTC
+   virtual-clock shadow and preserve request-index/overlap/frozen/delay logs;
+8. stop on any contract/camera/state/action error and diagnose it without weakening
    deployment safety constants.
 
 The expected client output must explicitly include:

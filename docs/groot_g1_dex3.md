@@ -69,6 +69,45 @@ ssh -N -L 5555:127.0.0.1:5555 alex@GPU_PC_IP
 
 The runner still uses `--policy-host 127.0.0.1`; SSH carries that connection to the loopback-only model server. Do not expose the raw GR00T ZMQ port on Wi-Fi. The request contains about 0.9 MB of uncompressed RGB data, so measure tunnel latency and packet loss in shadow mode.
 
+### Synchronous and experimental RTC inference
+
+The default remains `--inference-mode synchronous`: capture one observation, wait for
+one prediction, execute its `--execution-horizon` prefix, then repeat. This is the
+simpler baseline for comparisons.
+
+`--inference-mode rtc` enables experimental asynchronous **Real-Time Chunking** for a
+checkpoint whose configured action horizon is at least 32. The server must advertise
+the RTC v1 physical-tail capability; an old server, ReplayPolicy, or wrapped simulator
+policy is rejected before DDS is initialized. The exact queue handoff is:
+
+1. After reset/warm-start, make one blocking prediction `A` and start its full horizon
+   in the watchdog-owning actuator child.
+2. The child advances targets at 30 Hz while continuing to write the current target to
+   DDS at 100 Hz.
+3. After at least `E = --execution-horizon` actions of the current plan, snapshot its
+   exact generation and index `r`, capture a fresh observation, and send the physical
+   tail `A[r:]` to GR00T from a separate worker-owned ZeroMQ client.
+4. The child continues executing `A` during camera capture, network transfer, model
+   inference and decoding. GR00T inpaints a new plan `B`, freezing the estimated
+   end-to-end delay prefix and smoothly denoising the remaining overlap.
+5. At handoff the child measures `k = current_index - r`, validates the old commanded
+   target to `B[k]` boundary, discards `B[:k]`, and atomically continues with `B[k:]`.
+6. A stale generation, invalid boundary, failed request, or `k` exhausting the supplied
+   overlap is never replayed. The child enters powered HOLD (or the existing actuator
+   fault/release path for a hard safety fault).
+
+In RTC mode `--execution-horizon` is the minimum replan spacing and the accounting unit,
+not the returned model length. `--max-chunks N` gives an exact action budget of `E*N` at
+30 Hz. The automatic frozen prefix estimates recent end-to-end delays. An explicit
+`--rtc-frozen-steps` overrides that total budget in 30 Hz actions, including observation
+capture, serialization/network, inference, parsing and handoff. Leave
+`--rtc-ramp-rate` unset to use the checkpoint's model configuration.
+
+Publisher-free RTC shadow mode runs the same wire protocol against a virtual 30 Hz
+action clock. It is useful for latency, stale-response and buffer-budget measurements,
+but the real robot does not follow the virtual targets, so it cannot demonstrate
+closed-loop smoothness or task quality.
+
 ## 3. Run a publisher-free shadow test
 
 Run this on the machine that can reach the G1 DDS network and PC2—normally the XR laptop unless the GPU PC is directly connected:
@@ -133,13 +172,14 @@ Actuated runs use policy warm-start by default. After `RUN`, the client performs
 
 This transition is available in both IsaacLab and the explicitly unqualified real path. It is a per-goal joint-space transition, not collision-aware planning and not a general license for large policy jumps. On the real robot, `WARMSTART` and `RESUME` are separate confirmations so the operator can inspect the target delta and the reached pose.
 
-During an actuated run, terminal commands are read only at safe action-chunk boundaries:
+During a synchronous actuated run, terminal commands are read at safe action-chunk
+boundaries. RTC polls them continuously while its child owns the exact 30 Hz handoff:
 
 - `hold` or `h`, followed by Enter, captures the current measured arm/hand pose and keeps publishing it at 100 Hz. The client stops making GR00T requests and displays a next-goal prompt. This is a powered position hold, not a passive brake or collision-safe freeze; it can continue exerting force and requires the client/watchdog to remain alive.
 - At the HOLD prompt, enter a trained task ID, its menu number, its exact training sentence, or custom goal text. Unknown text again requires exact `YES`. The new goal repeats GR00T reset, fresh inference, `WARMSTART`, discarded chunk, `RESUME`, reset, and fresh strict inference.
-- `quit` or `q` requests orderly release and exits. `Ctrl-C` also enters cleanup from any state. On real hardware, cleanup retains the final arm target while ramping `arm_sdk` authority to zero over one second, then sends Dex3 `stopMotors`; final pose and grasp after Unitree retakes authority are not guaranteed.
+- `quit` or `q` requests orderly release and exits. `Ctrl-C` also enters cleanup from any state. On real hardware, cleanup retains the final arm target while ramping `arm_sdk` authority to zero over 1.5 seconds, then sends Dex3 `stopMotors`; final pose and grasp after Unitree retakes authority are not guaranteed.
 
-A command typed while a synchronous inference request is already running cannot cancel that network request. Its result is discarded before submission, then HOLD or release occurs. Reaching finite `--max-chunks` without a HOLD command still exits through normal release; use a sufficiently large but finite bound for an interactive pick/put session.
+A command typed while a synchronous inference request is already running cannot cancel that network request. Its result is discarded before submission, then HOLD or release occurs. In RTC, `h` interrupts the active plan into powered HOLD and drains/discards any in-flight reply before accepting a new goal; `q` begins orderly release without waiting for the reply. Reaching finite `--max-chunks` without a HOLD command still exits through normal release; use a sufficiently large but finite bound for an interactive pick/put session.
 
 Armed `INITIALIZE`, `RUN`, `WARMSTART`, and `RESUME` prompts time out after 60 seconds. The HOLD goal prompt may wait indefinitely while continuing the heartbeat and safety checks. `Ctrl-C`, rejection, timeout or a watchdog fault enters the existing authority-release and Dex3 `stopMotors` cleanup path.
 
@@ -208,6 +248,27 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
     --execution-horizon 8 \
     --max-chunks 20
 ```
+
+After the complete synchronous ladder passes, a 32-action checkpoint can exercise the
+same isolated simulator with:
+
+```bash
+python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --sim \
+    --actuate \
+    --task pick-red-cup \
+    --policy-host 127.0.0.1 \
+    --image-host 127.0.0.1 \
+    --confirm-sim-network-isolated \
+    --inference-mode rtc \
+    --execution-horizon 8 \
+    --max-chunks 20
+```
+
+Keep automatic RTC delay estimation for the first test and record every request index,
+overlap, frozen prefix, inference time, actual child-measured delay and handoff. An RTC
+buffer underrun must produce powered HOLD, never replay or silently fall back to
+independent chunks.
 
 `--sim` selects DDS domain 1 and simulator `rt/lowcmd`, checks the simulator camera config, and converts the simulator's right-hand thumb/middle/index ordering to the recorded thumb/index/middle ordering. The stock simulator and runner both auto-select their CycloneDDS interface; do not pass `--network-interface`. Disconnect or isolate every physical robot network before starting either process, then use `--confirm-sim-network-isolated` as an explicit operator assertion. DDS domain 1 alone is not a physical safety boundary because the simulator reuses robot topic names. The sim path never publishes the real motion-mode `rt/arm_sdk` topic.
 

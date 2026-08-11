@@ -886,25 +886,10 @@ def validate_action_chunk(
     )
 
 
-def parse_action_chunk(
-    action: dict[str, Any],
-    model_horizon: int,
-    execution_horizon: int,
-    current_arm: np.ndarray,
-    current_left: np.ndarray,
-    current_right: np.ndarray,
-    validate_initial_step: bool = True,
-) -> ActionChunk:
-    if not 1 <= execution_horizon <= min(model_horizon, MAX_EXECUTION_HORIZON):
-        raise DeploymentError(
-            f"Execution horizon {execution_horizon} must be 1.."
-            f"{min(model_horizon, MAX_EXECUTION_HORIZON)}; "
-            f"MAX_EXECUTION_HORIZON={MAX_EXECUTION_HORIZON}"
-        )
+def _parse_full_action(action: dict[str, Any], model_horizon: int) -> ActionChunk:
+    """Parse a complete model prediction and enforce its absolute joint ranges."""
 
     chunks = {key: _numeric_action(action, key, model_horizon) for key in ACTION_KEYS}
-    # Reject gross invalid values anywhere in the model response, including the
-    # unexecuted tail, then apply rate checks to the executed prefix.
     full_arm = np.concatenate((chunks["left_arm"], chunks["right_arm"]), axis=1)
     _check_limits(
         "arm",
@@ -940,10 +925,54 @@ def parse_action_chunk(
         tolerance_constant="HAND_LIMIT_TOLERANCE_RAD",
     )
 
+    return ActionChunk(
+        arm=np.ascontiguousarray(full_arm),
+        left_hand=np.ascontiguousarray(chunks["left_hand"]),
+        right_hand=np.ascontiguousarray(chunks["right_hand"]),
+    )
+
+
+def parse_action_plan(
+    action: dict[str, Any],
+    model_horizon: int,
+    current_arm: np.ndarray,
+    current_left: np.ndarray,
+    current_right: np.ndarray,
+    validate_initial_step: bool = True,
+) -> ActionChunk:
+    """Parse and rate-check the full prediction horizon used by RTC."""
+
+    result = _parse_full_action(action, model_horizon)
+    if validate_initial_step:
+        validation_state = (current_arm, current_left, current_right)
+    else:
+        validation_state = (result.arm[0], result.left_hand[0], result.right_hand[0])
+    validate_action_chunk(result, *validation_state)
+    return result
+
+
+def parse_action_chunk(
+    action: dict[str, Any],
+    model_horizon: int,
+    execution_horizon: int,
+    current_arm: np.ndarray,
+    current_left: np.ndarray,
+    current_right: np.ndarray,
+    validate_initial_step: bool = True,
+) -> ActionChunk:
+    if not 1 <= execution_horizon <= min(model_horizon, MAX_EXECUTION_HORIZON):
+        raise DeploymentError(
+            f"Execution horizon {execution_horizon} must be 1.."
+            f"{min(model_horizon, MAX_EXECUTION_HORIZON)}; "
+            f"MAX_EXECUTION_HORIZON={MAX_EXECUTION_HORIZON}"
+        )
+
+    full = _parse_full_action(action, model_horizon)
+
     result = ActionChunk(
-        arm=np.ascontiguousarray(full_arm[:execution_horizon]),
-        left_hand=np.ascontiguousarray(chunks["left_hand"][:execution_horizon]),
-        right_hand=np.ascontiguousarray(chunks["right_hand"][:execution_horizon]),
+        arm=np.ascontiguousarray(full.arm[:execution_horizon]),
+        left_hand=np.ascontiguousarray(full.left_hand[:execution_horizon]),
+        right_hand=np.ascontiguousarray(full.right_hand[:execution_horizon]),
     )
     if validate_initial_step:
         validation_state = (current_arm, current_left, current_right)

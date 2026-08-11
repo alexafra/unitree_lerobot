@@ -61,12 +61,16 @@ a deliberate reason to change the adapter:
 - Exact 28 joint names and ordering already recorded in `meta/info.json`.
 - Relative model representation for the two arms, decoded by GR00T to absolute positions.
 - Absolute model representation for both hands.
-- Current predicted action horizon: 16; deployment executes no more than 8.
+- Predicted action horizon is checkpoint-specific: the current colour-only config uses
+  16 and the current gray-depth config uses 32; deployment `--execution-horizon`
+  remains capped at 8.
 - Exact task strings in the runner allowlist.
 
-If future RTC merging is a real requirement, deciding to train a 32- or 40-step predicted
-horizon now preserves that option. It does **not** add RTC to the current sequential
-runtime. Do not combine an RTC runtime rewrite with the first physical deployment.
+The runtime now has two deliberately separate modes. `synchronous` remains the baseline.
+Experimental `rtc` requires a predicted horizon of at least 32 and an RTC-capable direct
+PyTorch server. Treat it as a separate change: complete the synchronous simulator and
+physical ladder first, then repeat the relevant gates for RTC rather than changing the
+model, scene, network and scheduler together.
 
 Record the final paths once selected:
 
@@ -142,6 +146,8 @@ cd "$HOME/Development/Isaac-GR00T"
 
 uv run --no-sync python -m pytest \
     tests/gr00t/eval/test_server_modality_json.py \
+    tests/gr00t/model/test_action_head_rtc.py \
+    tests/gr00t/policy/test_gr00t_policy.py \
     tests/gr00t/policy/test_policy_service.py \
     -q
 ```
@@ -157,6 +163,11 @@ conda activate unitree_lerobot
 python -m unittest discover \
     -s tests \
     -p 'test_groot_g1_deployment.py' \
+    -v
+
+python -m unittest discover \
+    -s tests \
+    -p 'test_groot_g1_rtc.py' \
     -v
 
 python -m unittest discover \
@@ -481,6 +492,47 @@ Simulator pass criteria:
   causes a fault rather than stale-action continuation.
 - [ ] No attempt is made to claim task success from a scene that does not match training.
 
+### Separate experimental RTC gate
+
+Do this only with a checkpoint exposing at least 32 actions and only after every
+synchronous item above passes. First run publisher-free RTC shadow with a large finite
+budget. Its virtual clock tests the physical-tail wire protocol and end-to-end timing;
+it does not test closed-loop behavior because no predicted action moves the robot.
+
+```bash
+python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --task pick-red-cup \
+    --policy-host 127.0.0.1 \
+    --image-host 127.0.0.1 \
+    --inference-mode rtc \
+    --execution-horizon 8 \
+    --max-chunks 100
+```
+
+Then repeat in isolated IsaacLab with `--sim --actuate
+--confirm-sim-network-isolated`. Keep automatic frozen-delay estimation initially.
+
+- [ ] Server metadata advertises RTC protocol v1, physical action tails and direct
+  PyTorch backend; an old/replay/wrapped server fails before DDS initialization.
+- [ ] Shadow logs every request origin, overlap, frozen prefix, end-to-end inference
+  duration, child/virtual elapsed action count and handoff.
+- [ ] `execution-horizon=8`, `max-chunks=1` executes exactly eight actions and does not
+  manufacture an extra chunk; `max-chunks=20` budgets exactly 160 actions.
+- [ ] At each handoff the child continues with `B[k:]`, where `k` is measured after
+  observation capture and inference. No already-consumed prefix is replayed.
+- [ ] The old-commanded-target to `B[k]` boundary and every remaining within-plan step
+  retain the normal joint/rate checks.
+- [ ] A delayed reply that exhausts the overlap causes powered HOLD, not stale
+  continuation or fallback to independent chunks.
+- [ ] A stale generation is discarded and causes powered HOLD.
+- [ ] `h` during inference holds, drains/discards that response, and a second goal repeats
+  reset plus the normal warm-start before RTC restarts.
+- [ ] `q` and Ctrl-C take the existing orderly release path; they never wait indefinitely
+  for a policy reply.
+- [ ] Camera timeout, policy timeout, worker failure and action-buffer underrun have each
+  been injected in simulation or CPU protocol tests and fail closed.
+- [ ] No ZeroMQ camera, policy or DDS socket crosses thread ownership.
+
 Simulation does not prove physical joint signs, real `arm_sdk` authority behavior, DDS
 loss behavior, hand stopping, collision safety, or balance safety.
 
@@ -707,8 +759,10 @@ Use a new process/run record for each stage:
 | E | 8 | 2 | 0.533 s |
 | F | 8 | 4 | 1.067 s |
 
-Wall-clock time is longer because inference occurs between chunks. Do not increase horizon,
-chunk count, initialization mode, task and scene difficulty in the same experiment.
+In synchronous mode wall-clock time is longer because inference occurs between chunks.
+Do not increase horizon, chunk count, initialization mode, task and scene difficulty in
+the same experiment. Keep this first physical ladder synchronous; RTC needs its own
+qualification after the baseline is understood.
 
 For each stage:
 
@@ -732,9 +786,11 @@ when:
 - a validation/watchdog fault occurs; or
 - an exception occurs.
 
-At 30 Hz, horizon 8 represents about 0.267 seconds of commanded action per chunk; 20 chunks
-represent about 5.33 seconds of commanded action, plus inference gaps. Do not set a long
-limit and assume the policy will stop itself after success.
+At 30 Hz, horizon 8 represents about 0.267 seconds of commanded action per accounting
+chunk; 20 chunks represent exactly 160 actions or about 5.33 seconds of commanded motion.
+Synchronous mode adds inference gaps between those prefixes. RTC continues the old action
+buffer during inference, so it has no deliberate gaps and treats the same values as one
+160-action budget. Neither mode infers that the task is finished.
 
 - [ ] Use finite, conservative `max-chunks` for every physical run.
 - [ ] Operator remains ready to stop when success or an unsafe condition is observed.
@@ -798,7 +854,8 @@ RGBD is a separate integration layer, even though it uses the same physical Real
 ### Remaining known limitations
 
 - No GR00T task-completion signal.
-- No asynchronous RTC merge; current loop is sequential chunk execution.
+- RTC is experimental and separately unqualified for physical use; publisher-free shadow
+  validates timing/protocol but not closed-loop smoothness.
 - Workstation cleanup cannot guarantee release through a failed/wedged DDS path.
 - IsaacLab does not prove real balance, collisions, joint signs or hand-stop behavior.
 
