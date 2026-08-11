@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "/home/alex/miniconda3/envs/tv/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/alex/miniconda3/envs/tv/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/alex/Development/unitree_lerobot/unitree_lerobot/eval_robot/diagnose_g1_authority_ramp.py", line 102, in <module>
+    raise SystemExit(main())
+  File "/home/alex/Development/unitree_lerobot/unitree_lerobot/eval_robot/diagnose_g1_authority_ramp.py", line 71, in main
+    _confirm()
+  File "/home/alex/Development/unitree_lerobot/unitree_lerobot/eval_robot/diagnose_g1_authority_ramp.py", line 47, in _confirm
+    with open("/dev/tty", "r+", buffering=1) as tty:
+io.UnsupportedOperation: File or stream is not seekable.

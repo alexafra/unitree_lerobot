@@ -1732,6 +1732,7 @@ def _actuator_main(
                     state_started = time.monotonic()
                     measured = backend.state()
                     state_lookup_ms = (time.monotonic() - state_started) * 1e3
+                    state_age_ms = (time.monotonic() - measured.captured_at) * 1e3
                     backend.set_target(measured.arm, measured.left_hand, measured.right_hand)
                     weight = (step + 1) / steps
                     backend.set_weight(weight)
@@ -1745,7 +1746,7 @@ def _actuator_main(
                             {
                                 "weight": weight,
                                 "heartbeat_age_ms": heartbeat_age * 1e3,
-                                "state_age_ms": (time.monotonic() - measured.captured_at) * 1e3,
+                                "state_age_ms": state_age_ms,
                                 "arm_drift_rad": float(np.max(np.abs(measured.arm - ramp_reference.arm))),
                                 "arm_dq_rad_s": float(np.max(np.abs(measured.arm_dq))),
                                 "state_lookup_ms": state_lookup_ms,
@@ -2473,19 +2474,21 @@ class SafeG1Dex3Actuator:
         self._stop_event = context.Event()
         self._urgent_hold_event = context.Event()
         self._heartbeat = context.Value("d", time.monotonic())
+        process_args = (
+            simulation,
+            network_interface,
+            self._command_queue,
+            self._status_queue,
+            self._stop_event,
+            self._heartbeat,
+            self._urgent_hold_event,
+            command_conditioning,
+        )
+        if authority_ramp_diagnostics:
+            process_args += (True,)
         self._process = context.Process(
             target=_actuator_main,
-            args=(
-                simulation,
-                network_interface,
-                self._command_queue,
-                self._status_queue,
-                self._stop_event,
-                self._heartbeat,
-                self._urgent_hold_event,
-                command_conditioning,
-                authority_ramp_diagnostics,
-            ),
+            args=process_args,
             name="groot-g1-dex3-actuator",
         )
         self._sequence = 0
