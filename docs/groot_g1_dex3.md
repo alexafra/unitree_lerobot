@@ -323,7 +323,11 @@ For that reason, real `--actuate` is rejected by default. Before any real test, 
 - motion mode ownership, arm tracking/rate limits, and authority ramps;
 - absence of every competing XR, replay, or arm/hand DDS publisher.
 
-This adapter accepts only `mode_machine == 5`, corresponding to the current `g1_29dof_with_hand_rev_1_0` asset, and checks it continuously. Mode 2 or another G1 embodiment needs a separately qualified adapter.
+This adapter accepts only `mode_machine == 6`, corresponding to
+`g1_29dof_lock_waist_with_hand_rev_1_0`, the one-DoF lock-waist embodiment used for
+data collection and training. Waist yaw remains active; waist roll and pitch are locked.
+The adapter checks the mode continuously; mode 5, mode 2, or another G1 embodiment
+needs a separately qualified adapter.
 
 After those qualifications, the syntax for an explicitly unqualified research test is shown below so the override cannot be mistaken for a default:
 

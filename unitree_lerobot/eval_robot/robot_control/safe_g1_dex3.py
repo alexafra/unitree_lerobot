@@ -43,6 +43,7 @@ from unitree_lerobot.eval_robot.groot_contract import (
     LEFT_HAND_JOINT_NAMES,
     LEFT_HAND_UPPER,
     MAX_ARM_STEP_RAD,
+    MEASURED_LIMIT_TOLERANCE_RAD,
     RIGHT_HAND_LOWER,
     RIGHT_HAND_JOINT_NAMES,
     RIGHT_HAND_UPPER,
@@ -84,9 +85,11 @@ HAND_TRACKING_WARNING_DWELL_S = 0.20
 HAND_COMMAND_HISTORY_SIZE = 128
 TRACKING_GRACE_S = 0.50
 MAX_ACTION_LATENESS_S = 0.02
-# OFFICIAL: Unitree G1 asset mapping identifies mode_machine 5 as
-# g1_29dof_with_hand_rev_1_0 (eval_robot/assets/g1/README.md).
-QUALIFIED_REAL_MODE_MACHINE = 5
+# OFFICIAL: Unitree G1 asset mapping identifies mode_machine 6 as
+# g1_29dof_lock_waist_with_hand_rev_1_0: waist yaw remains active while
+# roll/pitch are locked (eval_robot/assets/g1/README.md). This matches the
+# embodiment used to collect and train the deployed policy.
+QUALIFIED_REAL_MODE_MACHINE = 6
 PREARM_STATIONARY_DWELL_S = 0.5
 PREARM_STATE_MAX_AGE_S = 0.05
 PREARM_MAX_ARM_DQ_RAD_S = 0.10
@@ -521,6 +524,118 @@ def _smooth_initialization_path(
     return current[None] + blend[:, None] * (target - current)[None]
 
 
+def _strict_hand_target_bounds(lower: np.ndarray, upper: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    return lower - HAND_LIMIT_TOLERANCE_RAD, upper + HAND_LIMIT_TOLERANCE_RAD
+
+
+def _validate_initialization_hand_recovery(
+    name: str,
+    values: np.ndarray,
+    current: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    joint_names: tuple[str, ...],
+) -> None:
+    """Allow only a bounded inward transition from measured-only tolerance.
+
+    Policy targets use the stricter hand target range.  Initialization is the
+    one place where its starting state can legitimately be outside that range:
+    measured state admits a wider tolerance so encoder noise at a URDF limit
+    does not fault the reader.  Until a joint first enters the strict target
+    range, every initialization command must stay inside the measured range and
+    move monotonically inward.  Once inside, it may never leave again.
+    """
+
+    strict_lower, strict_upper = _strict_hand_target_bounds(lower, upper)
+    measured_lower = lower - MEASURED_LIMIT_TOLERANCE_RAD
+    measured_upper = upper + MEASURED_LIMIT_TOLERANCE_RAD
+    previous = np.asarray(current, dtype=np.float64).copy()
+    entered_strict_range = (previous >= strict_lower) & (previous <= strict_upper)
+
+    for step, target in enumerate(np.asarray(values, dtype=np.float64)):
+        bad_measured = np.flatnonzero((target < measured_lower) | (target > measured_upper))
+        if bad_measured.size:
+            joint = int(bad_measured[0])
+            raise DeploymentError(
+                f"Initialization {name} recovery left the measured-state range at step {step}, "
+                f"joint {joint} ({joint_names[joint]}): {target[joint]:.4f} rad"
+            )
+
+        delta = target - previous
+        bad_step = np.flatnonzero(np.abs(delta) > INITIALIZATION_MAX_HAND_STEP_RAD + 1e-12)
+        if bad_step.size:
+            joint = int(bad_step[0])
+            raise DeploymentError(
+                f"Initialization {name} recovery step is too large at step {step}, joint {joint} "
+                f"({joint_names[joint]}): {delta[joint]:+.4f} rad; "
+                f"INITIALIZATION_MAX_HAND_STEP_RAD={INITIALIZATION_MAX_HAND_STEP_RAD:.4f} rad"
+            )
+
+        below = target < strict_lower
+        above = target > strict_upper
+        for joint in np.flatnonzero(below):
+            if entered_strict_range[joint] or previous[joint] >= strict_lower[joint] or delta[joint] < -1e-12:
+                raise DeploymentError(
+                    f"Initialization {name} recovery is not monotonic inward at step {step}, "
+                    f"joint {joint} ({joint_names[joint]})"
+                )
+        for joint in np.flatnonzero(above):
+            if entered_strict_range[joint] or previous[joint] <= strict_upper[joint] or delta[joint] > 1e-12:
+                raise DeploymentError(
+                    f"Initialization {name} recovery is not monotonic inward at step {step}, "
+                    f"joint {joint} ({joint_names[joint]})"
+                )
+
+        entered_strict_range |= ~(below | above)
+        previous = target
+
+    if not np.all(entered_strict_range):
+        joint = int(np.flatnonzero(~entered_strict_range)[0])
+        raise DeploymentError(
+            f"Initialization {name} recovery did not enter the strict target range at joint {joint} "
+            f"({joint_names[joint]})"
+        )
+
+
+def _validate_moving_initialization_chunk(
+    chunk: ActionChunk,
+    current_arm: np.ndarray,
+    current_left: np.ndarray,
+    current_right: np.ndarray,
+) -> None:
+    """Validate a moving init without weakening the policy-action contract."""
+
+    left_lower, left_upper = _strict_hand_target_bounds(LEFT_HAND_LOWER, LEFT_HAND_UPPER)
+    right_lower, right_upper = _strict_hand_target_bounds(RIGHT_HAND_LOWER, RIGHT_HAND_UPPER)
+
+    # Reuse the ordinary strict validator for structure, arm limits, final hand
+    # limits, and the hard command-step backstop.  Only initialization's
+    # measured-origin hand samples are projected in this validation surrogate;
+    # the actual samples are checked against the narrower recovery rules below.
+    strict_chunk = ActionChunk(
+        arm=chunk.arm,
+        left_hand=np.clip(chunk.left_hand, left_lower, left_upper),
+        right_hand=np.clip(chunk.right_hand, right_lower, right_upper),
+    )
+    validate_action_chunk(strict_chunk, current_arm, current_left, current_right)
+    _validate_initialization_hand_recovery(
+        "left hand",
+        chunk.left_hand,
+        current_left,
+        LEFT_HAND_LOWER,
+        LEFT_HAND_UPPER,
+        LEFT_HAND_JOINT_NAMES,
+    )
+    _validate_initialization_hand_recovery(
+        "right hand",
+        chunk.right_hand,
+        current_right,
+        RIGHT_HAND_LOWER,
+        RIGHT_HAND_UPPER,
+        RIGHT_HAND_JOINT_NAMES,
+    )
+
+
 def build_initialization_chunk(state: RobotState, spec: InitializationSpec) -> ActionChunk:
     """Resolve measured targets and create a bounded smooth joint-space path."""
 
@@ -531,13 +646,30 @@ def build_initialization_chunk(state: RobotState, spec: InitializationSpec) -> A
         np.asarray(state.left_hand, dtype=np.float64),
         np.asarray(state.right_hand, dtype=np.float64),
     )
-    targets = tuple(
-        measured.copy() if target is None else np.asarray(target, dtype=np.float64).copy()
-        for measured, target in zip(
-            current,
-            (spec.arm, spec.left_hand, spec.right_hand),
-            strict=True,
+    if spec.mode == "measured":
+        # This is an exact no-motion hold, not a policy action.  The measured
+        # state was accepted by validate_measured_state above and must not be
+        # rejected merely because the policy target tolerance is narrower.
+        return ActionChunk(
+            arm=np.ascontiguousarray(current[0][None]).copy(),
+            left_hand=np.ascontiguousarray(current[1][None]).copy(),
+            right_hand=np.ascontiguousarray(current[2][None]).copy(),
         )
+
+    left_lower, left_upper = _strict_hand_target_bounds(LEFT_HAND_LOWER, LEFT_HAND_UPPER)
+    right_lower, right_upper = _strict_hand_target_bounds(RIGHT_HAND_LOWER, RIGHT_HAND_UPPER)
+    targets = (
+        current[0].copy() if spec.arm is None else np.asarray(spec.arm, dtype=np.float64).copy(),
+        (
+            np.clip(current[1], left_lower, left_upper)
+            if spec.left_hand is None
+            else np.asarray(spec.left_hand, dtype=np.float64).copy()
+        ),
+        (
+            np.clip(current[2], right_lower, right_upper)
+            if spec.right_hand is None
+            else np.asarray(spec.right_hand, dtype=np.float64).copy()
+        ),
     )
     max_steps = (INITIALIZATION_MAX_ARM_STEP_RAD, INITIALIZATION_MAX_HAND_STEP_RAD, INITIALIZATION_MAX_HAND_STEP_RAD)
     # A cubic smoothstep has a maximum slope of 1.5.  This initial estimate is
@@ -576,7 +708,7 @@ def build_initialization_chunk(state: RobotState, spec: InitializationSpec) -> A
         left_hand=np.ascontiguousarray(paths[1]),
         right_hand=np.ascontiguousarray(paths[2]),
     )
-    validate_action_chunk(chunk, *current)
+    _validate_moving_initialization_chunk(chunk, *current)
     return chunk
 
 
@@ -965,7 +1097,8 @@ class _G1Dex3CommandBackend:
         if not simulation and initial.mode_machine != QUALIFIED_REAL_MODE_MACHINE:
             raise DeploymentError(
                 f"Real G1 mode_machine is {initial.mode_machine}; this adapter is qualified only "
-                f"for mode {QUALIFIED_REAL_MODE_MACHINE} (g1_29dof_with_hand_rev_1_0)"
+                f"for mode {QUALIFIED_REAL_MODE_MACHINE} "
+                "(g1_29dof_lock_waist_with_hand_rev_1_0)"
             )
 
         from unitree_lerobot.eval_robot.robot_control.robot_arm import G1_29_JointArmIndex
@@ -1511,6 +1644,119 @@ def _validate_policy_target_input(
         LOGGER.warning("%s raw target discontinuity will be conditioned before DDS: %s", context, exc)
 
 
+def _ramp_real_arm_authority(
+    backend: _G1Dex3CommandBackend,
+    stop_event: Any,
+    heartbeat: Any,
+) -> bool:
+    """Publish a measured hold while gradually acquiring ``arm_sdk`` authority.
+
+    Dex3 absolute targets do not need to be rewritten for every arm authority
+    step.  Writing each hand at every step made the nominal 1.5-second ramp
+    perform 450 serial DDS writes and allowed DDS latency to push arming past
+    the parent's timeout.  First publish the measured arm hold at zero weight,
+    then send the measured hand hold once and ramp only the arm command.  The
+    initial arm write also establishes the cleanup invariant before any hand
+    write: a subsequent cancellation/fault must run arm release and Dex3
+    ``stopMotors``.  Arm weight follows elapsed wall time and missed 100 Hz
+    ticks are skipped instead of accumulating an extra sleep after slow writes.
+
+    ``False`` is an orderly cancellation requested through ``stop_event``;
+    heartbeat expiry remains a fault with a distinct diagnostic.
+    """
+
+    if stop_event.is_set():
+        LOGGER.info("Arm authority ramp cancelled before the first DDS write")
+        return False
+    if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
+        raise DeploymentError("Parent heartbeat expired before arm authority ramp")
+
+    backend.set_weight(0.0)
+    authority_started = time.monotonic()
+    initial_arm_write_started = authority_started
+    backend._publish_arm()
+    initial_arm_write_s = time.monotonic() - initial_arm_write_started
+    if stop_event.is_set():
+        LOGGER.info("Arm authority ramp cancelled after the zero-weight arm hold write")
+        return False
+    if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
+        raise DeploymentError("Parent heartbeat expired after zero-weight arm hold write")
+
+    hand_write_started = time.monotonic()
+    backend._publish_hands()
+    hand_write_s = time.monotonic() - hand_write_started
+    if stop_event.is_set():
+        LOGGER.info("Arm authority ramp cancelled after the measured hand hold write")
+        return False
+    if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
+        raise DeploymentError("Parent heartbeat expired after measured hand hold write")
+
+    period = 1.0 / PUBLISH_HZ
+    duration = max(float(ARM_AUTHORITY_RAMP_S), period)
+    ramp_started = time.monotonic()
+    next_write_at = ramp_started
+    arm_writes = 0
+    skipped_ticks = 0
+    max_arm_cycle_s = 0.0
+
+    while True:
+        if stop_event.is_set():
+            LOGGER.info("Arm authority ramp cancelled after %d arm writes", arm_writes)
+            return False
+        if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
+            raise DeploymentError("Parent heartbeat expired while ramping arm authority")
+
+        now = time.monotonic()
+        if now < next_write_at and stop_event.wait(next_write_at - now):
+            LOGGER.info("Arm authority ramp cancelled after %d arm writes", arm_writes)
+            return False
+        if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
+            raise DeploymentError("Parent heartbeat expired while ramping arm authority")
+
+        cycle_started = time.monotonic()
+        measured = backend.state()
+        # Keep the exact hand targets that were written above.  Only the arm
+        # target tracks measured q while authority weight rises.
+        backend.set_target(measured.arm, backend._left_target, backend._right_target)
+        weight = min(1.0, (cycle_started - ramp_started + period) / duration)
+        backend.set_weight(weight)
+        backend._publish_arm()
+        cycle_completed = time.monotonic()
+        arm_writes += 1
+        max_arm_cycle_s = max(max_arm_cycle_s, cycle_completed - cycle_started)
+
+        # Cleanup requests are not heartbeat faults.  Check the stop event
+        # first, including after a potentially blocking DDS Write.
+        if stop_event.is_set():
+            LOGGER.info("Arm authority ramp cancelled after %d arm writes", arm_writes)
+            return False
+        if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
+            raise DeploymentError("Parent heartbeat expired while ramping arm authority")
+        if weight >= 1.0:
+            break
+
+        next_write_at += period
+        if next_write_at <= cycle_completed:
+            missed = int((cycle_completed - next_write_at) // period) + 1
+            skipped_ticks += missed
+            next_write_at += missed * period
+
+    completed_at = time.monotonic()
+    LOGGER.info(
+        "Arm authority acquisition completed in %.3fs: weight ramp=%.3fs, "
+        "zero-weight arm write=%.3fs, hand hold write=%.3fs, arm writes=%d, "
+        "skipped 100 Hz ticks=%d, max arm cycle=%.3fs",
+        completed_at - authority_started,
+        completed_at - ramp_started,
+        initial_arm_write_s,
+        hand_write_s,
+        arm_writes,
+        skipped_ticks,
+        max_arm_cycle_s,
+    )
+    return True
+
+
 def _actuator_main(
     simulation: bool,
     network_interface: str | None,
@@ -1568,15 +1814,8 @@ def _actuator_main(
         backend.prepare_measured_hold()
 
         if not simulation:
-            steps = max(1, round(ARM_AUTHORITY_RAMP_S * PUBLISH_HZ))
-            for step in range(steps):
-                if stop_event.is_set() or _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
-                    raise DeploymentError("Heartbeat expired while ramping arm authority")
-                measured = backend.state()
-                backend.set_target(measured.arm, measured.left_hand, measured.right_hand)
-                backend.set_weight((step + 1) / steps)
-                backend.publish()
-                stop_event.wait(1.0 / PUBLISH_HZ)
+            if not _ramp_real_arm_authority(backend, stop_event, heartbeat):
+                return
         tracking_checks_after = time.monotonic() + TRACKING_GRACE_S
         _status(status_queue, "armed")
 

@@ -94,6 +94,7 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     MAX_CONDITIONED_HAND_STEP_RAD,
     MAX_HAND_TRACKING_ERROR_RAD,
     PUBLISH_HZ,
+    QUALIFIED_REAL_MODE_MACHINE,
     RobotState,
     SafeG1Dex3Actuator,
     SIM_RIGHT_HAND_PERMUTATION,
@@ -102,6 +103,7 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     _G1Dex3CommandBackend,
     _actuator_main,
     _execute_initialization,
+    _ramp_real_arm_authority,
     _wait_for_initialization_start,
     build_initialization_chunk,
     decode_color_0_rgb,
@@ -274,6 +276,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertEqual(MAX_ARM_DQ_RAD_S, 6.0)
         self.assertEqual(MAX_ARM_TRACKING_ERROR_RAD, 0.35)
         self.assertEqual(MAX_HAND_TRACKING_ERROR_RAD, 1.50)
+        self.assertEqual(QUALIFIED_REAL_MODE_MACHINE, 6)
         self.assertAlmostEqual(MAX_CONDITIONED_ARM_STEP_RAD, 0.03)
         np.testing.assert_allclose(
             MAX_CONDITIONED_HAND_STEP_RAD,
@@ -2783,6 +2786,93 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertEqual(FakeBackend.instance.publishes, 0)
         self.assertTrue(FakeBackend.instance.closed)
 
+    def test_real_authority_ramp_writes_hands_once_and_acks_after_final_arm_weight(self):
+        class SlowAuthorityBackend(FakeBackend):
+            instance = None
+
+            def __init__(self, simulation, network_interface):
+                super().__init__(simulation, network_interface)
+                type(self).instance = self
+                self.hand_writes = 0
+                self.arm_writes = 0
+                self.weights = []
+
+            def _publish_hands(self):
+                self.hand_writes += 1
+
+            def _publish_arm(self):
+                self.arm_writes += 1
+                # Deliberately slower than the patched 1 kHz schedule.  The
+                # ramp must skip missed ticks instead of accumulating them.
+                time.sleep(0.004)
+
+            def set_weight(self, weight):
+                self.weights.append(float(weight))
+
+        commands = queue.Queue(maxsize=1)
+        statuses = queue.Queue(maxsize=32)
+        stop = threading.Event()
+        heartbeat = FakeHeartbeat(time.monotonic())
+        module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+        with (
+            mock.patch(f"{module}._G1Dex3CommandBackend", SlowAuthorityBackend),
+            mock.patch(f"{module}.ARM_AUTHORITY_RAMP_S", 0.03),
+            mock.patch(f"{module}.PUBLISH_HZ", 1_000.0),
+        ):
+            thread = threading.Thread(
+                target=_actuator_main,
+                args=(False, None, commands, statuses, stop, heartbeat),
+                daemon=True,
+            )
+            thread.start()
+            self.assertEqual(statuses.get(timeout=1.0)[0], "ready")
+            commands.put(("arm",))
+            self.assertEqual(statuses.get(timeout=1.0)[0], "armed")
+
+            backend = SlowAuthorityBackend.instance
+            self.assertEqual(backend.hand_writes, 1)
+            self.assertGreater(backend.arm_writes, 1)
+            self.assertLess(backend.arm_writes, 20)
+            self.assertEqual(backend.weights[0], 0.0)
+            self.assertEqual(backend.weights[-1], 1.0)
+            self.assertTrue(all(a < b for a, b in zip(backend.weights, backend.weights[1:])))
+
+            stop.set()
+            thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(backend.released)
+        self.assertTrue(backend.closed)
+
+    def test_stop_during_authority_ramp_is_orderly_cancellation_not_heartbeat_fault(self):
+        class CancellingBackend(FakeBackend):
+            def __init__(self, stop_event):
+                super().__init__(False, None)
+                self.stop_event = stop_event
+                self.hand_writes = 0
+                self.arm_writes = 0
+
+            def _publish_hands(self):
+                self.hand_writes += 1
+
+            def _publish_arm(self):
+                self.arm_writes += 1
+                if self.arm_writes == 2:
+                    self.stop_event.set()
+
+        stop = threading.Event()
+        backend = CancellingBackend(stop)
+
+        completed = _ramp_real_arm_authority(
+            backend,
+            stop,
+            FakeHeartbeat(time.monotonic()),
+        )
+
+        self.assertFalse(completed)
+        self.assertEqual(backend.hand_writes, 1)
+        self.assertEqual(backend.arm_writes, 2)
+
     def test_actuator_rejects_policy_chunks_until_initialization_completes(self):
         actuator = object.__new__(SafeG1Dex3Actuator)
         actuator._initialized = False
@@ -3641,10 +3731,10 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertEqual(backend._left_publisher.writes, 1)
         self.assertEqual(backend._right_publisher.writes, 1)
 
-    def test_prepare_measured_hold_rejects_unqualified_transient_mode(self):
+    def test_prepare_measured_hold_rejects_full_waist_mode_for_lock_waist_policy(self):
         unsafe_state = RobotState(
             captured_at=time.monotonic(),
-            mode_machine=2,
+            mode_machine=5,
             arm=np.zeros(14),
             arm_dq=np.zeros(14),
             left_hand=np.zeros(7),
@@ -3655,10 +3745,39 @@ class GrootG1DeploymentTests(unittest.TestCase):
         backend.reader = SimpleNamespace(read=lambda timeout_s: unsafe_state)
         backend._arm_message = SimpleNamespace(mode_machine=None)
 
-        with self.assertRaisesRegex(DeploymentError, "QUALIFIED_REAL_MODE_MACHINE=5"):
+        with self.assertRaisesRegex(DeploymentError, "QUALIFIED_REAL_MODE_MACHINE=6"):
             backend.prepare_measured_hold()
 
         self.assertIsNone(backend._arm_message.mode_machine)
+
+    def test_prepare_measured_hold_accepts_and_writes_lock_waist_mode(self):
+        class FreshReader:
+            @staticmethod
+            def read(timeout_s):
+                del timeout_s
+                return RobotState(
+                    captured_at=time.monotonic(),
+                    mode_machine=6,
+                    arm=np.zeros(14),
+                    arm_dq=np.zeros(14),
+                    left_hand=np.zeros(7),
+                    right_hand=np.zeros(7),
+                )
+
+        backend = object.__new__(_G1Dex3CommandBackend)
+        backend.simulation = False
+        backend.reader = FreshReader()
+        backend._arm_message = SimpleNamespace(mode_machine=None)
+
+        module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+        with (
+            mock.patch(f"{module}.PREARM_STATIONARY_DWELL_S", 0.01),
+            mock.patch(f"{module}.PREARM_MIN_DISTINCT_SAMPLES", 1),
+        ):
+            state = backend.prepare_measured_hold()
+
+        self.assertEqual(state.mode_machine, 6)
+        self.assertEqual(backend._arm_message.mode_machine, 6)
 
     def test_prepare_measured_hold_requires_fresh_stationary_real_state(self):
         def backend_with_state(state):
@@ -3670,7 +3789,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
         stale = RobotState(
             captured_at=time.monotonic() - 1.0,
-            mode_machine=5,
+            mode_machine=6,
             arm=np.zeros(14),
             arm_dq=np.zeros(14),
             left_hand=np.zeros(7),
@@ -3681,7 +3800,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
         moving = RobotState(
             captured_at=time.monotonic(),
-            mode_machine=5,
+            mode_machine=6,
             arm=np.zeros(14),
             arm_dq=np.full(14, 0.2),
             left_hand=np.zeros(7),
