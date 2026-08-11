@@ -1627,6 +1627,7 @@ def _actuator_main(
     heartbeat: Any,
     urgent_hold_event: Any | None = None,
     command_conditioning: str = "none",
+    authority_ramp_diagnostics: bool = False,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if threading.current_thread() is threading.main_thread():
@@ -1653,6 +1654,7 @@ def _actuator_main(
     hand_watchdog = HandTrackingWatchdog()
     try:
         backend = _G1Dex3CommandBackend(simulation, network_interface)
+        backend._authority_ramp_timing_enabled = authority_ramp_diagnostics
         if command_conditioning == "xr":
             conditioner = XrPolicyOutputConditioner()
         _status(status_queue, "ready")
@@ -1672,18 +1674,115 @@ def _actuator_main(
         else:
             return
 
-        backend.prepare_measured_hold()
+        prearm_started = time.monotonic()
+        if authority_ramp_diagnostics:
+            _status(
+                status_queue,
+                "authority_ramp_timing",
+                {"event": "prearm_begin", "elapsed_ms": 0.0},
+            )
+        ramp_reference = backend.prepare_measured_hold()
+        if authority_ramp_diagnostics:
+            _status(
+                status_queue,
+                "authority_ramp_timing",
+                {
+                    "event": "prearm_complete",
+                    "elapsed_ms": (time.monotonic() - prearm_started) * 1e3,
+                },
+            )
 
         if not simulation:
             steps = max(1, round(ARM_AUTHORITY_RAMP_S * PUBLISH_HZ))
-            for step in range(steps):
-                if stop_event.is_set() or _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
-                    raise DeploymentError("Heartbeat expired while ramping arm authority")
-                measured = backend.state()
-                backend.set_target(measured.arm, measured.left_hand, measured.right_hand)
-                backend.set_weight((step + 1) / steps)
-                backend.publish()
-                stop_event.wait(1.0 / PUBLISH_HZ)
+            ramp_started = time.monotonic()
+            timing_records: list[dict[str, float]] = []
+            if authority_ramp_diagnostics:
+                _status(
+                    status_queue,
+                    "authority_ramp_timing",
+                    {
+                        "event": "ramp_begin",
+                        "completed_steps": 0,
+                        "total_steps": steps,
+                        "elapsed_ms": 0.0,
+                    },
+                )
+            try:
+                for step in range(steps):
+                    if stop_event.is_set():
+                        if authority_ramp_diagnostics:
+                            _status(
+                                status_queue,
+                                "authority_ramp_timing",
+                                _authority_ramp_timing_summary(
+                                    timing_records,
+                                    event="cancelled_by_parent_stop",
+                                    elapsed_s=time.monotonic() - ramp_started,
+                                    total_steps=steps,
+                                ),
+                            )
+                        return
+                    heartbeat_age = _heartbeat_age(heartbeat)
+                    if heartbeat_age > HEARTBEAT_TIMEOUT_S:
+                        raise DeploymentError(
+                            "Parent heartbeat expired while ramping arm authority: "
+                            f"age={heartbeat_age:.3f}s, HEARTBEAT_TIMEOUT_S={HEARTBEAT_TIMEOUT_S:.3f}s"
+                        )
+                    loop_started = time.monotonic()
+                    state_started = time.monotonic()
+                    measured = backend.state()
+                    state_lookup_ms = (time.monotonic() - state_started) * 1e3
+                    backend.set_target(measured.arm, measured.left_hand, measured.right_hand)
+                    weight = (step + 1) / steps
+                    backend.set_weight(weight)
+                    backend.publish()
+                    work_ms = (time.monotonic() - loop_started) * 1e3
+                    stop_event.wait(1.0 / PUBLISH_HZ)
+                    cycle_ms = (time.monotonic() - loop_started) * 1e3
+                    if authority_ramp_diagnostics:
+                        publish_timing = backend._last_publish_timing_ms
+                        timing_records.append(
+                            {
+                                "weight": weight,
+                                "heartbeat_age_ms": heartbeat_age * 1e3,
+                                "state_age_ms": (time.monotonic() - measured.captured_at) * 1e3,
+                                "arm_drift_rad": float(np.max(np.abs(measured.arm - ramp_reference.arm))),
+                                "arm_dq_rad_s": float(np.max(np.abs(measured.arm_dq))),
+                                "state_lookup_ms": state_lookup_ms,
+                                "arm_state_check_ms": publish_timing.get("arm_state_check", 0.0),
+                                "arm_crc_ms": publish_timing.get("arm_crc", 0.0),
+                                "arm_write_ms": publish_timing.get("arm_write", 0.0),
+                                "left_write_ms": publish_timing.get("left_write", 0.0),
+                                "right_write_ms": publish_timing.get("right_write", 0.0),
+                                "publish_total_ms": publish_timing.get("publish_total", 0.0),
+                                "work_ms": work_ms,
+                                "cycle_ms": cycle_ms,
+                            }
+                        )
+                        if (step + 1) % 25 == 0 or step + 1 == steps:
+                            _status(
+                                status_queue,
+                                "authority_ramp_timing",
+                                _authority_ramp_timing_summary(
+                                    timing_records,
+                                    event="progress" if step + 1 < steps else "complete",
+                                    elapsed_s=time.monotonic() - ramp_started,
+                                    total_steps=steps,
+                                ),
+                            )
+            except BaseException:
+                if authority_ramp_diagnostics:
+                    _status(
+                        status_queue,
+                        "authority_ramp_timing",
+                        _authority_ramp_timing_summary(
+                            timing_records,
+                            event="fault",
+                            elapsed_s=time.monotonic() - ramp_started,
+                            total_steps=steps,
+                        ),
+                    )
+                raise
         tracking_checks_after = time.monotonic() + TRACKING_GRACE_S
         _status(status_queue, "armed")
 
@@ -2364,6 +2463,7 @@ class SafeG1Dex3Actuator:
         simulation: bool,
         network_interface: str | None,
         command_conditioning: str = "none",
+        authority_ramp_diagnostics: bool = False,
     ):
         if command_conditioning not in COMMAND_CONDITIONING_MODES:
             raise DeploymentError(f"Unknown command conditioning mode {command_conditioning!r}")
@@ -2384,6 +2484,7 @@ class SafeG1Dex3Actuator:
                 self._heartbeat,
                 self._urgent_hold_event,
                 command_conditioning,
+                authority_ramp_diagnostics,
             ),
             name="groot-g1-dex3-actuator",
         )
@@ -2398,6 +2499,8 @@ class SafeG1Dex3Actuator:
         self._rtc_active = False
         self._rtc_terminal: tuple[str, Any] | None = None
         self._command_conditioning = command_conditioning
+        self._authority_ramp_diagnostics = authority_ramp_diagnostics
+        self._last_authority_ramp_timing: dict[str, Any] | None = None
         self._control_lock = threading.Lock()
         self._immediate_hold_requested = threading.Event()
         self._immediate_release_requested = threading.Event()
@@ -2425,6 +2528,10 @@ class SafeG1Dex3Actuator:
                 continue
             if kind == "fault":
                 raise DeploymentError(f"Actuator fault: {value}")
+            if kind == "authority_ramp_timing":
+                self._last_authority_ramp_timing = value
+                LOGGER.warning("ACTUATOR_TIMING %s", _format_authority_ramp_timing(value))
+                continue
             if kind == "release_failed":
                 raise DeploymentError(f"Actuator release failed: {value}")
             if kind == "stopped":
@@ -2448,6 +2555,16 @@ class SafeG1Dex3Actuator:
                 raise RtcTerminalEvent("complete", value)
             if kind == expected and (payload is None or value == payload):
                 return value
+        if expected == "armed" and self._authority_ramp_diagnostics:
+            heartbeat_age_ms = _heartbeat_age(self._heartbeat) * 1e3
+            LOGGER.error(
+                "ACTUATOR_TIMING event=parent_timeout expected=armed timeout_ms=%.3f "
+                "heartbeat_age_ms=%.3f child_alive=%s last=%s",
+                timeout_s * 1e3,
+                heartbeat_age_ms,
+                self._process.is_alive(),
+                _format_authority_ramp_timing(self._last_authority_ramp_timing or {}),
+            )
         raise TimeoutError(f"Timed out waiting for actuator status '{expected}'")
 
     def start(self) -> None:
@@ -2457,12 +2574,19 @@ class SafeG1Dex3Actuator:
         self._wait_status("ready", timeout_s=8.0)
         self._started = True
 
-    def arm(self) -> None:
+    def arm(self, timeout_s: float | None = None) -> None:
         if not self._started or self._armed:
             raise DeploymentError("Actuator must be started exactly once before arming")
         self.heartbeat()
         self._command_queue.put(("arm",), timeout=0.2)
-        self._wait_status("armed", timeout_s=ARM_AUTHORITY_RAMP_S + 3.0)
+        if timeout_s is None:
+            timeout_s = ARM_AUTHORITY_RAMP_S + 3.0
+        try:
+            self._wait_status("armed", timeout_s=timeout_s)
+        except TimeoutError:
+            # Do not wait for an outer finally block to tell the child to stop.
+            self._stop_event.set()
+            raise
         self._armed = True
 
     def initialize(self, spec: InitializationSpec) -> None:
@@ -2910,6 +3034,9 @@ class SafeG1Dex3Actuator:
             if kind == "stopped":
                 stopped_acknowledged = True
                 break
+            elif kind == "authority_ramp_timing":
+                self._last_authority_ramp_timing = value
+                LOGGER.warning("ACTUATOR_TIMING %s", _format_authority_ramp_timing(value))
             elif kind == "release_failed":
                 issues.append(f"release failed: {value}")
             elif kind == "fault":
