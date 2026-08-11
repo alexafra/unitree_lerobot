@@ -449,7 +449,7 @@ def chunk_delta_summary(chunk: ActionChunk, state_reader: G1Dex3StateReader) -> 
             np.max(np.abs(chunk.right_hand[0] - state.right_hand)),
         )
     )
-    return f"first-step delta arm={arm_delta:.4f} rad, hand={hand_delta:.4f} rad"
+    return f"first-target pose gap arm={arm_delta:.4f} rad, hand={hand_delta:.4f} rad"
 
 
 def _prepare_policy_goal(
@@ -653,9 +653,12 @@ def run(args: argparse.Namespace) -> None:
             camera_timeout_s=3.0,
             show_camera=getattr(args, "show_camera", False),
             allow_custom_instruction=allow_custom_instruction,
-            validate_initial_step=not (
-                args.actuate and (initialization.moves or getattr(args, "policy_warm_start", False))
-            ),
+            # Shadow never executes or warm-starts this result, so its passive
+            # measured pose is not a meaningful execution reference.  Skip
+            # only measured-q -> action[0]; parsing still enforces every
+            # shape/finite/range check and every action[t-1] -> action[t] step.
+            validate_initial_step=args.actuate
+            and not (initialization.moves or getattr(args, "policy_warm_start", False)),
         )
         LOGGER.info(
             "Publisher-free preflight passed in %.3fs: %s",
@@ -682,6 +685,11 @@ def run(args: argparse.Namespace) -> None:
                     args.execution_horizon,
                     show_camera=getattr(args, "show_camera", False),
                     allow_custom_instruction=allow_custom_instruction,
+                    # No shadow action is executed, so each request remains
+                    # anchored to the unchanged passive robot pose.  Report
+                    # that pose gap below, but do not treat it as a commanded
+                    # 30 Hz transition.
+                    validate_initial_step=False,
                 )
                 LOGGER.info(
                     "Shadow chunk %d/%d: inference %.3fs, %s",

@@ -81,9 +81,7 @@ class JsonDataset:
         self.json_file = "data.json"
 
         if depth_far_m <= depth_near_m:
-            raise ValueError(
-                f"depth_far_m ({depth_far_m}) must be greater than depth_near_m ({depth_near_m})"
-            )
+            raise ValueError(f"depth_far_m ({depth_far_m}) must be greater than depth_near_m ({depth_near_m})")
 
         self.include_depth = include_depth
         self.depth_near_m = depth_near_m
@@ -103,9 +101,7 @@ class JsonDataset:
             raise NotADirectoryError(f"Raw dataset directory does not exist: {self.data_dirs}")
 
         direct_episode_paths = sorted(
-            path
-            for path in self.data_dirs.iterdir()
-            if path.is_dir() and (path / self.json_file).is_file()
+            path for path in self.data_dirs.iterdir() if path.is_dir() and (path / self.json_file).is_file()
         )
 
         if direct_episode_paths:
@@ -116,9 +112,7 @@ class JsonDataset:
             self.episode_paths = []
             for task_path in sorted(path for path in self.data_dirs.iterdir() if path.is_dir()):
                 episode_paths = sorted(
-                    path
-                    for path in task_path.iterdir()
-                    if path.is_dir() and (path / self.json_file).is_file()
+                    path for path in task_path.iterdir() if path.is_dir() and (path / self.json_file).is_file()
                 )
                 if episode_paths:
                     self.task_paths.append(task_path)
@@ -229,10 +223,7 @@ class JsonDataset:
 
         if stored_scale is None:
             depth_scale = DEFAULT_DEPTH_SCALE_M_PER_UNIT
-            print(
-                f"Warning: depth scale missing for {episode_path}; "
-                f"assuming {depth_scale} m/unit"
-            )
+            print(f"Warning: depth scale missing for {episode_path}; assuming {depth_scale} m/unit")
         else:
             depth_scale = float(stored_scale)
 
@@ -265,8 +256,7 @@ class JsonDataset:
 
             if depth_u16.dtype != np.uint16 or depth_u16.ndim != 2:
                 raise ValueError(
-                    f"Expected HxW uint16 depth at {depth_path}; "
-                    f"got shape={depth_u16.shape}, dtype={depth_u16.dtype}"
+                    f"Expected HxW uint16 depth at {depth_path}; got shape={depth_u16.shape}, dtype={depth_u16.dtype}"
                 )
 
             depth_rgb = encode_depth_gray_rgb(
@@ -301,6 +291,11 @@ class JsonDataset:
 
         # Load task description
         task = episode_data.get("text", {}).get("goal", "")
+        if not isinstance(task, str):
+            raise TypeError(f"Episode {file_path} text.goal must be a string")
+        task = task.strip()
+        if not task:
+            raise ValueError(f"Episode {file_path} has an empty text.goal after trimming whitespace")
 
         # Load camera images
         cameras = self._parse_images(file_path, episode_data)
@@ -320,8 +315,7 @@ class JsonDataset:
             for frame_index, frame in enumerate(frames):
                 if frame.dtype != np.uint8:
                     raise ValueError(
-                        f"Expected uint8 image for {camera_key} frame {frame_index} in "
-                        f"{file_path}; got {frame.dtype}"
+                        f"Expected uint8 image for {camera_key} frame {frame_index} in {file_path}; got {frame.dtype}"
                     )
                 if frame.shape != reference_shape:
                     raise ValueError(

@@ -846,7 +846,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertNotIn("actuator.submit:pick-warm-start:1", events)
         self.assertNotIn("actuator.submit:put-warm-start:2", events)
 
-    def test_preflight_keeps_initial_step_validation_for_shadow_and_measured_live_runs(self):
+    def test_shadow_skips_initial_step_validation_for_every_chunk_but_measured_live_keeps_it(self):
         class StopAfterPreflight(Exception):
             pass
 
@@ -856,9 +856,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
             video_keys=COLOUR_VIDEO_KEYS,
             requires_depth=False,
         )
-        for name, actuate, initialization in (
-            ("shadow measured hold", False, "measured"),
-            ("live measured hold", True, "measured"),
+        for name, actuate, initialization, max_chunks, expected_checks in (
+            ("shadow measured hold", False, "measured", 3, [False, False, False]),
+            ("live measured hold", True, "measured", 1, [True]),
         ):
             with self.subTest(name=name):
                 checks = []
@@ -893,7 +893,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                     image_host="camera",
                     network_interface=None,
                     execution_horizon=1,
-                    max_chunks=1,
+                    max_chunks=max_chunks,
                     initialization=initialization,
                     initial_pose_file=None,
                     sim=True,
@@ -912,6 +912,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                     mock.patch(f"{module}.infer_chunk", side_effect=record_preflight),
                     mock.patch(f"{module}.chunk_delta_summary", return_value="safe"),
                     mock.patch(f"{module}.confirm_actuation", side_effect=confirmation),
+                    mock.patch(f"{module}.time.sleep"),
                 ):
                     if actuate:
                         with self.assertRaises(StopAfterPreflight):
@@ -919,7 +920,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                     else:
                         run_groot(args)
 
-                self.assertEqual(checks, [True])
+                self.assertEqual(checks, expected_checks)
 
     def test_armed_confirmation_keeps_watchdog_alive_and_accepts_only_exact_input(self):
         actuator = SimpleNamespace(

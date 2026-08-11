@@ -18,8 +18,8 @@ from unitree_lerobot.utils.depth_encoding import (
 
 
 TASKS = {
-    "pick-toothpaste": "pick up the cylinder toothepaste.",
-    "put-toothpaste": "put down the cylinder toothepaste.",
+    "pick-toothpaste": "pick up the cylinder toothpaste.",
+    "put-toothpaste": "put down the cylinder toothpaste.",
     "pick-red-cup": "pick up the red cup.",
     "put-red-cup": "put down the red cup.",
 }
@@ -948,10 +948,10 @@ def parse_action_chunk(
     if validate_initial_step:
         validation_state = (current_arm, current_left, current_right)
     else:
-        # Publisher-free preflight output is always discarded.  Still enforce
-        # every shape, finite/range check and every within-prefix rate step,
-        # but do not require its first target to be close to a pose that an
-        # explicit initialization will replace before execution.
+        # This result is either an unexecuted shadow prediction or a discarded
+        # preflight/warm-start prediction.  Still enforce every shape,
+        # finite/range check and every within-prefix rate step, but do not
+        # interpret measured-q -> action[0] as a commanded transition.
         validation_state = (result.arm[0], result.left_hand[0], result.right_hand[0])
     validate_action_chunk(result, *validation_state)
     return result

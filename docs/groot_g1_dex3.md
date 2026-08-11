@@ -90,8 +90,8 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
 Omit `--task` for a menu. The allowlisted IDs preserve the exact training strings:
 
 ```text
-pick-toothpaste  -> pick up the cylinder toothepaste.
-put-toothpaste   -> put down the cylinder toothepaste.
+pick-toothpaste  -> pick up the cylinder toothpaste.
+put-toothpaste   -> put down the cylinder toothpaste.
 pick-red-cup     -> pick up the red cup.
 put-red-cup      -> put down the red cup.
 ```
