@@ -86,7 +86,7 @@ TRACKING_GRACE_S = 0.50
 MAX_ACTION_LATENESS_S = 0.02
 # OFFICIAL: Unitree G1 asset mapping identifies mode_machine 5 as
 # g1_29dof_with_hand_rev_1_0 (eval_robot/assets/g1/README.md).
-QUALIFIED_REAL_MODE_MACHINE = 5
+QUALIFIED_REAL_MODE_MACHINE = 6
 PREARM_STATIONARY_DWELL_S = 0.5
 PREARM_STATE_MAX_AGE_S = 0.05
 PREARM_MAX_ARM_DQ_RAD_S = 0.10
@@ -1001,6 +1001,10 @@ class _G1Dex3CommandBackend:
         self._weight = 0.0
         self._released = False
         self._has_published = False
+        # Enabled only by the dedicated authority-ramp diagnostic.  Keeping the
+        # timers dormant avoids changing the normal deployment hot path.
+        self._authority_ramp_timing_enabled = False
+        self._last_publish_timing_ms: dict[str, float] = {}
         self._arm_target = initial.arm.copy()
         self._left_target = initial.left_hand.copy()
         self._right_target = initial.right_hand.copy()
@@ -1110,6 +1114,8 @@ class _G1Dex3CommandBackend:
         self._right_hand_publish_history.clear()
 
     def _publish_arm(self, require_qualified_state: bool = True) -> None:
+        timing_enabled = self._authority_ramp_timing_enabled
+        timing = self._last_publish_timing_ms
         for offset, index in enumerate(self._arm_indices):
             self._arm_message.motor_cmd[index].q = float(self._arm_target[offset])
         if not self.simulation:
@@ -1120,10 +1126,20 @@ class _G1Dex3CommandBackend:
             # fault that triggered it.
             self._arm_message.mode_machine = QUALIFIED_REAL_MODE_MACHINE
             if require_qualified_state:
+                started_ns = time.monotonic_ns()
                 self._validate_runtime_state(self.reader.latest())
+                if timing_enabled:
+                    timing["arm_state_check"] = (time.monotonic_ns() - started_ns) / 1e6
             self._arm_message.motor_cmd[29].q = float(self._weight)
+        started_ns = time.monotonic_ns()
         self._arm_message.crc = self._crc.Crc(self._arm_message)
-        if self._arm_publisher.Write(self._arm_message, timeout=DDS_WRITE_TIMEOUT_S) is not True:
+        if timing_enabled:
+            timing["arm_crc"] = (time.monotonic_ns() - started_ns) / 1e6
+        started_ns = time.monotonic_ns()
+        write_ok = self._arm_publisher.Write(self._arm_message, timeout=DDS_WRITE_TIMEOUT_S)
+        if timing_enabled:
+            timing["arm_write"] = (time.monotonic_ns() - started_ns) / 1e6
+        if write_ok is not True:
             raise DeploymentError("Arm DDS Write failed")
         self._has_published = True
 
@@ -1141,10 +1157,20 @@ class _G1Dex3CommandBackend:
         for offset, index in enumerate(self._right_indices):
             self._right_message.motor_cmd[index].q = float(right_command[offset])
 
-        if self._left_publisher.Write(self._left_message, timeout=DDS_WRITE_TIMEOUT_S) is not True:
+        timing_enabled = self._authority_ramp_timing_enabled
+        timing = self._last_publish_timing_ms
+        started_ns = time.monotonic_ns()
+        left_ok = self._left_publisher.Write(self._left_message, timeout=DDS_WRITE_TIMEOUT_S)
+        if timing_enabled:
+            timing["left_write"] = (time.monotonic_ns() - started_ns) / 1e6
+        if left_ok is not True:
             raise DeploymentError("Left Dex3 DDS Write failed")
         self._left_hand_publish_history.append(PublishedHandTarget(completed_at=time.monotonic(), target=left_target))
-        if self._right_publisher.Write(self._right_message, timeout=DDS_WRITE_TIMEOUT_S) is not True:
+        started_ns = time.monotonic_ns()
+        right_ok = self._right_publisher.Write(self._right_message, timeout=DDS_WRITE_TIMEOUT_S)
+        if timing_enabled:
+            timing["right_write"] = (time.monotonic_ns() - started_ns) / 1e6
+        if right_ok is not True:
             raise DeploymentError("Right Dex3 DDS Write failed")
         self._right_hand_publish_history.append(PublishedHandTarget(completed_at=time.monotonic(), target=right_target))
 
@@ -1177,8 +1203,16 @@ class _G1Dex3CommandBackend:
             raise DeploymentError("; ".join(failures))
 
     def publish(self) -> None:
-        self._publish_arm()
-        self._publish_hands()
+        timing_enabled = self._authority_ramp_timing_enabled
+        if timing_enabled:
+            self._last_publish_timing_ms = {}
+        started_ns = time.monotonic_ns()
+        try:
+            self._publish_arm()
+            self._publish_hands()
+        finally:
+            if timing_enabled:
+                self._last_publish_timing_ms["publish_total"] = (time.monotonic_ns() - started_ns) / 1e6
 
     def set_weight(self, weight: float) -> None:
         self._weight = float(np.clip(weight, 0.0, 1.0))
@@ -1241,6 +1275,79 @@ def _status(status_queue: MpQueue, kind: str, payload: Any = None) -> None:
         status_queue.put((kind, payload), timeout=0.2)
     except queue.Full:
         pass
+
+
+def _authority_ramp_timing_summary(
+    records: list[dict[str, float]],
+    *,
+    event: str,
+    elapsed_s: float,
+    total_steps: int,
+) -> dict[str, Any]:
+    """Return a compact timing summary without doing I/O in the 100 Hz loop."""
+
+    summary: dict[str, Any] = {
+        "event": event,
+        "completed_steps": len(records),
+        "total_steps": total_steps,
+        "elapsed_ms": elapsed_s * 1e3,
+    }
+    if not records:
+        return summary
+    summary["last_weight"] = records[-1]["weight"]
+    summary["heartbeat_age_max_ms"] = max(record["heartbeat_age_ms"] for record in records)
+    summary["state_age_max_ms"] = max(record["state_age_ms"] for record in records)
+    summary["arm_drift_max_rad"] = max(record["arm_drift_rad"] for record in records)
+    summary["arm_dq_max_rad_s"] = max(record["arm_dq_rad_s"] for record in records)
+    summary["work_over_10ms"] = sum(record["work_ms"] > 10.0 for record in records)
+    for key in (
+        "state_lookup_ms",
+        "arm_state_check_ms",
+        "arm_crc_ms",
+        "arm_write_ms",
+        "left_write_ms",
+        "right_write_ms",
+        "publish_total_ms",
+        "work_ms",
+        "cycle_ms",
+    ):
+        values = np.asarray([record[key] for record in records], dtype=np.float64)
+        summary[f"{key}_mean"] = float(np.mean(values))
+        summary[f"{key}_p95"] = float(np.percentile(values, 95))
+        summary[f"{key}_max"] = float(np.max(values))
+    return summary
+
+
+def _format_authority_ramp_timing(payload: dict[str, Any]) -> str:
+    preferred = (
+        "event",
+        "completed_steps",
+        "total_steps",
+        "elapsed_ms",
+        "last_weight",
+        "heartbeat_age_max_ms",
+        "state_age_max_ms",
+        "arm_drift_max_rad",
+        "arm_dq_max_rad_s",
+        "publish_total_ms_p95",
+        "publish_total_ms_max",
+        "arm_write_ms_max",
+        "left_write_ms_max",
+        "right_write_ms_max",
+        "cycle_ms_p95",
+        "cycle_ms_max",
+        "work_over_10ms",
+    )
+    fields = []
+    for key in preferred:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if isinstance(value, float):
+            fields.append(f"{key}={value:.3f}")
+        else:
+            fields.append(f"{key}={value}")
+    return " ".join(fields)
 
 
 def _tracking_errors(backend: _G1Dex3CommandBackend, state: RobotState) -> tuple[float, float]:

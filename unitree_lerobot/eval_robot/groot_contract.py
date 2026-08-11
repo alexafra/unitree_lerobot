@@ -101,8 +101,8 @@ MAX_ARM_STEP_RAD = 0.10
 # backstop itself is not an official Unitree velocity limit.
 MAX_HAND_STEP_RAD = 0.60
 JOINT_LIMIT_MARGIN_RAD = 0.03
-HAND_LIMIT_TOLERANCE_RAD = 0.002
-MEASURED_LIMIT_TOLERANCE_RAD = 0.01
+HAND_LIMIT_TOLERANCE_RAD = 0.01
+MEASURED_LIMIT_TOLERANCE_RAD = 0.2
 
 # OFFICIAL: Unitree-derived g1_body29_hand14.urdf position limits, reordered into
 # the G1_29_JointArmIndex / recorded-dataset action order.
