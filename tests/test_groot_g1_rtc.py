@@ -15,6 +15,7 @@ from unitree_lerobot.eval_robot.eval_groot_g1 import (
     _RtcRequest,
     _RtcResponse,
     _run_active_goal_rtc,
+    _run_active_goal_rtc_controlled,
     _rtc_options,
     _rtc_previous_action,
     build_parser,
@@ -140,12 +141,33 @@ class _LaggingRecordingBackend(_RecordingBackend):
     follow_commanded_target = False
 
 
+class _GatedRecordingBackend(_RecordingBackend):
+    """Pause one publisher iteration so queue/event ordering is deterministic."""
+
+    instance: _GatedRecordingBackend | None = None
+
+    def __init__(self, simulation: bool, network_interface: str | None):
+        super().__init__(simulation, network_interface)
+        type(self).instance = self
+        self.pause_next_publish = threading.Event()
+        self.publish_paused = threading.Event()
+        self.continue_publish = threading.Event()
+
+    def publish(self) -> None:
+        super().publish()
+        if self.pause_next_publish.is_set():
+            self.pause_next_publish.clear()
+            self.publish_paused.set()
+            self.continue_publish.wait(timeout=1.0)
+
+
 class _ChildHarness:
     def __init__(self, backend_type: type[_RecordingBackend] = _RecordingBackend):
         self.backend_type = backend_type
         self.commands: queue.Queue = queue.Queue(maxsize=1)
         self.statuses: queue.Queue = queue.Queue(maxsize=32)
         self.stop = threading.Event()
+        self.urgent_hold = threading.Event()
         self.heartbeat = _LiveHeartbeat()
         self.thread: threading.Thread | None = None
         self._stack = ExitStack()
@@ -165,7 +187,15 @@ class _ChildHarness:
         self._stack.enter_context(mock.patch(f"{_SAFE_MODULE}.MAX_ACTION_LATENESS_S", 0.10))
         self.thread = threading.Thread(
             target=_actuator_main,
-            args=(True, None, self.commands, self.statuses, self.stop, self.heartbeat),
+            args=(
+                True,
+                None,
+                self.commands,
+                self.statuses,
+                self.stop,
+                self.heartbeat,
+                self.urgent_hold,
+            ),
             daemon=True,
         )
         self.thread.start()
@@ -229,7 +259,74 @@ def _rtc_start_command(sequence: int, plan: ActionChunk, action_budget: int) -> 
     )
 
 
+def _parent_handle_for_child(child: _ChildHarness) -> SafeG1Dex3Actuator:
+    class _ThreadProcess:
+        def is_alive(self) -> bool:
+            return child.thread is not None and child.thread.is_alive()
+
+    actuator = object.__new__(SafeG1Dex3Actuator)
+    actuator._command_queue = child.commands
+    actuator._status_queue = child.statuses
+    actuator._stop_event = child.stop
+    actuator._urgent_hold_event = child.urgent_hold
+    actuator._heartbeat = child.heartbeat
+    actuator._process = _ThreadProcess()
+    actuator._sequence = 0
+    actuator._started = True
+    actuator._armed = True
+    actuator._initialized = True
+    actuator._warm_started = True
+    actuator._holding = False
+    actuator._chunk_in_flight = False
+    actuator._pending_sequence = None
+    actuator._rtc_active = False
+    actuator._rtc_terminal = None
+    actuator._control_lock = threading.Lock()
+    actuator._immediate_hold_requested = threading.Event()
+    actuator._immediate_release_requested = threading.Event()
+    actuator._stopped_acknowledged = False
+    actuator._closed = False
+    return actuator
+
+
 class GrootG1RtcTests(unittest.TestCase):
+    def test_initial_rtc_inference_result_is_discarded_after_immediate_operator_key(self):
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        args = SimpleNamespace(
+            execution_horizon=8,
+            max_chunks=20,
+            policy_host="127.0.0.1",
+            policy_port=5555,
+            show_camera=False,
+            rtc_frozen_steps=None,
+            rtc_ramp_rate=None,
+        )
+        for command, expected in (("hold", "hold"), ("release", "release")):
+            with self.subTest(command=command):
+                actuator = mock.Mock()
+                actuator.immediate_control_requested.return_value = command
+                terminal = SimpleNamespace(poll_control=mock.Mock(return_value=command))
+                with mock.patch(f"{module}.infer_plan", return_value=(_plan(32), 0.1)):
+                    outcome = _run_active_goal_rtc_controlled(
+                        mock.Mock(),
+                        mock.Mock(),
+                        mock.Mock(),
+                        actuator,
+                        "pick-red-cup",
+                        "pick up the red cup.",
+                        SimpleNamespace(action_horizon=32),
+                        args,
+                        terminal,
+                        allow_custom_instruction=False,
+                    )
+
+                self.assertEqual(outcome, expected)
+                actuator.start_rtc.assert_not_called()
+                if command == "hold":
+                    actuator.finish_immediate_hold.assert_called_once_with()
+                else:
+                    actuator.finish_immediate_hold.assert_not_called()
+
     def test_inference_worker_owns_its_client_and_surfaces_timeout(self):
         main_thread = threading.get_ident()
         thread_ids: list[int] = []
@@ -301,7 +398,7 @@ class GrootG1RtcTests(unittest.TestCase):
         contract = SimpleNamespace(action_horizon=32)
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
 
-        for terminal_input, expected_outcome in (("h", "hold"), ("q", "release")):
+        for terminal_input, expected_outcome in (("s", "hold"), ("q", "release")):
             with self.subTest(terminal_input=terminal_input):
                 actuator = mock.Mock()
                 actuator.start_rtc.return_value = 1
@@ -310,7 +407,10 @@ class GrootG1RtcTests(unittest.TestCase):
                 with (
                     mock.patch(f"{module}.infer_plan", return_value=(plan, 0.1)),
                     mock.patch(f"{module}._RtcInferenceWorker", _IdleWorker),
-                    mock.patch(f"{module}._poll_active_command", return_value=terminal_input),
+                    mock.patch(
+                        f"{module}._poll_active_command",
+                        side_effect=(None, terminal_input),
+                    ),
                 ):
                     outcome = _run_active_goal_rtc(
                         mock.Mock(),
@@ -496,6 +596,175 @@ class GrootG1RtcTests(unittest.TestCase):
             self.assertTrue(child.thread.is_alive())
             self.assertFalse(child.backend.released)
 
+    def test_urgent_stop_preempts_synchronous_chunk_before_its_next_action(self):
+        with _ChildHarness() as child:
+            plan = _plan(16)
+            child.commands.put(
+                (
+                    "chunk",
+                    1,
+                    time.monotonic(),
+                    plan.arm,
+                    plan.left_hand,
+                    plan.right_hand,
+                ),
+                timeout=0.2,
+            )
+            child.wait_for_target_count(2)
+            requested_at = time.monotonic()
+            child.urgent_hold.set()
+
+            self.assertEqual(child.assert_status("holding"), 1)
+            self.assertLess(time.monotonic() - requested_at, 0.2)
+            targets = child.backend.target_snapshot()
+            self.assertLess(len(targets), plan.length + 1)
+            np.testing.assert_array_equal(targets[-1][0], targets[-2][0])
+            self.assertTrue(child.thread.is_alive())
+            self.assertFalse(child.backend.released)
+
+            child.commands.put(("urgent_hold_barrier",), timeout=0.2)
+            self.assertEqual(child.assert_status("urgent_holding"), 1)
+            self.assertFalse(child.urgent_hold.is_set())
+
+            # STOP keeps authority and permits a later plan generation.
+            next_plan = _plan(1)
+            child.commands.put(
+                (
+                    "chunk",
+                    2,
+                    time.monotonic(),
+                    next_plan.arm,
+                    next_plan.left_hand,
+                    next_plan.right_hand,
+                ),
+                timeout=0.2,
+            )
+            self.assertEqual(child.assert_status("completed"), 2)
+
+    def test_urgent_stop_latch_keeps_publishing_without_advancing_policy_targets(self):
+        with _ChildHarness() as child:
+            plan = _plan(16)
+            child.commands.put(
+                (
+                    "chunk",
+                    1,
+                    time.monotonic(),
+                    plan.arm,
+                    plan.left_hand,
+                    plan.right_hand,
+                ),
+                timeout=0.2,
+            )
+            child.wait_for_target_count(2)
+            child.urgent_hold.set()
+            self.assertEqual(child.assert_status("holding"), 1)
+
+            held_targets = child.backend.target_snapshot()
+            held_publish_count = child.backend.publishes
+            deadline = time.monotonic() + 0.3
+            while child.backend.publishes < held_publish_count + 5 and time.monotonic() < deadline:
+                time.sleep(0.002)
+
+            self.assertGreaterEqual(child.backend.publishes, held_publish_count + 5)
+            self.assertEqual(len(child.backend.target_snapshot()), len(held_targets))
+            np.testing.assert_array_equal(child.backend.target_snapshot()[-1][0], held_targets[-1][0])
+            self.assertTrue(child.urgent_hold.is_set())
+            self.assertTrue(child.thread.is_alive())
+            self.assertFalse(child.backend.released)
+
+            child.commands.put(("urgent_hold_barrier",), timeout=0.2)
+            self.assertEqual(child.assert_status("urgent_holding"), 1)
+            self.assertFalse(child.urgent_hold.is_set())
+
+    def test_urgent_stop_wins_when_sync_chunk_is_already_queued_but_unconsumed(self):
+        with _ChildHarness(_GatedRecordingBackend) as child:
+            backend = child.backend
+            backend.pause_next_publish.set()
+            self.assertTrue(backend.publish_paused.wait(timeout=0.5))
+            actuator = _parent_handle_for_child(child)
+            plan = _plan(8)
+            plan.arm[:, 0] += 0.02
+
+            try:
+                sequence = actuator.submit(plan)
+                actuator.request_immediate_hold()
+            finally:
+                backend.continue_publish.set()
+
+            actuator.finish_immediate_hold()
+            self.assertEqual(sequence, 1)
+            self.assertTrue(actuator._holding)
+            self.assertFalse(actuator._chunk_in_flight)
+            self.assertIsNone(actuator._pending_sequence)
+            targets = backend.target_snapshot()
+            self.assertGreaterEqual(len(targets), 1)
+            for arm_target, _, _ in targets:
+                np.testing.assert_array_equal(arm_target, np.zeros(14))
+            self.assertTrue(child.thread.is_alive())
+
+    def test_urgent_stop_wins_when_rtc_start_is_already_queued_but_unconsumed(self):
+        with _ChildHarness(_GatedRecordingBackend) as child:
+            backend = child.backend
+            backend.pause_next_publish.set()
+            self.assertTrue(backend.publish_paused.wait(timeout=0.5))
+            actuator = _parent_handle_for_child(child)
+            plan = _plan(8)
+            plan.arm[:, 0] += 0.02
+            result: list[int] = []
+            errors: list[BaseException] = []
+
+            def start_rtc() -> None:
+                try:
+                    result.append(actuator.start_rtc(plan, action_budget=20))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            starter = threading.Thread(target=start_rtc, daemon=True)
+            starter.start()
+            deadline = time.monotonic() + 0.5
+            while child.commands.empty() and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertFalse(child.commands.empty())
+            try:
+                actuator.request_immediate_hold()
+            finally:
+                backend.continue_publish.set()
+            starter.join(timeout=1.0)
+
+            self.assertFalse(starter.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(result, [1])
+            actuator.finish_immediate_hold()
+            self.assertTrue(actuator._holding)
+            self.assertFalse(actuator._rtc_active)
+            self.assertFalse(actuator._chunk_in_flight)
+            targets = backend.target_snapshot()
+            self.assertGreaterEqual(len(targets), 1)
+            for arm_target, _, _ in targets:
+                np.testing.assert_array_equal(arm_target, np.zeros(14))
+            self.assertTrue(child.thread.is_alive())
+
+    def test_urgent_stop_preempts_rtc_plan_and_keeps_powered_authority(self):
+        with _ChildHarness() as child:
+            plan = _plan(16)
+            child.commands.put(_rtc_start_command(1, plan, action_budget=100), timeout=0.2)
+            self.assertEqual(child.assert_status("rtc_started"), 1)
+            child.wait_for_target_count(2)
+            requested_at = time.monotonic()
+            child.urgent_hold.set()
+
+            self.assertEqual(child.assert_status("holding"), 1)
+            self.assertLess(time.monotonic() - requested_at, 0.2)
+            targets = child.backend.target_snapshot()
+            self.assertLess(len(targets), plan.length + 1)
+            np.testing.assert_array_equal(targets[-1][0], targets[-2][0])
+            self.assertTrue(child.thread.is_alive())
+            self.assertFalse(child.backend.released)
+
+            child.commands.put(("urgent_hold_barrier",), timeout=0.2)
+            self.assertEqual(child.assert_status("urgent_holding"), 1)
+            self.assertFalse(child.urgent_hold.is_set())
+
     def test_child_underrun_holds_and_accepts_the_next_generation(self):
         with _ChildHarness() as child:
             short_plan = _plan(2)
@@ -556,6 +825,10 @@ class GrootG1RtcTests(unittest.TestCase):
         actuator._sequence = 7
         actuator._rtc_active = True
         actuator._rtc_terminal = None
+        actuator._control_lock = threading.Lock()
+        actuator._immediate_hold_requested = threading.Event()
+        actuator._immediate_release_requested = threading.Event()
+        actuator._stopped_acknowledged = False
         actuator._command_queue = queue.Queue(maxsize=1)
         actuator._status_queue = queue.Queue(maxsize=32)
         actuator._status_queue.put(("rtc_underrun", {"sequence": 7}))

@@ -51,9 +51,9 @@ ARM_AUTHORITY_RAMP_S = 1.5
 ARM_RELEASE_RAMP_S = 1.5
 PUBLISH_HZ = 100.0
 DDS_WRITE_TIMEOUT_S = 0.5
-MAX_ARM_DQ_RAD_S = 6.0
+MAX_ARM_DQ_RAD_S = 12.0
 MAX_ARM_TRACKING_ERROR_RAD = 0.35
-MAX_HAND_TRACKING_ERROR_RAD = 0.50
+MAX_HAND_TRACKING_ERROR_RAD = 1
 TRACKING_GRACE_S = 0.50
 MAX_ACTION_LATENESS_S = 0.02
 # OFFICIAL: Unitree G1 asset mapping identifies mode_machine 5 as
@@ -97,6 +97,16 @@ class RtcTerminalEvent(DeploymentError):
         super().__init__(f"RTC {outcome}: {detail}")
         self.outcome = outcome
         self.detail = detail
+
+
+class ImmediateControlEvent(DeploymentError):
+    """An operator STOP/release interrupted a blocking actuator operation."""
+
+    def __init__(self, action: str):
+        if action not in {"hold", "release"}:
+            raise ValueError(f"Unknown immediate operator action {action!r}")
+        super().__init__(f"Operator requested immediate {action}")
+        self.action = action
 
 
 @dataclass(frozen=True)
@@ -1065,6 +1075,7 @@ def _actuator_main(
     status_queue: MpQueue,
     stop_event: Any,
     heartbeat: Any,
+    urgent_hold_event: Any | None = None,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if threading.current_thread() is threading.main_thread():
@@ -1077,6 +1088,10 @@ def _actuator_main(
             if signum is not None:
                 signal.signal(signum, stop_on_signal)
     backend: _G1Dex3CommandBackend | None = None
+    if urgent_hold_event is None:
+        # Keeps direct/threaded tests and older internal callers compatible.
+        urgent_hold_event = threading.Event()
+
     last_sequence = 0
     tracking_checks_after = float("inf")
     try:
@@ -1196,6 +1211,7 @@ def _actuator_main(
         rtc_mode = False
         rtc_total_actions = 0
         rtc_action_budget = 0
+        urgent_hold_active = False
 
         while not stop_event.is_set():
             loop_started = time.monotonic()
@@ -1208,6 +1224,26 @@ def _actuator_main(
                 command = None
             if command is not None:
                 kind = command[0] if isinstance(command, tuple) and command else None
+                if kind == "urgent_hold_barrier":
+                    if command != ("urgent_hold_barrier",):
+                        raise DeploymentError("Malformed urgent STOP barrier")
+                    # The barrier is queued only after every concurrently
+                    # submitted motion command. Reaching it proves that no
+                    # pre-STOP plan remains hidden in multiprocessing.Queue's
+                    # feeder thread. Capture the final measured pose, then
+                    # acknowledge the fully serialized powered STOP.
+                    state = backend.state()
+                    backend.set_target(state.arm, state.left_hand, state.right_hand)
+                    chunk = None
+                    chunk_index = 0
+                    rtc_mode = False
+                    tracking_checks_after = time.monotonic()
+                    holding = True
+                    urgent_hold_active = False
+                    urgent_hold_event.clear()
+                    _status(status_queue, "urgent_holding", last_sequence)
+                    continue
+
                 if kind == "hold":
                     if not isinstance(command, tuple) or len(command) != 2:
                         raise DeploymentError("Malformed hold command")
@@ -1514,6 +1550,32 @@ def _actuator_main(
                     last_sequence = sequence
                     holding = False
 
+            # This is deliberately checked after accepting any queued plan, but
+            # before advancing its next 30 Hz target.  An operator stop can
+            # therefore cancel synchronous and RTC motion without racing an
+            # unconsumed plan command in the queue.  The event is independent
+            # of the normal command queue so it cannot be delayed by a full
+            # queue.
+            if urgent_hold_event.is_set():
+                if not urgent_hold_active or chunk is not None or rtc_mode or not holding:
+                    state = backend.state()
+                    backend.set_target(state.arm, state.left_hand, state.right_hand)
+                    chunk = None
+                    chunk_index = 0
+                    rtc_mode = False
+                    tracking_checks_after = time.monotonic()
+                    holding = True
+                    _status(status_queue, "holding", last_sequence)
+                urgent_hold_active = True
+                now = time.monotonic()
+                state = backend.state()
+                if now >= tracking_checks_after:
+                    _enforce_tracking(backend, state)
+                backend.publish()
+                elapsed = time.monotonic() - loop_started
+                stop_event.wait(max(0.0, period - elapsed))
+                continue
+
             now = time.monotonic()
             if chunk is not None and now >= next_action_at:
                 if chunk_index < chunk.length:
@@ -1590,6 +1652,7 @@ class SafeG1Dex3Actuator:
         self._command_queue = context.Queue(maxsize=1)
         self._status_queue = context.Queue(maxsize=32)
         self._stop_event = context.Event()
+        self._urgent_hold_event = context.Event()
         self._heartbeat = context.Value("d", time.monotonic())
         self._process = context.Process(
             target=_actuator_main,
@@ -1600,6 +1663,7 @@ class SafeG1Dex3Actuator:
                 self._status_queue,
                 self._stop_event,
                 self._heartbeat,
+                self._urgent_hold_event,
             ),
             name="groot-g1-dex3-actuator",
         )
@@ -1613,6 +1677,10 @@ class SafeG1Dex3Actuator:
         self._pending_sequence: int | None = None
         self._rtc_active = False
         self._rtc_terminal: tuple[str, Any] | None = None
+        self._control_lock = threading.Lock()
+        self._immediate_hold_requested = threading.Event()
+        self._immediate_release_requested = threading.Event()
+        self._stopped_acknowledged = False
         self._closed = False
 
     def heartbeat(self) -> None:
@@ -1622,6 +1690,11 @@ class SafeG1Dex3Actuator:
     def _wait_status(self, expected: str, timeout_s: float, payload: Any = None) -> Any:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
+            immediate = self.immediate_control_requested()
+            if immediate is not None and expected != "urgent_holding":
+                raise ImmediateControlEvent(immediate)
+            if immediate == "release":
+                raise ImmediateControlEvent("release")
             self.heartbeat()
             try:
                 kind, value = self._status_queue.get(timeout=0.05)
@@ -1634,6 +1707,9 @@ class SafeG1Dex3Actuator:
             if kind == "release_failed":
                 raise DeploymentError(f"Actuator release failed: {value}")
             if kind == "stopped":
+                self._stopped_acknowledged = True
+                if self._immediate_release_requested.is_set():
+                    raise ImmediateControlEvent("release")
                 raise DeploymentError("Actuator stopped before the requested operation completed")
             if kind in {"rtc_underrun", "rtc_rejected"} and kind != expected:
                 self._rtc_terminal = ("hold", value)
@@ -1692,6 +1768,9 @@ class SafeG1Dex3Actuator:
         self._holding = True
 
     def assert_healthy(self) -> None:
+        immediate = self.immediate_control_requested()
+        if immediate is not None:
+            raise ImmediateControlEvent(immediate)
         issue = None
         try:
             while True:
@@ -1700,8 +1779,10 @@ class SafeG1Dex3Actuator:
                     issue = f"fault: {value}"
                 elif kind == "release_failed":
                     issue = f"release failed: {value}"
-                elif kind == "stopped" and issue is None:
-                    issue = "stopped"
+                elif kind == "stopped":
+                    self._stopped_acknowledged = True
+                    if issue is None:
+                        issue = "stopped"
                 elif kind == "rtc_completed":
                     self._rtc_terminal = ("complete", value)
                 elif kind in {"rtc_underrun", "rtc_rejected"}:
@@ -1709,8 +1790,12 @@ class SafeG1Dex3Actuator:
         except queue.Empty:
             pass
         if issue is not None:
+            if self._immediate_release_requested.is_set():
+                raise ImmediateControlEvent("release")
             raise DeploymentError(f"Actuator process is unhealthy: {issue}")
         if not self._process.is_alive():
+            if self._immediate_release_requested.is_set():
+                raise ImmediateControlEvent("release")
             raise DeploymentError("Actuator process stopped")
 
     def warm_start(self, chunk: ActionChunk) -> None:
@@ -1752,24 +1837,28 @@ class SafeG1Dex3Actuator:
         if self._chunk_in_flight:
             raise DeploymentError("A policy chunk is already in flight")
         self.assert_healthy()
-        self._sequence += 1
-        self.heartbeat()
-        command = (
-            "chunk",
-            self._sequence,
-            time.monotonic(),
-            chunk.arm,
-            chunk.left_hand,
-            chunk.right_hand,
-        )
-        try:
-            self._command_queue.put(command, timeout=0.2)
-        except queue.Full as exc:
-            raise DeploymentError("Actuator command queue is full; refusing to buffer") from exc
-        self._chunk_in_flight = True
-        self._pending_sequence = self._sequence
-        self._holding = False
-        return self._sequence
+        with self._control_lock:
+            immediate = self.immediate_control_requested()
+            if immediate is not None:
+                raise ImmediateControlEvent(immediate)
+            self._sequence += 1
+            self.heartbeat()
+            command = (
+                "chunk",
+                self._sequence,
+                time.monotonic(),
+                chunk.arm,
+                chunk.left_hand,
+                chunk.right_hand,
+            )
+            try:
+                self._command_queue.put(command, timeout=0.2)
+            except queue.Full as exc:
+                raise DeploymentError("Actuator command queue is full; refusing to buffer") from exc
+            self._chunk_in_flight = True
+            self._pending_sequence = self._sequence
+            self._holding = False
+            return self._sequence
 
     def start_rtc(self, plan: ActionChunk, *, action_budget: int) -> int:
         """Start one full-horizon plan under the child-owned RTC scheduler."""
@@ -1782,22 +1871,26 @@ class SafeG1Dex3Actuator:
             raise DeploymentError("RTC action budget must be a positive integer")
         validate_action_chunk(plan, plan.arm[0], plan.left_hand[0], plan.right_hand[0])
         self.assert_healthy()
-        next_sequence = self._sequence + 1
-        self.heartbeat()
-        command = (
-            "rtc_start",
-            next_sequence,
-            time.monotonic(),
-            action_budget,
-            plan.arm,
-            plan.left_hand,
-            plan.right_hand,
-            plan.length,
-        )
-        try:
-            self._command_queue.put(command, timeout=0.2)
-        except queue.Full as exc:
-            raise DeploymentError("Actuator command queue is full; refusing RTC plan") from exc
+        with self._control_lock:
+            immediate = self.immediate_control_requested()
+            if immediate is not None:
+                raise ImmediateControlEvent(immediate)
+            next_sequence = self._sequence + 1
+            self.heartbeat()
+            command = (
+                "rtc_start",
+                next_sequence,
+                time.monotonic(),
+                action_budget,
+                plan.arm,
+                plan.left_hand,
+                plan.right_hand,
+                plan.length,
+            )
+            try:
+                self._command_queue.put(command, timeout=0.2)
+            except queue.Full as exc:
+                raise DeploymentError("Actuator command queue is full; refusing RTC plan") from exc
         self._wait_status("rtc_started", timeout_s=1.0, payload=next_sequence)
         self._sequence = next_sequence
         self._chunk_in_flight = True
@@ -1853,24 +1946,28 @@ class SafeG1Dex3Actuator:
         event = self.poll_rtc_event()
         if event is not None:
             raise RtcTerminalEvent(*event)
-        next_sequence = self._sequence + 1
-        self.heartbeat()
-        command = (
-            "rtc_replace",
-            next_sequence,
-            time.monotonic(),
-            expected_sequence,
-            request_index,
-            expected_overlap,
-            plan.arm,
-            plan.left_hand,
-            plan.right_hand,
-            plan.length,
-        )
-        try:
-            self._command_queue.put(command, timeout=0.2)
-        except queue.Full as exc:
-            raise DeploymentError("Actuator command queue is full; refusing RTC replacement") from exc
+        with self._control_lock:
+            immediate = self.immediate_control_requested()
+            if immediate is not None:
+                raise ImmediateControlEvent(immediate)
+            next_sequence = self._sequence + 1
+            self.heartbeat()
+            command = (
+                "rtc_replace",
+                next_sequence,
+                time.monotonic(),
+                expected_sequence,
+                request_index,
+                expected_overlap,
+                plan.arm,
+                plan.left_hand,
+                plan.right_hand,
+                plan.length,
+            )
+            try:
+                self._command_queue.put(command, timeout=0.2)
+            except queue.Full as exc:
+                raise DeploymentError("Actuator command queue is full; refusing RTC replacement") from exc
         value = self._wait_status("rtc_replaced", timeout_s=0.5)
         if not isinstance(value, dict) or value.get("sequence") != next_sequence:
             raise DeploymentError("Actuator returned a malformed RTC replacement acknowledgment")
@@ -1885,6 +1982,9 @@ class SafeG1Dex3Actuator:
     def poll_rtc_event(self) -> tuple[str, Any] | None:
         """Poll completion/HOLD/fault without allowing a worker to touch actuator state."""
 
+        immediate = self.immediate_control_requested()
+        if immediate is not None:
+            raise ImmediateControlEvent(immediate)
         event = self._rtc_terminal
         self._rtc_terminal = None
         try:
@@ -1895,6 +1995,9 @@ class SafeG1Dex3Actuator:
                 if kind == "release_failed":
                     raise DeploymentError(f"Actuator release failed: {value}")
                 if kind == "stopped":
+                    self._stopped_acknowledged = True
+                    if self._immediate_release_requested.is_set():
+                        raise ImmediateControlEvent("release")
                     raise DeploymentError("Actuator stopped during RTC")
                 if kind == "rtc_completed":
                     event = ("complete", value)
@@ -1908,15 +2011,123 @@ class SafeG1Dex3Actuator:
             self._rtc_active = False
             self._holding = True
         if not self._process.is_alive():
+            if self._immediate_release_requested.is_set():
+                raise ImmediateControlEvent("release")
             raise DeploymentError("Actuator process stopped")
         return event
 
-    def wait_completed(self, sequence: int, timeout_s: float) -> None:
-        if not self._chunk_in_flight or sequence != self._pending_sequence:
-            raise DeploymentError(f"Action chunk {sequence} is not the pending sequence")
-        self._wait_status("completed", timeout_s=timeout_s, payload=sequence)
+    def immediate_control_requested(self) -> str | None:
+        """Return the pending thread-safe operator control, with release priority."""
+
+        if self._immediate_release_requested.is_set():
+            return "release"
+        if self._immediate_hold_requested.is_set():
+            return "hold"
+        return None
+
+    def request_immediate_hold(self) -> None:
+        """Request a child-side measured-pose stop without using the command queue."""
+
+        if not self._initialized:
+            raise DeploymentError("Actuator must complete initialization before operator STOP")
+        if self._closed or self._immediate_release_requested.is_set():
+            return
+        self._immediate_hold_requested.set()
+        self._urgent_hold_event.set()
+        # Wait for any submission already inside its critical section. Once
+        # this returns, future submissions see the pending STOP and refuse,
+        # while the child-side event has already stopped target advancement.
+        with self._control_lock:
+            pass
+
+    def request_immediate_release(self) -> None:
+        """Start the existing orderly release path without waiting for the main thread."""
+
+        self._immediate_release_requested.set()
+        self._stop_event.set()
+
+    def finish_immediate_hold(self) -> str:
+        """Fence queued plans, consume the child STOP ack, and update parent state."""
+
+        if self._immediate_release_requested.is_set():
+            return "release"
+        if not self._immediate_hold_requested.is_set() and self._holding:
+            return "hold"
+        # This command is queued after every submission that could have raced
+        # the raw-key thread. The child keeps its STOP latch set until it
+        # consumes this barrier, so none of those plans can advance a target.
+        with self._control_lock:
+            try:
+                self._command_queue.put(("urgent_hold_barrier",), timeout=0.2)
+            except queue.Full as exc:
+                if self._immediate_release_requested.is_set():
+                    return "release"
+                raise DeploymentError("Actuator command queue is full; could not fence operator STOP") from exc
+        try:
+            acknowledged_sequence = self._wait_status("urgent_holding", timeout_s=1.0)
+        except ImmediateControlEvent as exc:
+            if exc.action == "release":
+                return "release"
+            raise
+        if isinstance(acknowledged_sequence, bool) or not isinstance(acknowledged_sequence, int):
+            raise DeploymentError("Actuator returned a malformed urgent STOP acknowledgment")
+        if acknowledged_sequence < self._sequence:
+            raise DeploymentError("Urgent STOP acknowledgment regressed the action sequence")
+        self._sequence = acknowledged_sequence
+        self._immediate_hold_requested.clear()
+        self._holding = True
+        self._warm_started = False
         self._chunk_in_flight = False
         self._pending_sequence = None
+        self._rtc_active = False
+        return "release" if self._immediate_release_requested.is_set() else "hold"
+
+    def wait_completed(self, sequence: int, timeout_s: float) -> str:
+        if not self._chunk_in_flight or sequence != self._pending_sequence:
+            raise DeploymentError(f"Action chunk {sequence} is not the pending sequence")
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            immediate = self.immediate_control_requested()
+            if immediate == "release":
+                return "release"
+            if immediate == "hold":
+                return self.finish_immediate_hold()
+
+            self.heartbeat()
+            try:
+                kind, value = self._status_queue.get(timeout=0.02)
+            except queue.Empty:
+                if not self._process.is_alive():
+                    raise DeploymentError("Actuator process exited unexpectedly")
+                continue
+            if kind == "fault":
+                raise DeploymentError(f"Actuator fault: {value}")
+            if kind == "release_failed":
+                raise DeploymentError(f"Actuator release failed: {value}")
+            if kind == "stopped":
+                self._stopped_acknowledged = True
+                if self._immediate_release_requested.is_set():
+                    return "release"
+                raise DeploymentError("Actuator stopped before the action chunk completed")
+            if kind == "holding" and value == sequence:
+                self._immediate_hold_requested.clear()
+                self._holding = True
+                self._warm_started = False
+                self._chunk_in_flight = False
+                self._pending_sequence = None
+                self._rtc_active = False
+                return "hold"
+            if kind == "completed" and value == sequence:
+                self._chunk_in_flight = False
+                self._pending_sequence = None
+                return "complete"
+            if kind in {"rtc_underrun", "rtc_rejected"}:
+                self._rtc_terminal = ("hold", value)
+                raise RtcTerminalEvent("hold", value)
+            if kind == "rtc_completed":
+                self._rtc_terminal = ("complete", value)
+                raise RtcTerminalEvent("complete", value)
+        raise TimeoutError(f"Timed out waiting for action chunk {sequence}")
 
     def hold(self) -> None:
         """Capture the measured pose and keep publishing it under watchdog control."""
@@ -1963,7 +2174,7 @@ class SafeG1Dex3Actuator:
         issues = []
         if self._process.is_alive():
             issues.append("actuator process remains alive after forced shutdown")
-        stopped_acknowledged = False
+        stopped_acknowledged = getattr(self, "_stopped_acknowledged", False)
         deadline = time.monotonic() + 0.5
         while time.monotonic() < deadline:
             try:

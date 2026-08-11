@@ -61,9 +61,10 @@ a deliberate reason to change the adapter:
 - Exact 28 joint names and ordering already recorded in `meta/info.json`.
 - Relative model representation for the two arms, decoded by GR00T to absolute positions.
 - Absolute model representation for both hands.
-- Predicted action horizon is checkpoint-specific: the current colour-only config uses
-  16 and the current gray-depth config uses 32; deployment `--execution-horizon`
-  remains capped at 8.
+- Predicted action horizon is checkpoint-specific. Both current 20k colour-only and
+  gray-depth runs use 32; older colour checkpoints may still expose 16. Deployment
+  `--execution-horizon` may use any positive prefix up to the checkpoint's advertised
+  action horizon.
 - Exact task strings in the runner allowlist.
 
 The runtime now has two deliberately separate modes. `synchronous` remains the baseline.
@@ -479,6 +480,7 @@ Then expand deliberately:
 - [ ] `execution-horizon=4`, `max-chunks=1`.
 - [ ] `execution-horizon=8`, `max-chunks=1`.
 - [ ] `execution-horizon=8`, `max-chunks=20`.
+- [ ] For a 32-action checkpoint, `execution-horizon=16`, `max-chunks=20`.
 
 Simulator pass criteria:
 

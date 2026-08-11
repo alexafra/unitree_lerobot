@@ -18,6 +18,7 @@ import queue
 import select
 import signal
 import sys
+import termios
 import threading
 import time
 
@@ -28,7 +29,6 @@ from unitree_lerobot.eval_robot.groot_client import DeploymentError, Gr00tClient
 from unitree_lerobot.eval_robot.groot_contract import (
     CONTROL_HZ,
     INITIALIZATION_MODES,
-    MAX_EXECUTION_HORIZON,
     TASKS,
     ActionChunk,
     InitializationSpec,
@@ -43,6 +43,7 @@ from unitree_lerobot.eval_robot.groot_contract import (
 )
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     G1Dex3StateReader,
+    ImmediateControlEvent,
     RtcTerminalEvent,
     SafeG1Dex3Actuator,
     TeleimagerCamera,
@@ -54,7 +55,7 @@ LOGGER = logging.getLogger("eval_groot_g1")
 LOCAL_POLICY_HOSTS = {"127.0.0.1", "localhost"}
 OPERATOR_CONFIRMATION_TIMEOUT_S = 60.0
 PREVIEW_WINDOWS = ("GR00T input: ego_view", "GR00T input: depth_gray_view")
-HOLD_COMMANDS = {"hold", "h"}
+STOP_COMMANDS = {"stop", "s"}
 EXIT_COMMANDS = {"quit", "q"}
 RTC_MIN_MODEL_HORIZON = 32
 RTC_DELAY_HISTORY = 8
@@ -62,6 +63,132 @@ RTC_DELAY_HISTORY = 8
 
 class OperatorRelease(Exception):
     """Internal control flow for an orderly operator-requested release."""
+
+
+class OperatorStop(Exception):
+    """Internal control flow for an immediate powered operator STOP."""
+
+
+class _OperatorTerminal:
+    """Capture active-motion ``s``/``q`` keys without requiring Enter.
+
+    Raw key capture is enabled only while a policy goal is actively executing.
+    Armed line prompts use their own explicit q/Shift-Q/Shift-S mapping.
+    The reader thread performs only thread-safe event signalling; it never
+    consumes actuator status acknowledgements.
+    """
+
+    def __init__(self, actuator: SafeG1Dex3Actuator):
+        self._actuator = actuator
+        self._commands: queue.Queue[str | BaseException] = queue.Queue()
+        self._stopping = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._fd: int | None = None
+        self._saved_attributes: list[object] | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._thread is not None
+
+    def __enter__(self) -> "_OperatorTerminal":
+        if not sys.stdin.isatty():
+            return self
+        try:
+            fd = sys.stdin.fileno()
+            saved = termios.tcgetattr(fd)
+            active = saved.copy()
+            active[6] = saved[6][:]
+            active[3] &= ~(termios.ICANON | termios.ECHO)
+            active[6][termios.VMIN] = 1
+            active[6][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSANOW, active)
+        except (AttributeError, OSError, TypeError, ValueError, termios.error) as exc:
+            raise DeploymentError("Immediate operator keys require an interactive POSIX terminal") from exc
+        self._fd = fd
+        self._saved_attributes = saved
+        self._thread = threading.Thread(
+            target=self._read_keys,
+            name="groot-operator-keys",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def _read_keys(self) -> None:
+        assert self._fd is not None
+        stop_sent = False
+        try:
+            while not self._stopping.is_set():
+                readable, _, _ = select.select([self._fd], [], [], 0.05)
+                if not readable:
+                    continue
+                value = os.read(self._fd, 1)
+                if value == b"":
+                    raise DeploymentError("stdin closed while command authority was active")
+                stop_sent = self._handle_key(value, stop_sent)
+                if value in {b"q", b"Q"}:
+                    return
+        except BaseException as exc:
+            # Input failure is fail-closed: begin release even if the main
+            # thread is blocked in camera or policy I/O.
+            try:
+                self._actuator.request_immediate_release()
+            finally:
+                self._commands.put(exc)
+
+    def _handle_key(self, value: bytes, stop_sent: bool) -> bool:
+        if value in {b"s", b"S"} and not stop_sent:
+            self._actuator.request_immediate_hold()
+            self._commands.put("hold")
+            return True
+        if value in {b"q", b"Q"}:
+            self._actuator.request_immediate_release()
+            self._commands.put("release")
+        return stop_sent
+
+    def poll_control(self) -> str | None:
+        result: str | None = None
+        while True:
+            try:
+                value = self._commands.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(value, BaseException):
+                if isinstance(value, DeploymentError):
+                    raise value
+                raise DeploymentError(f"Immediate operator-key reader failed: {value}") from value
+            if value == "release":
+                result = "release"
+            elif result is None:
+                result = "hold"
+        return result
+
+    def __exit__(self, *_: object) -> None:
+        self._stopping.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        # Close the tiny boundary between the active runner's final poll and
+        # terminal restoration. If s/q was already buffered, honor it before
+        # command authority can transition to the next state.
+        if self._fd is not None and (self._thread is None or not self._thread.is_alive()):
+            stop_sent = False
+            while True:
+                try:
+                    readable, _, _ = select.select([self._fd], [], [], 0.0)
+                except (OSError, ValueError):
+                    break
+                if not readable:
+                    break
+                value = os.read(self._fd, 1)
+                if value == b"":
+                    break
+                stop_sent = self._handle_key(value, stop_sent)
+        if self._fd is not None and self._saved_attributes is not None:
+            try:
+                termios.tcsetattr(self._fd, termios.TCSAFLUSH, self._saved_attributes)
+            except (OSError, ValueError, termios.error) as exc:
+                self._actuator.request_immediate_release()
+                raise DeploymentError("Could not restore the operator terminal; releasing authority") from exc
 
 
 @dataclass(frozen=True)
@@ -209,8 +336,8 @@ def resolve_runtime_goal(response: str) -> tuple[str, str]:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if not 1 <= args.execution_horizon <= MAX_EXECUTION_HORIZON:
-        raise DeploymentError(f"--execution-horizon must be between 1 and {MAX_EXECUTION_HORIZON}")
+    if args.execution_horizon < 1:
+        raise DeploymentError("--execution-horizon must be at least 1")
     if args.max_chunks < 1:
         raise DeploymentError("--max-chunks must be finite and at least 1")
     if args.actuate and not args.sim and not args.network_interface:
@@ -297,6 +424,8 @@ def _readline_while_armed(
 
     print(prompt, end="", flush=True)
     deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    if sys.stdin.isatty():
+        return _readline_with_immediate_prompt_controls(actuator, deadline)
     while True:
         actuator.heartbeat()
         actuator.assert_healthy()
@@ -316,6 +445,91 @@ def _readline_while_armed(
         if response == "":
             raise DeploymentError("stdin closed while command authority was active")
         return response.strip()
+
+
+def _readline_with_immediate_prompt_controls(
+    actuator: SafeG1Dex3Actuator,
+    deadline: float | None,
+) -> str:
+    """Read an armed line while keeping lowercase ``q`` as a global release key.
+
+    Shift-Q inserts a literal lowercase q into custom text. Lowercase s remains
+    ordinary prompt text, while Shift-S requests the powered STOP state. Both
+    common Backspace byte encodings remain available for editing.
+    """
+
+    try:
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        active = saved.copy()
+        active[6] = saved[6][:]
+        active[3] &= ~(termios.ICANON | termios.ECHO)
+        active[6][termios.VMIN] = 1
+        active[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, active)
+    except (AttributeError, OSError, TypeError, ValueError, termios.error) as exc:
+        print()
+        raise DeploymentError("Armed input requires an interactive POSIX terminal") from exc
+
+    entered = bytearray()
+    try:
+        while True:
+            actuator.heartbeat()
+            actuator.assert_healthy()
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0.0:
+                print()
+                raise DeploymentError(
+                    "Timed out waiting for armed operator input; releasing command authority"
+                )
+            wait_s = 0.1 if remaining is None else min(0.1, remaining)
+            try:
+                readable, _, _ = select.select([fd], [], [], wait_s)
+            except (OSError, TypeError, ValueError) as exc:
+                print()
+                raise DeploymentError("Could not poll the armed operator terminal") from exc
+            if not readable:
+                continue
+            value = os.read(fd, 1)
+            if value == b"":
+                raise DeploymentError("stdin closed while command authority was active")
+            if value == b"q":
+                actuator.request_immediate_release()
+                print()
+                return "q"
+            if value == b"Q":  # Shift-Q: escaped literal q
+                entered.extend(b"q")
+                print("q", end="", flush=True)
+                continue
+            if value == b"S":  # Shift-S: powered STOP command
+                try:
+                    actuator.request_immediate_hold()
+                except DeploymentError:
+                    # Before initialization the child is already publishing its
+                    # measured target, so STOP is an idempotent prompt response.
+                    pass
+                print()
+                return "stop"
+            if value in {b"\r", b"\n"}:
+                print()
+                try:
+                    return entered.decode("utf-8").strip()
+                except UnicodeDecodeError as exc:
+                    raise DeploymentError("Armed operator input is not valid UTF-8") from exc
+            if value in {b"\x08", b"\x7f"}:
+                if entered:
+                    entered.pop()
+                    print("\b \b", end="", flush=True)
+                continue
+            if value >= b" " and value != b"\x7f":
+                entered.extend(value)
+                print(value.decode("utf-8", errors="ignore"), end="", flush=True)
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSAFLUSH, saved)
+        except (OSError, ValueError, termios.error) as exc:
+            actuator.request_immediate_release()
+            raise DeploymentError("Could not restore the armed terminal; releasing authority") from exc
 
 
 def _confirm_while_armed(
@@ -342,14 +556,27 @@ def _confirm_while_armed(
         lowered = response.lower()
         if lowered in EXIT_COMMANDS:
             raise OperatorRelease
-        if lowered in HOLD_COMMANDS:
-            LOGGER.info("Command remains held; still waiting for exact %s", required)
+        if lowered in STOP_COMMANDS:
+            _finish_operator_stop(actuator)
+            LOGGER.info("Command remains stopped; still waiting for exact %s", required)
             continue
         raise DeploymentError(f"Expected {required}; releasing command authority")
 
 
-def _poll_active_command() -> str | None:
-    """Return one completed terminal line without delaying the policy loop."""
+def _poll_active_command(terminal: _OperatorTerminal | None = None) -> str | None:
+    """Return one active control without delaying the policy loop.
+
+    Live active execution supplies ``terminal`` and receives a single raw key.
+    The line-based fallback is retained for non-live callers and unit tests.
+    """
+
+    if terminal is not None:
+        control = terminal.poll_control()
+        if control == "hold":
+            return "s"
+        if control == "release":
+            return "q"
+        return None
 
     if not sys.stdin.isatty():
         return None
@@ -371,9 +598,10 @@ def _select_next_goal_while_holding(
     """Wait in powered hold until a new goal or an orderly release request."""
 
     print(
-        "\nHOLDING CURRENT MEASURED POSE. GR00T requests are stopped.\n"
+        "\nSTOPPED IN A POWERED POSITION HOLD. GR00T requests are stopped.\n"
         "Enter a trained task ID/number/exact instruction, or arbitrary custom goal text.\n"
-        "Type quit or q to release command authority; Ctrl-C also releases."
+        "Press q to release immediately (no Enter); use Shift-Q to type a literal q. "
+        "Press Shift-S to remain stopped. Ctrl-C also releases."
     )
     for index, (task_name, instruction) in enumerate(TASKS.items(), start=1):
         print(f"  {index}. {task_name:16s}  {instruction}")
@@ -382,8 +610,10 @@ def _select_next_goal_while_holding(
         lowered = response.lower()
         if lowered in EXIT_COMMANDS:
             return None
-        if lowered in HOLD_COMMANDS or not response:
-            LOGGER.info("Already holding; no GR00T request was sent")
+        if lowered in STOP_COMMANDS or not response:
+            if lowered in STOP_COMMANDS:
+                _finish_operator_stop(actuator)
+            LOGGER.info("Already stopped; no GR00T request was sent")
             continue
         task_name, instruction = resolve_runtime_goal(response)
         if task_name != "custom-goal":
@@ -406,6 +636,10 @@ def _select_next_goal_while_holding(
             return task_name, instruction
         if confirmation.lower() in EXIT_COMMANDS:
             return None
+        if confirmation.lower() in STOP_COMMANDS:
+            _finish_operator_stop(actuator)
+            LOGGER.info("Custom goal was not sent; remaining STOPPED")
+            continue
         LOGGER.warning("Custom goal rejected; remaining in powered hold")
 
 
@@ -443,15 +677,15 @@ def _confirm_goal_transition(
     print(message)
     response = _readline_while_armed(
         actuator,
-        f"Type {required} to continue (hold/h or quit/q): ",
+        f"Type {required} to continue (Shift-S STOP; q immediately releases): ",
         timeout_s=OPERATOR_CONFIRMATION_TIMEOUT_S,
     )
     if response == required:
         return "continue"
     lowered = response.lower()
-    if lowered in HOLD_COMMANDS:
-        actuator.hold()
-        LOGGER.warning("Goal transition cancelled; remaining in powered HOLD")
+    if lowered in STOP_COMMANDS:
+        _finish_operator_stop(actuator)
+        LOGGER.warning("Goal transition cancelled; remaining STOPPED in powered position hold")
         return "hold"
     if lowered in EXIT_COMMANDS:
         return "release"
@@ -464,16 +698,16 @@ def confirm_policy_warm_start(actuator: SafeG1Dex3Actuator, delta_summary: str) 
         "\nPOLICY WARM-START WILL MOVE THE ROBOT to the first target from a fresh policy "
         f"inference ({delta_summary}). The transition is rate-bounded but is joint-space only "
         "and not collision-aware. The inferred chunk will be discarded afterward.",
-        "WARMSTART",
+        "WARMUP",
     )
 
 
-def confirm_policy_resume(actuator: SafeG1Dex3Actuator) -> str:
+def confirm_policy_continue(actuator: SafeG1Dex3Actuator) -> str:
     return _confirm_goal_transition(
         actuator,
-        "\nPolicy warm-start converged. Visually verify the robot and scene. RESUME resets "
+        "\nPolicy warm-start converged. Visually verify the robot and scene. CONTINUE resets "
         "GR00T, captures a fresh observation, and restores normal action-step limits.",
-        "RESUME",
+        "CONTINUE",
     )
 
 
@@ -498,6 +732,19 @@ def close_camera_preview() -> None:
             pass
 
 
+def _raise_if_immediate_control(actuator: SafeG1Dex3Actuator | None) -> None:
+    if actuator is None:
+        return
+    checker = getattr(actuator, "immediate_control_requested", None)
+    if not callable(checker):
+        return
+    requested = checker()
+    if requested == "release":
+        raise OperatorRelease
+    if requested == "hold":
+        raise OperatorStop
+
+
 def capture_policy_observation(
     state_reader: G1Dex3StateReader,
     camera: TeleimagerCamera,
@@ -509,14 +756,17 @@ def capture_policy_observation(
     allow_custom_instruction: bool = False,
 ) -> tuple[dict[str, object], object]:
     if actuator is not None:
+        _raise_if_immediate_control(actuator)
         actuator.heartbeat()
     state = state_reader.read(timeout_s=0.5)
     if actuator is not None:
+        _raise_if_immediate_control(actuator)
         actuator.heartbeat()
     images = camera.read(timeout_s=camera_timeout_s)
     if show_camera:
         show_camera_preview(images.rgb, images.depth_gray)
     if actuator is not None:
+        _raise_if_immediate_control(actuator)
         actuator.heartbeat()
 
     observation = make_observation(
@@ -556,9 +806,14 @@ def infer_chunk(
         allow_custom_instruction,
     )
     started = time.monotonic()
-    action = policy.get_action(observation)
+    try:
+        action = policy.get_action(observation)
+    except BaseException:
+        _raise_if_immediate_control(actuator)
+        raise
     inference_s = time.monotonic() - started
     if actuator is not None:
+        _raise_if_immediate_control(actuator)
         actuator.assert_healthy()
     chunk = parse_action_chunk(
         action,
@@ -595,9 +850,14 @@ def infer_plan(
         allow_custom_instruction,
     )
     started = time.monotonic()
-    action = policy.get_action(observation)
+    try:
+        action = policy.get_action(observation)
+    except BaseException:
+        _raise_if_immediate_control(actuator)
+        raise
     inference_s = time.monotonic() - started
     if actuator is not None:
+        _raise_if_immediate_control(actuator)
         actuator.assert_healthy()
     return (
         parse_action_plan(
@@ -664,7 +924,7 @@ def _prepare_policy_goal(
         return decision
     actuator.warm_start(warm_start_chunk)
     LOGGER.warning("Policy warm-start reached the first target; inferred chunk discarded")
-    decision = confirm_policy_resume(actuator)
+    decision = confirm_policy_continue(actuator)
     if decision in {"hold", "release"}:
         return decision
     policy.reset()
@@ -675,15 +935,27 @@ def _active_command_action(command: str | None) -> str | None:
     if command is None or not command:
         return None
     lowered = command.lower()
-    if lowered in HOLD_COMMANDS:
+    if lowered in STOP_COMMANDS:
         return "hold"
     if lowered in EXIT_COMMANDS:
         return "release"
     LOGGER.warning(
-        "Ignoring active-run terminal input %r; use hold/h or quit/q",
+        "Ignoring active-run terminal input %r; press s to STOP or q to release",
         command,
     )
     return None
+
+
+def _finish_operator_stop(actuator: SafeG1Dex3Actuator) -> None:
+    checker = getattr(actuator, "immediate_control_requested", None)
+    requested = checker() if callable(checker) else None
+    if requested == "release":
+        raise OperatorRelease
+    if requested == "hold":
+        if actuator.finish_immediate_hold() == "release":
+            raise OperatorRelease
+    else:
+        actuator.hold()
 
 
 def _run_active_goal(
@@ -698,13 +970,63 @@ def _run_active_goal(
     *,
     allow_custom_instruction: bool,
 ) -> str:
+    with _OperatorTerminal(actuator) as terminal:
+        try:
+            outcome = _run_active_goal_controlled(
+                policy,
+                state_reader,
+                camera,
+                actuator,
+                task_name,
+                instruction,
+                contract,
+                args,
+                terminal,
+                allow_custom_instruction=allow_custom_instruction,
+            )
+        except OperatorStop:
+            _finish_operator_stop(actuator)
+            LOGGER.warning("Goal %r STOPPED; unexecuted policy output was discarded", task_name)
+            outcome = "hold"
+        except OperatorRelease:
+            LOGGER.warning("Operator requested immediate orderly authority release")
+            outcome = "release"
+        except ImmediateControlEvent as exc:
+            if exc.action == "release":
+                outcome = "release"
+            else:
+                _finish_operator_stop(actuator)
+                outcome = "hold"
+    checker = getattr(actuator, "immediate_control_requested", None)
+    requested = checker() if callable(checker) else None
+    if requested == "release":
+        return "release"
+    if requested == "hold":
+        _finish_operator_stop(actuator)
+        return "hold"
+    return outcome
+
+
+def _run_active_goal_controlled(
+    policy: Gr00tClient,
+    state_reader: G1Dex3StateReader,
+    camera: TeleimagerCamera,
+    actuator: SafeG1Dex3Actuator,
+    task_name: str,
+    instruction: str,
+    contract: ModelContract,
+    args: argparse.Namespace,
+    terminal: _OperatorTerminal,
+    *,
+    allow_custom_instruction: bool,
+) -> str:
     """Run one finite goal; return ``hold``, ``release``, or ``complete``."""
 
     for chunk_number in range(1, args.max_chunks + 1):
-        action = _active_command_action(_poll_active_command())
+        action = _active_command_action(_poll_active_command(terminal))
         if action == "hold":
-            actuator.hold()
-            LOGGER.warning("Goal %r entered powered HOLD", task_name)
+            _finish_operator_stop(actuator)
+            LOGGER.warning("Goal %r STOPPED in powered position hold", task_name)
             return "hold"
         if action == "release":
             LOGGER.warning("Operator requested orderly authority release")
@@ -725,17 +1047,26 @@ def _run_active_goal(
         # A command typed during synchronous inference is honored before the
         # newly returned chunk can be submitted. The request cannot be
         # cancelled, but its result is discarded and no further request is made.
-        action = _active_command_action(_poll_active_command())
+        action = _active_command_action(_poll_active_command(terminal))
         if action == "hold":
-            actuator.hold()
-            LOGGER.warning("Goal %r inferred chunk discarded; entered powered HOLD", task_name)
+            _finish_operator_stop(actuator)
+            LOGGER.warning("Goal %r inferred chunk discarded; STOPPED", task_name)
             return "hold"
         if action == "release":
             LOGGER.warning("Operator requested orderly authority release; inferred chunk discarded")
             return "release"
 
         sequence = actuator.submit(chunk)
-        actuator.wait_completed(sequence, timeout_s=args.execution_horizon / CONTROL_HZ + 1.0)
+        completion = actuator.wait_completed(
+            sequence,
+            timeout_s=args.execution_horizon / CONTROL_HZ + 1.0,
+        )
+        if completion == "hold":
+            LOGGER.warning("Goal %r STOPPED during action execution", task_name)
+            return "hold"
+        if completion == "release":
+            LOGGER.warning("Operator requested immediate orderly authority release")
+            return "release"
         LOGGER.info(
             "Completed live chunk %d/%d for %r (%d actions, inference %.3fs)",
             chunk_number,
@@ -744,10 +1075,10 @@ def _run_active_goal(
             chunk.length,
             inference_s,
         )
-        action = _active_command_action(_poll_active_command())
+        action = _active_command_action(_poll_active_command(terminal))
         if action == "hold":
-            actuator.hold()
-            LOGGER.warning("Goal %r entered powered HOLD", task_name)
+            _finish_operator_stop(actuator)
+            LOGGER.warning("Goal %r STOPPED in powered position hold", task_name)
             return "hold"
         if action == "release":
             LOGGER.warning("Operator requested orderly authority release")
@@ -811,6 +1142,56 @@ def _run_active_goal_rtc(
     *,
     allow_custom_instruction: bool,
 ) -> str:
+    with _OperatorTerminal(actuator) as terminal:
+        try:
+            outcome = _run_active_goal_rtc_controlled(
+                policy,
+                state_reader,
+                camera,
+                actuator,
+                task_name,
+                instruction,
+                contract,
+                args,
+                terminal,
+                allow_custom_instruction=allow_custom_instruction,
+            )
+        except OperatorStop:
+            _finish_operator_stop(actuator)
+            LOGGER.warning("Goal %r STOPPED; pending RTC result will be discarded", task_name)
+            outcome = "hold"
+        except OperatorRelease:
+            LOGGER.warning("Operator requested immediate orderly authority release during RTC")
+            outcome = "release"
+        except ImmediateControlEvent as exc:
+            if exc.action == "release":
+                outcome = "release"
+            else:
+                _finish_operator_stop(actuator)
+                outcome = "hold"
+    checker = getattr(actuator, "immediate_control_requested", None)
+    requested = checker() if callable(checker) else None
+    if requested == "release":
+        return "release"
+    if requested == "hold":
+        _finish_operator_stop(actuator)
+        return "hold"
+    return outcome
+
+
+def _run_active_goal_rtc_controlled(
+    policy: Gr00tClient,
+    state_reader: G1Dex3StateReader,
+    camera: TeleimagerCamera,
+    actuator: SafeG1Dex3Actuator,
+    task_name: str,
+    instruction: str,
+    contract: ModelContract,
+    args: argparse.Namespace,
+    terminal: _OperatorTerminal,
+    *,
+    allow_custom_instruction: bool,
+) -> str:
     """Run child-timed asynchronous RTC while the main thread services safety."""
 
     plan, initial_inference_s = infer_plan(
@@ -823,6 +1204,14 @@ def _run_active_goal_rtc(
         show_camera=getattr(args, "show_camera", False),
         allow_custom_instruction=allow_custom_instruction,
     )
+    initial_command = _active_command_action(_poll_active_command(terminal))
+    if initial_command == "hold":
+        _finish_operator_stop(actuator)
+        LOGGER.warning("Goal %r STOPPED; initial RTC plan was discarded", task_name)
+        return "hold"
+    if initial_command == "release":
+        LOGGER.warning("Operator requested immediate orderly authority release during RTC")
+        return "release"
     action_budget = args.execution_horizon * args.max_chunks
     current_sequence = actuator.start_rtc(plan, action_budget=action_budget)
     current_plan = plan
@@ -846,6 +1235,20 @@ def _run_active_goal_rtc(
     try:
         while True:
             actuator.heartbeat()
+            command_action = _active_command_action(_poll_active_command(terminal))
+            if command_action == "hold":
+                _finish_operator_stop(actuator)
+                LOGGER.warning(
+                    "Goal %r STOPPED; pending RTC result will be discarded",
+                    task_name,
+                )
+                _drain_rtc_worker(worker, actuator)
+                return "hold"
+            if command_action == "release":
+                LOGGER.warning("Operator requested immediate orderly authority release during RTC")
+                worker.close(wait=False)
+                return "release"
+
             event = actuator.poll_rtc_event()
             if event is not None:
                 outcome, detail = event
@@ -861,17 +1264,6 @@ def _run_active_goal_rtc(
                 LOGGER.error("RTC plan underrun/rejection; child entered powered HOLD: %s", detail)
                 _drain_rtc_worker(worker, actuator)
                 return "hold"
-
-            command_action = _active_command_action(_poll_active_command())
-            if command_action == "hold":
-                actuator.hold()
-                LOGGER.warning("Goal %r entered powered HOLD; pending RTC result will be discarded", task_name)
-                _drain_rtc_worker(worker, actuator)
-                return "hold"
-            if command_action == "release":
-                LOGGER.warning("Operator requested orderly authority release during RTC")
-                worker.close(wait=False)
-                return "release"
 
             response = worker.poll()
             if response is not None:
@@ -909,6 +1301,8 @@ def _run_active_goal_rtc(
                         _drain_rtc_worker(worker, actuator)
                         return "hold"
                     return "complete"
+                except ImmediateControlEvent:
+                    raise
                 except (DeploymentError, TimeoutError) as exc:
                     LOGGER.error("RTC response validation/handoff failed; entering powered HOLD: %s", exc)
                     actuator.hold()
@@ -1363,8 +1757,8 @@ def run(args: argparse.Namespace) -> None:
         # warm-starts from the held pose, discards that chunk, then resets again.
         if sys.stdin.isatty():
             print(
-                "\nACTIVE GOAL CONTROLS: hold or h enters powered HOLD; "
-                "quit or q releases authority and exits. Ctrl-C also releases from any state."
+                "\nACTIVE GOAL CONTROLS (NO ENTER): press s to STOP in a powered position hold; "
+                "press q to release authority and exit. Ctrl-C also releases from any state."
             )
 
         while True:

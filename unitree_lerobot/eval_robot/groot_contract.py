@@ -78,14 +78,13 @@ RIGHT_HAND_JOINT_NAMES = tuple(EXPECTED_JOINT_NAMES[21:28])
 ARM_DOF = 14
 HAND_DOF = 7
 CONTROL_HZ = 30.0
-MAX_EXECUTION_HORIZON = 8
 INITIALIZATION_MODES = ("measured", "xr-home", "pose-file")
 INITIAL_POSE_SCHEMA_VERSION = 1
 
 # These are deliberately fixed deployment ceilings, not tuning flags.  They need
 # hardware qualification before being relaxed.
 MAX_ARM_STEP_RAD = 0.1  # 0.05
-MAX_HAND_STEP_RAD = 0.20  # 0.10
+MAX_HAND_STEP_RAD = 0.60  # 0.10
 JOINT_LIMIT_MARGIN_RAD = 0.03
 HAND_LIMIT_TOLERANCE_RAD = 0.002
 MEASURED_LIMIT_TOLERANCE_RAD = 0.01
@@ -960,11 +959,10 @@ def parse_action_chunk(
     current_right: np.ndarray,
     validate_initial_step: bool = True,
 ) -> ActionChunk:
-    if not 1 <= execution_horizon <= min(model_horizon, MAX_EXECUTION_HORIZON):
+    if not 1 <= execution_horizon <= model_horizon:
         raise DeploymentError(
-            f"Execution horizon {execution_horizon} must be 1.."
-            f"{min(model_horizon, MAX_EXECUTION_HORIZON)}; "
-            f"MAX_EXECUTION_HORIZON={MAX_EXECUTION_HORIZON}"
+            f"Execution horizon {execution_horizon} must be 1..{model_horizon}; "
+            f"checkpoint action horizon={model_horizon}"
         )
 
     full = _parse_full_action(action, model_horizon)

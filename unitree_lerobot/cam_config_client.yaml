@@ -1,27 +1,48 @@
 head_camera:
   enable_zmq: true
-  enable_webrtc: false
-  webrtc_port: 6002
-  webrtc_codec: h264
-  zmq_port: 5555
-  depth_zmq_port: 5558
-  raw_depth_zmq_port: 5559
+  zmq_port: 55555
+  enable_depth: true
+  depth_zmq_port: 55558
   depth_scale_m_per_unit: 0.001
-  binocular: false
-  type: realsense
+  enable_webrtc: true
+  webrtc_port: 60001
+  webrtc_codec: h264
+  type: isaacsim
   image_shape:
   - 480
   - 640
+  binocular: false
   fps: 30
-  enable_depth: true
-  serial_number: '242322076480'
+  video_id: 0
+  serial_number: 01.00.00
+  physical_path: null
 left_wrist_camera:
-  type: uvc
   enable_zmq: false
+  zmq_port: 55556
   enable_webrtc: false
+  webrtc_port: 60002
+  webrtc_codec: h264
+  type: isaacsim
+  image_shape:
+  - 480
+  - 640
   binocular: false
+  fps: 30
+  video_id: 2
+  serial_number: 200901010001
+  physical_path: null
 right_wrist_camera:
-  type: uvc
   enable_zmq: false
+  zmq_port: 55557
   enable_webrtc: false
+  webrtc_port: 60003
+  webrtc_codec: h264
+  type: isaacsim
+  image_shape:
+  - 480
+  - 640
   binocular: false
+  fps: 30
+  video_id: 4
+  serial_number: 200901010002
+  physical_path: null
