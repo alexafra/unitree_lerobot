@@ -58,13 +58,21 @@ from unitree_lerobot.utils.depth_encoding import encode_depth_gray_rgb
 LOGGER = logging.getLogger(__name__)
 
 STATE_MAX_AGE_S = 0.25
-ACTUATOR_STATE_MAX_AGE_S = 0.075
+ACTUATOR_ARM_STATE_MAX_AGE_S = 0.075
+ACTUATOR_HAND_STATE_WARNING_AGE_S = 0.075
+ACTUATOR_HAND_STATE_MAX_AGE_S = 0.250
+ACTUATOR_HAND_RECOVERY_SAMPLES = 5
+# Backward-compatible name for tests/internal imports.  It remains the hard
+# arm-state deadline; hand state has its own limits above.
+ACTUATOR_STATE_MAX_AGE_S = ACTUATOR_ARM_STATE_MAX_AGE_S
 HEARTBEAT_TIMEOUT_S = 1.0
 CHUNK_MAX_AGE_S = 0.25
 ARM_AUTHORITY_RAMP_S = 1.5
 # CHANGEDSAFETY: original local adapter default was 1.0 s; current is 1.5 s.
 # This is the orderly arm_sdk authority ramp-down duration.
 ARM_RELEASE_RAMP_S = 1.5
+ACTUATOR_RELEASE_SOFT_TIMEOUT_S = ARM_RELEASE_RAMP_S + 2.0
+ACTUATOR_RELEASE_HARD_TIMEOUT_S = ARM_RELEASE_RAMP_S + 5.0
 PUBLISH_HZ = 100.0
 DDS_WRITE_TIMEOUT_S = 0.5
 # CHANGEDSAFETY: original local adapter default was 6.0 rad/s, it was experimentally
@@ -85,6 +93,7 @@ HAND_TRACKING_WARNING_DWELL_S = 0.20
 HAND_COMMAND_HISTORY_SIZE = 128
 TRACKING_GRACE_S = 0.50
 MAX_ACTION_LATENESS_S = 0.02
+
 # OFFICIAL: Unitree G1 asset mapping identifies mode_machine 6 as
 # g1_29dof_lock_waist_with_hand_rev_1_0: waist yaw remains active while
 # roll/pitch are locked (eval_robot/assets/g1/README.md). This matches the
@@ -179,6 +188,88 @@ class RobotState:
     # is not compared with a newer 100 Hz command or counted twice.
     left_hand_received_at: float | None = None
     right_hand_received_at: float | None = None
+    arm_received_at: float | None = None
+
+
+@dataclass(frozen=True)
+class HandFreshnessResult:
+    ready: bool
+    entered: bool = False
+    recovered: bool = False
+    pause_s: float = 0.0
+    stale_hands: tuple[str, ...] = ()
+    max_age_s: float = 0.0
+
+
+class HandStateFreshnessGate:
+    """Turn short Dex3 delivery gaps into a bounded motion pause."""
+
+    def __init__(self) -> None:
+        self._active = False
+        self._started_at = 0.0
+        self._fresh_samples = 0
+        self._last_left_at = 0.0
+        self._last_right_at = 0.0
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def reset(self) -> None:
+        self._active = False
+        self._started_at = 0.0
+        self._fresh_samples = 0
+        self._last_left_at = 0.0
+        self._last_right_at = 0.0
+
+    def check(self, state: RobotState, *, now: float | None = None) -> HandFreshnessResult:
+        checked_at = time.monotonic() if now is None else float(now)
+        left_at = state.captured_at if state.left_hand_received_at is None else state.left_hand_received_at
+        right_at = state.captured_at if state.right_hand_received_at is None else state.right_hand_received_at
+        ages = {
+            "left": max(0.0, checked_at - float(left_at)),
+            "right": max(0.0, checked_at - float(right_at)),
+        }
+        stale_hands = tuple(
+            name for name, age_s in ages.items() if age_s > ACTUATOR_HAND_STATE_WARNING_AGE_S
+        )
+        max_age_s = max(ages.values())
+        if stale_hands:
+            entered = not self._active
+            if entered:
+                self._active = True
+                self._started_at = checked_at
+            self._fresh_samples = 0
+            self._last_left_at = float(left_at)
+            self._last_right_at = float(right_at)
+            return HandFreshnessResult(
+                ready=False,
+                entered=entered,
+                stale_hands=stale_hands,
+                max_age_s=max_age_s,
+            )
+
+        if not self._active:
+            return HandFreshnessResult(ready=True, max_age_s=max_age_s)
+
+        # Count actual paired DDS updates, not repeated 100 Hz reads of one
+        # cached sample.
+        if float(left_at) <= self._last_left_at or float(right_at) <= self._last_right_at:
+            return HandFreshnessResult(ready=False, max_age_s=max_age_s)
+        self._last_left_at = float(left_at)
+        self._last_right_at = float(right_at)
+        self._fresh_samples += 1
+        if self._fresh_samples < ACTUATOR_HAND_RECOVERY_SAMPLES:
+            return HandFreshnessResult(ready=False, max_age_s=max_age_s)
+
+        pause_s = checked_at - self._started_at
+        self.reset()
+        return HandFreshnessResult(
+            ready=True,
+            recovered=True,
+            pause_s=pause_s,
+            max_age_s=max_age_s,
+        )
 
 
 @dataclass(frozen=True)
@@ -725,7 +816,12 @@ def initialize_dds(simulation: bool, network_interface: str | None) -> None:
 class G1Dex3StateReader:
     """Read arm and hand state without constructing command publishers."""
 
-    def __init__(self, simulation: bool = False, max_age_s: float = STATE_MAX_AGE_S):
+    def __init__(
+        self,
+        simulation: bool = False,
+        max_age_s: float = STATE_MAX_AGE_S,
+        hand_max_age_s: float | None = None,
+    ):
         from unitree_lerobot.eval_robot.robot_control.robot_arm import G1_29_JointArmIndex
         from unitree_lerobot.eval_robot.robot_control.robot_hand_unitree import (
             Dex3_1_Left_JointIndex,
@@ -735,13 +831,17 @@ class G1Dex3StateReader:
         from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandState_, LowState_
 
         self._simulation = simulation
-        self._max_age_s = max_age_s
+        self._arm_max_age_s = float(max_age_s)
+        self._hand_max_age_s = float(max_age_s if hand_max_age_s is None else hand_max_age_s)
+        if self._arm_max_age_s <= 0.0 or self._hand_max_age_s <= 0.0:
+            raise ValueError("State freshness limits must be positive")
         self._arm_indices = tuple(int(index) for index in G1_29_JointArmIndex)
         self._left_indices = tuple(int(index) for index in Dex3_1_Left_JointIndex)
         self._right_indices = tuple(int(index) for index in Dex3_1_Right_JointIndex)
         self._lock = threading.Lock()
         self._messages: dict[str, Any] = {"arm": None, "left": None, "right": None}
         self._updated_at = {key: 0.0 for key in self._messages}
+        self._rejected_zero_hand_frames = {"left": 0, "right": 0}
         self._subscribers = {
             "arm": ChannelSubscriber("rt/lowstate", LowState_),
             "left": ChannelSubscriber("rt/dex3/left/state", HandState_),
@@ -754,6 +854,21 @@ class G1Dex3StateReader:
         def update(message: Any) -> None:
             if message is None:
                 return
+            # A failed Dex3 boot can keep publishing a syntactically valid,
+            # all-zero placeholder at a high callback rate.  Treating those
+            # frames as fresh poisoned measured initialization on the real
+            # robot.  Preserve the last valid sample instead; sustained
+            # placeholders then naturally cross the soft/hard age gates.
+            if not self._simulation and key in {"left", "right"}:
+                indices = self._left_indices if key == "left" else self._right_indices
+                try:
+                    all_zero = all(float(message.motor_state[index].q) == 0.0 for index in indices)
+                except (AttributeError, IndexError, TypeError, ValueError):
+                    all_zero = False
+                if all_zero:
+                    with self._lock:
+                        self._rejected_zero_hand_frames[key] += 1
+                    return
             with self._lock:
                 self._messages[key] = message
                 self._updated_at[key] = time.monotonic()
@@ -765,11 +880,24 @@ class G1Dex3StateReader:
         with self._lock:
             messages = dict(self._messages)
             updated_at = dict(self._updated_at)
-        missing = [
-            key for key, message in messages.items() if message is None or now - updated_at[key] > self._max_age_s
-        ]
-        if missing:
-            raise TimeoutError(f"Stale Unitree state: {', '.join(missing)}")
+            rejected_zero = dict(self._rejected_zero_hand_frames)
+        limits = {
+            "arm": self._arm_max_age_s,
+            "left": self._hand_max_age_s,
+            "right": self._hand_max_age_s,
+        }
+        stale = []
+        for key, message in messages.items():
+            if message is None:
+                detail = f", rejected {rejected_zero[key]} all-zero frames" if key in rejected_zero else ""
+                stale.append(f"{key} (missing{detail})")
+                continue
+            age_s = now - updated_at[key]
+            if age_s > limits[key]:
+                detail = f", rejected {rejected_zero[key]} all-zero frames" if key in rejected_zero else ""
+                stale.append(f"{key} (age {age_s:.3f}s > {limits[key]:.3f}s{detail})")
+        if stale:
+            raise TimeoutError(f"Stale Unitree state: {', '.join(stale)}")
 
         arm_message = messages["arm"]
         left_message = messages["left"]
@@ -790,6 +918,7 @@ class G1Dex3StateReader:
             right_hand=right,
             left_hand_received_at=updated_at["left"],
             right_hand_received_at=updated_at["right"],
+            arm_received_at=updated_at["arm"],
         )
 
     def read(self, timeout_s: float = 3.0) -> RobotState:
@@ -1086,12 +1215,15 @@ TeleimagerColourCamera = TeleimagerCamera
 class _G1Dex3CommandBackend:
     """DDS publishers used only inside the actuator child process."""
 
+    _supports_cleanup_phases = True
+
     def __init__(self, simulation: bool, network_interface: str | None):
         initialize_dds(simulation, network_interface)
         self.simulation = simulation
         self.reader = G1Dex3StateReader(
             simulation=simulation,
-            max_age_s=ACTUATOR_STATE_MAX_AGE_S,
+            max_age_s=ACTUATOR_ARM_STATE_MAX_AGE_S,
+            hand_max_age_s=ACTUATOR_HAND_STATE_MAX_AGE_S,
         )
         initial = self.reader.read(timeout_s=5.0)
         if not simulation and initial.mode_machine != QUALIFIED_REAL_MODE_MACHINE:
@@ -1134,6 +1266,10 @@ class _G1Dex3CommandBackend:
         self._weight = 0.0
         self._released = False
         self._has_published = False
+        # Enabled only by the dedicated authority-ramp diagnostic.  Keeping the
+        # timers dormant avoids changing the normal deployment hot path.
+        self._authority_ramp_timing_enabled = False
+        self._last_publish_timing_ms: dict[str, float] = {}
         self._arm_target = initial.arm.copy()
         self._left_target = initial.left_hand.copy()
         self._right_target = initial.right_hand.copy()
@@ -1243,6 +1379,8 @@ class _G1Dex3CommandBackend:
         self._right_hand_publish_history.clear()
 
     def _publish_arm(self, require_qualified_state: bool = True) -> None:
+        timing_enabled = self._authority_ramp_timing_enabled
+        timing = self._last_publish_timing_ms
         for offset, index in enumerate(self._arm_indices):
             self._arm_message.motor_cmd[index].q = float(self._arm_target[offset])
         if not self.simulation:
@@ -1253,10 +1391,20 @@ class _G1Dex3CommandBackend:
             # fault that triggered it.
             self._arm_message.mode_machine = QUALIFIED_REAL_MODE_MACHINE
             if require_qualified_state:
+                started_ns = time.monotonic_ns()
                 self._validate_runtime_state(self.reader.latest())
+                if timing_enabled:
+                    timing["arm_state_check"] = (time.monotonic_ns() - started_ns) / 1e6
             self._arm_message.motor_cmd[29].q = float(self._weight)
+        started_ns = time.monotonic_ns()
         self._arm_message.crc = self._crc.Crc(self._arm_message)
-        if self._arm_publisher.Write(self._arm_message, timeout=DDS_WRITE_TIMEOUT_S) is not True:
+        if timing_enabled:
+            timing["arm_crc"] = (time.monotonic_ns() - started_ns) / 1e6
+        started_ns = time.monotonic_ns()
+        write_ok = self._arm_publisher.Write(self._arm_message, timeout=DDS_WRITE_TIMEOUT_S)
+        if timing_enabled:
+            timing["arm_write"] = (time.monotonic_ns() - started_ns) / 1e6
+        if write_ok is not True:
             raise DeploymentError("Arm DDS Write failed")
         self._has_published = True
 
@@ -1274,14 +1422,24 @@ class _G1Dex3CommandBackend:
         for offset, index in enumerate(self._right_indices):
             self._right_message.motor_cmd[index].q = float(right_command[offset])
 
-        if self._left_publisher.Write(self._left_message, timeout=DDS_WRITE_TIMEOUT_S) is not True:
+        timing_enabled = self._authority_ramp_timing_enabled
+        timing = self._last_publish_timing_ms
+        started_ns = time.monotonic_ns()
+        left_ok = self._left_publisher.Write(self._left_message, timeout=DDS_WRITE_TIMEOUT_S)
+        if timing_enabled:
+            timing["left_write"] = (time.monotonic_ns() - started_ns) / 1e6
+        if left_ok is not True:
             raise DeploymentError("Left Dex3 DDS Write failed")
         self._left_hand_publish_history.append(PublishedHandTarget(completed_at=time.monotonic(), target=left_target))
-        if self._right_publisher.Write(self._right_message, timeout=DDS_WRITE_TIMEOUT_S) is not True:
+        started_ns = time.monotonic_ns()
+        right_ok = self._right_publisher.Write(self._right_message, timeout=DDS_WRITE_TIMEOUT_S)
+        if timing_enabled:
+            timing["right_write"] = (time.monotonic_ns() - started_ns) / 1e6
+        if right_ok is not True:
             raise DeploymentError("Right Dex3 DDS Write failed")
         self._right_hand_publish_history.append(PublishedHandTarget(completed_at=time.monotonic(), target=right_target))
 
-    def _stop_hands(self) -> None:
+    def _stop_hands(self, phase_callback: Any | None = None) -> None:
         """Send Unitree's documented Dex3 ``stopMotors`` command once per hand."""
 
         for message, indices in (
@@ -1301,26 +1459,45 @@ class _G1Dex3CommandBackend:
             ("Left", self._left_publisher, self._left_message),
             ("Right", self._right_publisher, self._right_message),
         ):
+            if phase_callback is not None:
+                phase_callback(f"{name.lower()}_hand_stop_begin", {})
+            started = time.monotonic()
             try:
                 if publisher.Write(message, timeout=DDS_WRITE_TIMEOUT_S) is not True:
                     failures.append(f"{name} Dex3 stop Write failed")
             except Exception as exc:
                 failures.append(f"{name} Dex3 stop Write raised {exc!r}")
+            finally:
+                if phase_callback is not None:
+                    phase_callback(
+                        f"{name.lower()}_hand_stop_end",
+                        {"elapsed_s": time.monotonic() - started},
+                    )
         if failures:
             raise DeploymentError("; ".join(failures))
 
     def publish(self) -> None:
-        self._publish_arm()
-        self._publish_hands()
+        timing_enabled = self._authority_ramp_timing_enabled
+        if timing_enabled:
+            self._last_publish_timing_ms = {}
+        started_ns = time.monotonic_ns()
+        try:
+            self._publish_arm()
+            self._publish_hands()
+        finally:
+            if timing_enabled:
+                self._last_publish_timing_ms["publish_total"] = (time.monotonic_ns() - started_ns) / 1e6
 
     def set_weight(self, weight: float) -> None:
         self._weight = float(np.clip(weight, 0.0, 1.0))
 
-    def release(self) -> None:
+    def release(self, phase_callback: Any | None = None) -> None:
         if self._released:
             return
         self._released = True
         if not self._has_published:
+            if phase_callback is not None:
+                phase_callback("release_skipped_no_writes", {})
             return
         if self.simulation:
             try:
@@ -1332,23 +1509,82 @@ class _G1Dex3CommandBackend:
             return
         failures = []
         start_weight = self._weight
-        steps = max(1, round(ARM_RELEASE_RAMP_S * PUBLISH_HZ))
         period = 1.0 / PUBLISH_HZ
+        duration = max(float(ARM_RELEASE_RAMP_S), period)
+        ramp_started = time.monotonic()
+        next_write_at = ramp_started
+        arm_writes = 0
+        skipped_ticks = 0
+        max_arm_cycle_s = 0.0
+        last_successful_weight = start_weight
         # Release does not depend on policy, camera, fresh state, or IK.
-        for step in range(steps):
-            self.set_weight(start_weight * (1.0 - (step + 1) / steps))
+        LOGGER.info("Arm authority release started at weight %.4f", start_weight)
+        if phase_callback is not None:
+            phase_callback("arm_release_begin", {"start_weight": start_weight})
+        while True:
+            now = time.monotonic()
+            if now < next_write_at:
+                time.sleep(next_write_at - now)
+            cycle_started = time.monotonic()
+            progress = 1.0 if start_weight == 0.0 else min(
+                1.0,
+                (cycle_started - ramp_started + period) / duration,
+            )
+            self.set_weight(start_weight * (1.0 - progress))
             try:
                 self._publish_arm(require_qualified_state=False)
             except Exception as exc:
                 failures.append(f"arm_sdk authority release failed: {exc}")
                 break
-            time.sleep(period)
+            cycle_completed = time.monotonic()
+            arm_writes += 1
+            last_successful_weight = self._weight
+            max_arm_cycle_s = max(max_arm_cycle_s, cycle_completed - cycle_started)
+            if progress >= 1.0:
+                break
+            next_write_at += period
+            if next_write_at <= cycle_completed:
+                missed = int((cycle_completed - next_write_at) // period) + 1
+                skipped_ticks += missed
+                next_write_at += missed * period
+        # If an intermediate ramp write failed, make one explicit best-effort
+        # zero-weight attempt before stopping the hands.
+        if last_successful_weight != 0.0:
+            self.set_weight(0.0)
+            try:
+                self._publish_arm(require_qualified_state=False)
+                arm_writes += 1
+                last_successful_weight = 0.0
+            except Exception as exc:
+                failures.append(f"final zero-weight arm_sdk Write failed: {exc}")
+        arm_release_s = time.monotonic() - ramp_started
+        LOGGER.info(
+            "Arm authority release ended in %.3fs: writes=%d, skipped 100 Hz ticks=%d, "
+            "max arm cycle=%.3fs, last successful weight=%.4f",
+            arm_release_s,
+            arm_writes,
+            skipped_ticks,
+            max_arm_cycle_s,
+            last_successful_weight,
+        )
+        if phase_callback is not None:
+            phase_callback(
+                "arm_release_end",
+                {
+                    "elapsed_s": arm_release_s,
+                    "writes": arm_writes,
+                    "skipped_ticks": skipped_ticks,
+                    "last_successful_weight": last_successful_weight,
+                },
+            )
         # Do this after the arm release so a blocked hand DDS Write cannot
         # prevent the higher-priority arm_sdk weight ramp from being attempted.
+        hand_stop_started = time.monotonic()
         try:
-            self._stop_hands()
+            self._stop_hands(phase_callback)
         except Exception as exc:
             failures.append(f"Dex3 stopMotors failed: {exc}")
+        LOGGER.info("Dex3 stopMotors phase finished in %.3fs", time.monotonic() - hand_stop_started)
         if failures:
             raise DeploymentError("; ".join(failures))
 
@@ -1374,6 +1610,132 @@ def _status(status_queue: MpQueue, kind: str, payload: Any = None) -> None:
         status_queue.put((kind, payload), timeout=0.2)
     except queue.Full:
         pass
+
+
+def _status_nonblocking(status_queue: MpQueue, kind: str, payload: Any = None) -> None:
+    """Best-effort diagnostic status that must never delay the control loop."""
+
+    try:
+        status_queue.put_nowait((kind, payload))
+    except queue.Full:
+        pass
+
+
+def _observe_hand_freshness(
+    gate: HandStateFreshnessGate,
+    state: RobotState,
+    status_queue: MpQueue,
+    *,
+    context: str,
+) -> HandFreshnessResult:
+    result = gate.check(state)
+    if result.entered:
+        payload = {
+            "context": context,
+            "hands": result.stale_hands,
+            "age_s": result.max_age_s,
+            "warning_age_s": ACTUATOR_HAND_STATE_WARNING_AGE_S,
+            "hard_age_s": ACTUATOR_HAND_STATE_MAX_AGE_S,
+        }
+        LOGGER.warning(
+            "Dex3 state pause in %s: %s age %.3fs exceeded soft %.3fs; "
+            "freezing commands (hard fault at %.3fs)",
+            context,
+            "/".join(result.stale_hands),
+            result.max_age_s,
+            ACTUATOR_HAND_STATE_WARNING_AGE_S,
+            ACTUATOR_HAND_STATE_MAX_AGE_S,
+        )
+        _status_nonblocking(status_queue, "hand_state_pause", payload)
+    elif result.recovered:
+        payload = {
+            "context": context,
+            "pause_s": result.pause_s,
+            "fresh_samples": ACTUATOR_HAND_RECOVERY_SAMPLES,
+        }
+        LOGGER.info(
+            "Dex3 state recovered in %s after %.3fs and %d consecutive fresh samples",
+            context,
+            result.pause_s,
+            ACTUATOR_HAND_RECOVERY_SAMPLES,
+        )
+        # Recovery gates future motion, so unlike the entry diagnostic this
+        # acknowledgment is delivered through the bounded reliable path.
+        _status(status_queue, "hand_state_recovered", payload)
+    return result
+
+
+def _authority_ramp_timing_summary(
+    records: list[dict[str, float]],
+    *,
+    event: str,
+    elapsed_s: float,
+    total_steps: int,
+) -> dict[str, Any]:
+    """Return a compact timing summary without doing I/O in the 100 Hz loop."""
+
+    summary: dict[str, Any] = {
+        "event": event,
+        "completed_steps": len(records),
+        "total_steps": total_steps,
+        "elapsed_ms": elapsed_s * 1e3,
+    }
+    if not records:
+        return summary
+    summary["last_weight"] = records[-1]["weight"]
+    summary["heartbeat_age_max_ms"] = max(record["heartbeat_age_ms"] for record in records)
+    summary["state_age_max_ms"] = max(record["state_age_ms"] for record in records)
+    summary["arm_drift_max_rad"] = max(record["arm_drift_rad"] for record in records)
+    summary["arm_dq_max_rad_s"] = max(record["arm_dq_rad_s"] for record in records)
+    summary["work_over_10ms"] = sum(record["work_ms"] > 10.0 for record in records)
+    for key in (
+        "state_lookup_ms",
+        "arm_state_check_ms",
+        "arm_crc_ms",
+        "arm_write_ms",
+        "left_write_ms",
+        "right_write_ms",
+        "publish_total_ms",
+        "work_ms",
+        "cycle_ms",
+    ):
+        values = np.asarray([record[key] for record in records], dtype=np.float64)
+        summary[f"{key}_mean"] = float(np.mean(values))
+        summary[f"{key}_p95"] = float(np.percentile(values, 95))
+        summary[f"{key}_max"] = float(np.max(values))
+    return summary
+
+
+def _format_authority_ramp_timing(payload: dict[str, Any]) -> str:
+    preferred = (
+        "event",
+        "completed_steps",
+        "total_steps",
+        "elapsed_ms",
+        "last_weight",
+        "heartbeat_age_max_ms",
+        "state_age_max_ms",
+        "arm_drift_max_rad",
+        "arm_dq_max_rad_s",
+        "publish_total_ms_p95",
+        "publish_total_ms_max",
+        "arm_write_ms_max",
+        "left_write_ms_max",
+        "right_write_ms_max",
+        "cycle_ms_p95",
+        "cycle_ms_max",
+        "work_over_10ms",
+    )
+    fields = []
+    for key in preferred:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if isinstance(value, float):
+            fields.append(f"{key}={value:.3f}")
+        else:
+            fields.append(f"{key}={value}")
+    return " ".join(fields)
 
 
 def _tracking_errors(backend: _G1Dex3CommandBackend, state: RobotState) -> tuple[float, float]:
@@ -1447,6 +1809,8 @@ def _wait_for_initialization_start(
     stop_event: Any,
     heartbeat: Any,
     hand_watchdog: HandTrackingWatchdog | None = None,
+    hand_freshness_gate: HandStateFreshnessGate | None = None,
+    status_queue: MpQueue | None = None,
 ) -> RobotState | None:
     """Hold the current command until fresh measured state is stationary again."""
 
@@ -1463,8 +1827,40 @@ def _wait_for_initialization_start(
             raise DeploymentError("Parent heartbeat expired before initialization movement")
         latest = backend.state()
         now = time.monotonic()
-        if now - latest.captured_at > PREARM_STATE_MAX_AGE_S:
-            raise DeploymentError("Robot state is not fresh enough to start initialization")
+        if hand_freshness_gate is not None and status_queue is not None:
+            freshness = _observe_hand_freshness(
+                hand_freshness_gate,
+                latest,
+                status_queue,
+                context="initialization-start dwell",
+            )
+            if not freshness.ready:
+                backend.publish()
+                elapsed = time.monotonic() - loop_started
+                stop_event.wait(max(0.0, period - elapsed))
+                continue
+            if freshness.recovered:
+                _enforce_tracking(
+                    backend,
+                    latest,
+                    hand_watchdog,
+                    now=now,
+                    context="initialization-start recovery",
+                )
+                deadline += freshness.pause_s
+                if hand_watchdog is not None:
+                    hand_watchdog.reset(backend)
+                stationary_since = None
+                stationary_reference = None
+                distinct_samples = 0
+                last_capture = float("-inf")
+                backend.publish()
+                elapsed = time.monotonic() - loop_started
+                stop_event.wait(max(0.0, period - elapsed))
+                continue
+        arm_received_at = latest.captured_at if latest.arm_received_at is None else latest.arm_received_at
+        if now - arm_received_at > PREARM_STATE_MAX_AGE_S:
+            raise DeploymentError("Arm state is not fresh enough to start initialization")
         _enforce_tracking(
             backend,
             latest,
@@ -1527,6 +1923,8 @@ def _execute_initialization(
     heartbeat: Any,
     tracking_checks_after: float,
     hand_watchdog: HandTrackingWatchdog | None = None,
+    hand_freshness_gate: HandStateFreshnessGate | None = None,
+    status_queue: MpQueue | None = None,
     *,
     context: str = "initialization",
 ) -> bool:
@@ -1547,6 +1945,41 @@ def _execute_initialization(
 
         state = backend.state()
         now = time.monotonic()
+        if hand_freshness_gate is not None and status_queue is not None:
+            freshness = _observe_hand_freshness(
+                hand_freshness_gate,
+                state,
+                status_queue,
+                context=context,
+            )
+            if not freshness.ready:
+                # Preserve the last command exactly.  In particular, never
+                # replace a hand target with an old measurement while its DDS
+                # stream is paused.
+                backend.publish()
+                elapsed = time.monotonic() - loop_started
+                stop_event.wait(max(0.0, period - elapsed))
+                continue
+            if freshness.recovered:
+                if endpoint_deadline is not None:
+                    endpoint_deadline += freshness.pause_s
+                if np.isfinite(tracking_checks_after):
+                    tracking_checks_after += freshness.pause_s
+                _enforce_tracking(
+                    backend,
+                    state,
+                    hand_watchdog,
+                    now=now,
+                    context=f"{context} feedback recovery",
+                )
+                if hand_watchdog is not None:
+                    hand_watchdog.reset(backend)
+                # Resume on the next publisher tick; no path point is consumed
+                # in the recovery iteration.
+                backend.publish()
+                elapsed = time.monotonic() - loop_started
+                stop_event.wait(max(0.0, period - elapsed))
+                continue
         if path_index < chunk.length:
             # Advance exactly once per publisher iteration.  A late loop slows
             # initialization; it never skips or bursts targets to catch up.
@@ -1772,6 +2205,7 @@ def _actuator_main(
     heartbeat: Any,
     urgent_hold_event: Any | None = None,
     command_conditioning: str = "none",
+    authority_ramp_diagnostics: bool = False,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if threading.current_thread() is threading.main_thread():
@@ -1796,8 +2230,10 @@ def _actuator_main(
     tracking_checks_after = float("inf")
     conditioner: XrPolicyOutputConditioner | None = None
     hand_watchdog = HandTrackingWatchdog()
+    hand_freshness_gate = HandStateFreshnessGate()
     try:
         backend = _G1Dex3CommandBackend(simulation, network_interface)
+        backend._authority_ramp_timing_enabled = authority_ramp_diagnostics
         if command_conditioning == "xr":
             conditioner = XrPolicyOutputConditioner()
         _status(status_queue, "ready")
@@ -1817,7 +2253,23 @@ def _actuator_main(
         else:
             return
 
-        backend.prepare_measured_hold()
+        prearm_started = time.monotonic()
+        if authority_ramp_diagnostics:
+            _status(
+                status_queue,
+                "authority_ramp_timing",
+                {"event": "prearm_begin", "elapsed_ms": 0.0},
+            )
+        ramp_reference = backend.prepare_measured_hold()
+        if authority_ramp_diagnostics:
+            _status(
+                status_queue,
+                "authority_ramp_timing",
+                {
+                    "event": "prearm_complete",
+                    "elapsed_ms": (time.monotonic() - prearm_started) * 1e3,
+                },
+            )
 
         if not simulation:
             if not _ramp_real_arm_authority(backend, stop_event, heartbeat):
@@ -1853,7 +2305,14 @@ def _actuator_main(
                 if not np.isfinite(command_age) or not 0.0 <= command_age <= INITIALIZATION_COMMAND_MAX_AGE_S:
                     raise DeploymentError("Initialization command expired before execution")
                 hand_watchdog.reset(backend)
-                state = _wait_for_initialization_start(backend, stop_event, heartbeat, hand_watchdog)
+                state = _wait_for_initialization_start(
+                    backend,
+                    stop_event,
+                    heartbeat,
+                    hand_watchdog,
+                    hand_freshness_gate,
+                    status_queue,
+                )
                 if state is None:
                     _status(status_queue, "initialization_cancelled", initialization.mode)
                     return
@@ -1885,6 +2344,8 @@ def _actuator_main(
                     heartbeat,
                     tracking_checks_after,
                     hand_watchdog,
+                    hand_freshness_gate,
+                    status_queue,
                     context=f"initialization mode={initialization.mode}",
                 )
                 if not initialized:
@@ -1898,7 +2359,29 @@ def _actuator_main(
                 break
 
             state = backend.state()
-            if time.monotonic() >= tracking_checks_after:
+            now = time.monotonic()
+            freshness = _observe_hand_freshness(
+                hand_freshness_gate,
+                state,
+                status_queue,
+                context="pre-initialization hold",
+            )
+            if not freshness.ready:
+                backend.publish()
+                elapsed = time.monotonic() - loop_started
+                stop_event.wait(max(0.0, period - elapsed))
+                continue
+            if freshness.recovered:
+                _set_direct_target(
+                    backend,
+                    conditioner,
+                    hand_watchdog,
+                    state.arm,
+                    backend._left_target,
+                    backend._right_target,
+                )
+                tracking_checks_after = now
+            if now >= tracking_checks_after:
                 _enforce_tracking(
                     backend,
                     state,
@@ -1920,11 +2403,111 @@ def _actuator_main(
         rtc_total_actions = 0
         rtc_action_budget = 0
         urgent_hold_active = False
+        paused_sync_sequence: int | None = None
 
         while not stop_event.is_set():
             loop_started = time.monotonic()
             if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
                 raise DeploymentError("Parent heartbeat expired")
+
+            # Sample freshness before reading a queued plan or advancing the
+            # 30 Hz scheduler.  A short Dex3 gap therefore cannot consume an
+            # action that was never written.
+            state = backend.state()
+            freshness = _observe_hand_freshness(
+                hand_freshness_gate,
+                state,
+                status_queue,
+                context=(
+                    f"active sequence={chunk_sequence} next_action_index={chunk_index} "
+                    f"rtc={rtc_mode} holding={holding}"
+                ),
+            )
+            if freshness.entered:
+                had_sync_motion = chunk is not None and not rtc_mode
+                had_rtc_motion = chunk is not None and rtc_mode
+                if had_sync_motion:
+                    paused_sync_sequence = chunk_sequence
+                if had_rtc_motion:
+                    _status(
+                        status_queue,
+                        "rtc_rejected",
+                        {
+                            "reason": "hand_state_soft_stale",
+                            "sequence": chunk_sequence,
+                            "action_index": chunk_index,
+                            "total_actions": rtc_total_actions,
+                        },
+                    )
+                # Retain the exact targets most recently published.  Resetting
+                # the conditioner to those targets fences every unconsumed
+                # policy command without copying stale hand measurements.
+                frozen_arm = backend._arm_target.copy()
+                frozen_left = backend._left_target.copy()
+                frozen_right = backend._right_target.copy()
+                _set_direct_target(
+                    backend,
+                    conditioner,
+                    hand_watchdog,
+                    frozen_arm,
+                    frozen_left,
+                    frozen_right,
+                )
+                chunk = None
+                chunk_index = 0
+                rtc_mode = False
+                rtc_total_actions = 0
+                rtc_action_budget = 0
+                holding = True
+
+            if not freshness.ready:
+                # STOP/release remains higher priority than recovery.  A STOP
+                # barrier may be queued behind an RTC request, so discard all
+                # queued motion while the independent urgent latch is set and
+                # acknowledge the barrier when it is reached.
+                if urgent_hold_event.is_set():
+                    while True:
+                        try:
+                            paused_command = command_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if paused_command == ("urgent_hold_barrier",):
+                            urgent_hold_event.clear()
+                            urgent_hold_active = False
+                            _status(status_queue, "urgent_holding", last_sequence)
+                            break
+                backend.publish()
+                elapsed = time.monotonic() - loop_started
+                stop_event.wait(max(0.0, period - elapsed))
+                continue
+
+            if freshness.recovered:
+                # Arm feedback remained under its hard 75 ms gate.  Capture
+                # its current pose while preserving the exact frozen Dex3
+                # targets; the discarded plan is never resumed.
+                _enforce_tracking(
+                    backend,
+                    state,
+                    hand_watchdog,
+                    now=time.monotonic(),
+                    context="Dex3 feedback recovery HOLD",
+                )
+                _set_direct_target(
+                    backend,
+                    conditioner,
+                    hand_watchdog,
+                    state.arm,
+                    backend._left_target,
+                    backend._right_target,
+                )
+                tracking_checks_after = time.monotonic() + TRACKING_GRACE_S
+                if paused_sync_sequence is not None:
+                    _status(status_queue, "holding", paused_sync_sequence)
+                    paused_sync_sequence = None
+                backend.publish()
+                elapsed = time.monotonic() - loop_started
+                stop_event.wait(max(0.0, period - elapsed))
+                continue
 
             try:
                 command = command_queue.get_nowait()
@@ -2009,6 +2592,8 @@ def _actuator_main(
                         stop_event,
                         heartbeat,
                         hand_watchdog,
+                        hand_freshness_gate,
+                        status_queue,
                     )
                     if state is None:
                         _status(status_queue, "warm_start_cancelled")
@@ -2037,6 +2622,8 @@ def _actuator_main(
                         heartbeat,
                         tracking_checks_after,
                         hand_watchdog,
+                        hand_freshness_gate,
+                        status_queue,
                         context="policy warm-start",
                     )
                     if not completed:
@@ -2442,7 +3029,6 @@ def _actuator_main(
                         _status(status_queue, "completed", chunk_sequence)
                         chunk = None
 
-            state = backend.state()
             if now >= tracking_checks_after:
                 # In conditioned mode this compares against the last target that
                 # was actually published. The next conditioned command is formed
@@ -2482,15 +3068,38 @@ def _actuator_main(
     except BaseException as exc:
         _status(status_queue, "fault", f"{type(exc).__name__}: {exc}")
     finally:
+        release_ok = backend is None
         if backend is not None:
+            def cleanup_phase(event: str, payload: dict[str, Any]) -> None:
+                _status(
+                    status_queue,
+                    "cleanup_phase",
+                    {"event": event, **payload},
+                )
+
+            cleanup_phase(
+                "cleanup_begin",
+                {"has_published": bool(getattr(backend, "_has_published", True))},
+            )
             try:
-                backend.release()
+                if getattr(backend, "_supports_cleanup_phases", False):
+                    backend.release(cleanup_phase)
+                else:
+                    # Focused fake backends predate structured cleanup phases.
+                    backend.release()
+                release_ok = True
+                _status(status_queue, "release_complete")
             except BaseException as exc:
                 _status(status_queue, "release_failed", f"{type(exc).__name__}: {exc}")
+            cleanup_phase("backend_close_begin", {})
             try:
                 backend.close()
             except BaseException as exc:
-                _status(status_queue, "release_failed", f"close {type(exc).__name__}: {exc}")
+                _status(status_queue, "close_failed", f"{type(exc).__name__}: {exc}")
+            else:
+                cleanup_phase("backend_close_complete", {})
+        elif release_ok:
+            _status(status_queue, "release_complete", "no backend was constructed")
         _status(status_queue, "stopped")
 
 
@@ -2502,6 +3111,7 @@ class SafeG1Dex3Actuator:
         simulation: bool,
         network_interface: str | None,
         command_conditioning: str = "none",
+        authority_ramp_diagnostics: bool = False,
     ):
         if command_conditioning not in COMMAND_CONDITIONING_MODES:
             raise DeploymentError(f"Unknown command conditioning mode {command_conditioning!r}")
@@ -2511,18 +3121,21 @@ class SafeG1Dex3Actuator:
         self._stop_event = context.Event()
         self._urgent_hold_event = context.Event()
         self._heartbeat = context.Value("d", time.monotonic())
+        process_args = (
+            simulation,
+            network_interface,
+            self._command_queue,
+            self._status_queue,
+            self._stop_event,
+            self._heartbeat,
+            self._urgent_hold_event,
+            command_conditioning,
+        )
+        if authority_ramp_diagnostics:
+            process_args += (True,)
         self._process = context.Process(
             target=_actuator_main,
-            args=(
-                simulation,
-                network_interface,
-                self._command_queue,
-                self._status_queue,
-                self._stop_event,
-                self._heartbeat,
-                self._urgent_hold_event,
-                command_conditioning,
-            ),
+            args=process_args,
             name="groot-g1-dex3-actuator",
         )
         self._sequence = 0
@@ -2536,15 +3149,51 @@ class SafeG1Dex3Actuator:
         self._rtc_active = False
         self._rtc_terminal: tuple[str, Any] | None = None
         self._command_conditioning = command_conditioning
+        self._authority_ramp_diagnostics = authority_ramp_diagnostics
+        self._last_authority_ramp_timing: dict[str, Any] | None = None
         self._control_lock = threading.Lock()
         self._immediate_hold_requested = threading.Event()
         self._immediate_release_requested = threading.Event()
         self._stopped_acknowledged = False
+        self._hand_state_paused = False
+        self._last_hand_state_event: Any = None
+        self._release_completed = False
+        self._last_cleanup_phase: Any = None
         self._closed = False
 
     def heartbeat(self) -> None:
         with self._heartbeat.get_lock():
             self._heartbeat.value = time.monotonic()
+
+    def _record_auxiliary_status(self, kind: str, value: Any) -> bool:
+        if kind == "hand_state_pause":
+            self._hand_state_paused = True
+            self._last_hand_state_event = value
+            LOGGER.warning("Actuator paused for short Dex3 feedback loss: %s", value)
+            return True
+        if kind == "hand_state_recovered":
+            self._hand_state_paused = False
+            self._last_hand_state_event = value
+            LOGGER.info("Actuator Dex3 feedback recovered: %s", value)
+            return True
+        if kind == "cleanup_phase":
+            self._last_cleanup_phase = value
+            return True
+        if kind == "release_complete":
+            self._release_completed = True
+            return True
+        return False
+
+    def _wait_for_hand_feedback(self) -> None:
+        """Do not enqueue new motion while the child is in a soft hand pause."""
+
+        self.assert_healthy()
+        if not getattr(self, "_hand_state_paused", False):
+            return
+        self._wait_status(
+            "hand_state_recovered",
+            timeout_s=ACTUATOR_HAND_STATE_MAX_AGE_S + 0.25,
+        )
 
     def _wait_status(self, expected: str, timeout_s: float, payload: Any = None) -> Any:
         deadline = time.monotonic() + timeout_s
@@ -2563,8 +3212,21 @@ class SafeG1Dex3Actuator:
                 continue
             if kind == "fault":
                 raise DeploymentError(f"Actuator fault: {value}")
+            if kind in {"hand_state_pause", "hand_state_recovered"}:
+                self._record_auxiliary_status(kind, value)
+                if kind == expected and (payload is None or value == payload):
+                    return value
+                continue
+            if self._record_auxiliary_status(kind, value):
+                continue
+            if kind == "authority_ramp_timing":
+                self._last_authority_ramp_timing = value
+                LOGGER.warning("ACTUATOR_TIMING %s", _format_authority_ramp_timing(value))
+                continue
             if kind == "release_failed":
                 raise DeploymentError(f"Actuator release failed: {value}")
+            if kind == "close_failed":
+                raise DeploymentError(f"Actuator resource cleanup failed: {value}")
             if kind == "stopped":
                 self._stopped_acknowledged = True
                 if self._immediate_release_requested.is_set():
@@ -2586,6 +3248,16 @@ class SafeG1Dex3Actuator:
                 raise RtcTerminalEvent("complete", value)
             if kind == expected and (payload is None or value == payload):
                 return value
+        if expected == "armed" and self._authority_ramp_diagnostics:
+            heartbeat_age_ms = _heartbeat_age(self._heartbeat) * 1e3
+            LOGGER.error(
+                "ACTUATOR_TIMING event=parent_timeout expected=armed timeout_ms=%.3f "
+                "heartbeat_age_ms=%.3f child_alive=%s last=%s",
+                timeout_s * 1e3,
+                heartbeat_age_ms,
+                self._process.is_alive(),
+                _format_authority_ramp_timing(self._last_authority_ramp_timing or {}),
+            )
         raise TimeoutError(f"Timed out waiting for actuator status '{expected}'")
 
     def start(self) -> None:
@@ -2595,19 +3267,26 @@ class SafeG1Dex3Actuator:
         self._wait_status("ready", timeout_s=8.0)
         self._started = True
 
-    def arm(self) -> None:
+    def arm(self, timeout_s: float | None = None) -> None:
         if not self._started or self._armed:
             raise DeploymentError("Actuator must be started exactly once before arming")
         self.heartbeat()
         self._command_queue.put(("arm",), timeout=0.2)
-        self._wait_status("armed", timeout_s=ARM_AUTHORITY_RAMP_S + 3.0)
+        if timeout_s is None:
+            timeout_s = ARM_AUTHORITY_RAMP_S + 3.0
+        try:
+            self._wait_status("armed", timeout_s=timeout_s)
+        except TimeoutError:
+            # Do not wait for an outer finally block to tell the child to stop.
+            self._stop_event.set()
+            raise
         self._armed = True
 
     def initialize(self, spec: InitializationSpec) -> None:
         if not self._armed or self._initialized:
             raise DeploymentError("Actuator must be armed and not yet initialized")
         validate_initialization_spec(spec)
-        self.assert_healthy()
+        self._wait_for_hand_feedback()
         self.heartbeat()
         try:
             self._command_queue.put(("initialize", time.monotonic(), spec), timeout=0.2)
@@ -2634,10 +3313,14 @@ class SafeG1Dex3Actuator:
         try:
             while True:
                 kind, value = self._status_queue.get_nowait()
+                if self._record_auxiliary_status(kind, value):
+                    continue
                 if kind == "fault":
                     issue = f"fault: {value}"
                 elif kind == "release_failed":
                     issue = f"release failed: {value}"
+                elif kind == "close_failed":
+                    issue = f"resource cleanup failed: {value}"
                 elif kind == "stopped":
                     self._stopped_acknowledged = True
                     if issue is None:
@@ -2674,7 +3357,7 @@ class SafeG1Dex3Actuator:
             right_hand=np.ascontiguousarray(chunk.right_hand[0], dtype=np.float64),
         )
         validate_initialization_spec(target)
-        self.assert_healthy()
+        self._wait_for_hand_feedback()
         self.heartbeat()
         try:
             self._command_queue.put(("warm_start", time.monotonic(), target), timeout=0.2)
@@ -2698,7 +3381,7 @@ class SafeG1Dex3Actuator:
             raise DeploymentError("Actuator must complete initialization before policy actions")
         if self._chunk_in_flight:
             raise DeploymentError("A policy chunk is already in flight")
-        self.assert_healthy()
+        self._wait_for_hand_feedback()
         with self._control_lock:
             immediate = self.immediate_control_requested()
             if immediate is not None:
@@ -2735,7 +3418,7 @@ class SafeG1Dex3Actuator:
             validate_action_chunk_limits(plan)
         else:
             validate_action_chunk(plan, plan.arm[0], plan.left_hand[0], plan.right_hand[0])
-        self.assert_healthy()
+        self._wait_for_hand_feedback()
         with self._control_lock:
             immediate = self.immediate_control_requested()
             if immediate is not None:
@@ -2858,10 +3541,14 @@ class SafeG1Dex3Actuator:
         try:
             while True:
                 kind, value = self._status_queue.get_nowait()
+                if self._record_auxiliary_status(kind, value):
+                    continue
                 if kind == "fault":
                     raise DeploymentError(f"Actuator fault: {value}")
                 if kind == "release_failed":
                     raise DeploymentError(f"Actuator release failed: {value}")
+                if kind == "close_failed":
+                    raise DeploymentError(f"Actuator resource cleanup failed: {value}")
                 if kind == "stopped":
                     self._stopped_acknowledged = True
                     if self._immediate_release_requested.is_set():
@@ -2964,16 +3651,23 @@ class SafeG1Dex3Actuator:
                 if not self._process.is_alive():
                     raise DeploymentError("Actuator process exited unexpectedly")
                 continue
+            if self._record_auxiliary_status(kind, value):
+                continue
             if kind == "fault":
                 raise DeploymentError(f"Actuator fault: {value}")
             if kind == "release_failed":
                 raise DeploymentError(f"Actuator release failed: {value}")
+            if kind == "close_failed":
+                raise DeploymentError(f"Actuator resource cleanup failed: {value}")
             if kind == "stopped":
                 self._stopped_acknowledged = True
                 if self._immediate_release_requested.is_set():
                     return "release"
                 raise DeploymentError("Actuator stopped before the action chunk completed")
             if kind == "holding" and value == sequence:
+                # Soft-stale synchronous HOLD is emitted only after the five
+                # distinct-sample recovery gate has completed.
+                self._hand_state_paused = False
                 self._immediate_hold_requested.clear()
                 self._holding = True
                 self._warm_started = False
@@ -3002,7 +3696,7 @@ class SafeG1Dex3Actuator:
             raise DeploymentError("Cannot enter HOLD before the current action chunk completes")
         if self._holding:
             return
-        self.assert_healthy()
+        self._wait_for_hand_feedback()
         self.heartbeat()
         try:
             self._command_queue.put(("hold", time.monotonic()), timeout=0.2)
@@ -3024,39 +3718,88 @@ class SafeG1Dex3Actuator:
             self._closed = True
             return
         forced_kill = False
-        self._process.join(timeout=ARM_RELEASE_RAMP_S + 2.0)
+        runtime_faults: list[str] = []
+        release_issues: list[str] = []
+        close_issues: list[str] = []
+        stopped_acknowledged = getattr(self, "_stopped_acknowledged", False)
+
+        def consume(kind: str, value: Any) -> None:
+            nonlocal stopped_acknowledged
+            if self._record_auxiliary_status(kind, value):
+                return
+            if kind == "stopped":
+                stopped_acknowledged = True
+            elif kind == "release_failed":
+                release_issues.append(str(value))
+            elif kind == "close_failed":
+                close_issues.append(str(value))
+            elif kind == "fault":
+                runtime_faults.append(str(value))
+            elif kind == "authority_ramp_timing":
+                self._last_authority_ramp_timing = value
+                LOGGER.warning("ACTUATOR_TIMING %s", _format_authority_ramp_timing(value))
+
+        started = time.monotonic()
+        soft_deadline = started + ACTUATOR_RELEASE_SOFT_TIMEOUT_S
+        hard_deadline = started + ACTUATOR_RELEASE_HARD_TIMEOUT_S
+        soft_warning_emitted = False
+        while self._process.is_alive() and time.monotonic() < hard_deadline:
+            try:
+                while True:
+                    consume(*self._status_queue.get_nowait())
+            except queue.Empty:
+                pass
+            now = time.monotonic()
+            if now >= soft_deadline and not soft_warning_emitted:
+                soft_warning_emitted = True
+                LOGGER.critical(
+                    "Actuator release exceeded %.1fs soft deadline; waiting to %.1fs hard deadline; last phase=%s",
+                    ACTUATOR_RELEASE_SOFT_TIMEOUT_S,
+                    ACTUATOR_RELEASE_HARD_TIMEOUT_S,
+                    self._last_cleanup_phase,
+                )
+            self._process.join(timeout=min(0.05, max(0.0, hard_deadline - now)))
         if self._process.is_alive():
-            LOGGER.critical("Actuator did not acknowledge release; requesting SIGTERM shutdown")
-            self._process.terminate()
-            self._process.join(timeout=ARM_RELEASE_RAMP_S + 2.0)
-        if self._process.is_alive():
-            LOGGER.critical("Actuator is unresponsive; forcing child process exit")
+            LOGGER.critical(
+                "Actuator is unresponsive at hard release deadline; forcing child exit; last phase=%s",
+                self._last_cleanup_phase,
+            )
             forced_kill = True
             self._process.kill()
             self._process.join(timeout=1.0)
         self._closed = True
-        issues = []
-        if self._process.is_alive():
-            issues.append("actuator process remains alive after forced shutdown")
-        stopped_acknowledged = getattr(self, "_stopped_acknowledged", False)
+
+        # Drain terminal queue records after the multiprocessing feeder has
+        # observed child exit.
         deadline = time.monotonic() + 0.5
         while time.monotonic() < deadline:
             try:
                 kind, value = self._status_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
-            if kind == "stopped":
-                stopped_acknowledged = True
-                break
-            elif kind == "release_failed":
-                issues.append(f"release failed: {value}")
-            elif kind == "fault":
-                issues.append(f"actuator fault: {value}")
+            consume(kind, value)
+
+        if self._process.is_alive():
+            release_issues.append("actuator process remains alive after forced shutdown")
+        if not getattr(self, "_release_completed", False):
+            release_issues.append("no local release-complete acknowledgment was received")
         if not stopped_acknowledged:
-            issues.append("no orderly stopped acknowledgment was received")
+            release_issues.append("no orderly stopped acknowledgment was received")
         if forced_kill:
-            issues.append("actuator required SIGKILL")
+            release_issues.append("actuator required SIGKILL")
         if self._process.exitcode not in (None, 0):
-            issues.append(f"actuator exited with code {self._process.exitcode}")
-        if issues:
-            raise DeploymentError("DDS release is unconfirmed: " + "; ".join(issues))
+            release_issues.append(f"actuator exited with code {self._process.exitcode}")
+        if release_issues:
+            detail = "; ".join(release_issues)
+            last_cleanup_phase = getattr(self, "_last_cleanup_phase", None)
+            if last_cleanup_phase is not None:
+                detail += f"; last cleanup phase={last_cleanup_phase}"
+            raise DeploymentError("DDS release is unconfirmed: " + detail)
+        if close_issues:
+            raise DeploymentError(
+                "DDS release completed, but actuator resource cleanup failed: " + "; ".join(close_issues)
+            )
+        if runtime_faults:
+            raise DeploymentError(
+                "Actuator fault; local DDS release completed: " + "; ".join(runtime_faults)
+            )

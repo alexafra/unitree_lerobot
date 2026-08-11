@@ -2062,7 +2062,12 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 mode_machine=5,
                 motor_state=[SimpleNamespace(q=0.0, dq=0.0) for _ in range(14)],
             )
-            hand_message = SimpleNamespace(motor_state=[SimpleNamespace(q=0.0) for _ in range(7)])
+            # A real Dex3 publisher that reports all seven q values as exact
+            # zero is an offline/default placeholder and is intentionally not
+            # accepted as a fresh measured state.
+            hand_message = SimpleNamespace(
+                motor_state=[SimpleNamespace(q=0.1 if index == 0 else 0.0) for index in range(7)]
+            )
             FakeSubscriber.instances["rt/lowstate"].handler(arm_message)
             FakeSubscriber.instances["rt/dex3/left/state"].handler(hand_message)
             FakeSubscriber.instances["rt/dex3/right/state"].handler(hand_message)
@@ -2070,6 +2075,15 @@ class GrootG1DeploymentTests(unittest.TestCase):
             state = reader.latest()
             self.assertEqual(state.mode_machine, 5)
             np.testing.assert_array_equal(state.arm, np.zeros(14))
+
+            last_left_update = reader._updated_at["left"]
+            zero_hand_message = SimpleNamespace(
+                motor_state=[SimpleNamespace(q=0.0) for _ in range(7)]
+            )
+            FakeSubscriber.instances["rt/dex3/left/state"].handler(zero_hand_message)
+            self.assertEqual(reader._updated_at["left"], last_left_update)
+            self.assertEqual(reader._rejected_zero_hand_frames["left"], 1)
+            np.testing.assert_array_equal(reader.latest().left_hand, state.left_hand)
             reader.close()
 
         self.assertTrue(all(item.closed for item in FakeSubscriber.instances.values()))

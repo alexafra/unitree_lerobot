@@ -12,3 +12,14 @@ data/
 ./data
 laptop_latency_diagnostic_h8_c100.log
 unitree_lerobot/cam_config_client.yaml
+dex3_hand_status_probe_10s.log
+.gitignore
+dds_state_profile_20s.log
+unitree_lerobot/cam_config_client.yaml
+unitree_lerobot/cam_config_client.yaml
+unitree_lerobot/cam_config_client.yaml
+dds_state_profile_300s.log
+g1_authority_ramp_debug.log
+g1_authority_ramp_debug.log
+g1_authority_ramp_debug.log
+g1_authority_ramp_debug.log
