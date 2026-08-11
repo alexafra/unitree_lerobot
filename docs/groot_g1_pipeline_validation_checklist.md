@@ -468,10 +468,10 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
     --max-chunks 1
 ```
 
-Type `SIMULATE`; at the `RUN` prompt press Ctrl-C. Next change to
-`--initialization xr-home`, type `SIMULATE` and `INITIALIZE`, then press Ctrl-C at `RUN`.
-Only after both cleanup paths pass should the simulator execute a policy action by typing
-`RUN`.
+Press `r` at the SIMULATE gate; at the RUN gate press Ctrl-C. Next change to
+`--initialization xr-home`, press `r` at the SIMULATE and INITIALIZE gates, then press
+Ctrl-C at RUN. Only after both cleanup paths pass should the simulator execute a policy
+action by pressing `r` at RUN. None of these gates requires Enter.
 
 Then expand deliberately:
 
@@ -522,12 +522,13 @@ Then repeat in isolated IsaacLab with `--sim --actuate
   manufacture an extra chunk; `max-chunks=20` budgets exactly 160 actions.
 - [ ] At each handoff the child continues with `B[k:]`, where `k` is measured after
   observation capture and inference. No already-consumed prefix is replayed.
-- [ ] The old-commanded-target to `B[k]` boundary and every remaining within-plan step
-  retain the normal joint/rate checks.
+- [ ] With default `--command-conditioning xr`, raw `B` remains finite/in-range and the
+  persistent 100 Hz conditioner makes every final outgoing boundary pass the normal
+  joint/step checks. With `none`, the raw old-target to `B[k]` check remains hard.
 - [ ] A delayed reply that exhausts the overlap causes powered HOLD, not stale
   continuation or fallback to independent chunks.
 - [ ] A stale generation is discarded and causes powered HOLD.
-- [ ] `h` during inference holds, drains/discards that response, and a second goal repeats
+- [ ] `s` during inference stops, drains/discards that response, and a second goal repeats
   reset plus the normal warm-start before RTC restarts.
 - [ ] `q` and Ctrl-C take the existing orderly release path; they never wait indefinitely
   for a policy reply.
@@ -623,7 +624,7 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
     2>&1 | tee real_measured_hold.log
 ```
 
-Type `ACTUATE`. At the `RUN` prompt, press Ctrl-C rather than typing `RUN`. This tests
+Press `r` at the ACTUATE gate. At RUN, press Ctrl-C rather than pressing `r`. This tests
 fresh-state qualification, measured hold, authority ramp and orderly release without any
 policy action.
 
@@ -650,8 +651,8 @@ Use the same command as the previous gate with:
 --initialization xr-home
 ```
 
-Type `ACTUATE`, then `INITIALIZE`. After convergence, visually inspect the robot. At the
-`RUN` prompt press Ctrl-C, so no policy action is executed.
+Press `r` at ACTUATE and then at INITIALIZE. After convergence, visually inspect the
+robot. At RUN press Ctrl-C instead of `r`, so no policy action is executed.
 
 - [ ] Initialization begins from the already-published hold target without a jump.
 - [ ] Motion is slow, smooth and in the expected direction for every arm/hand joint.
@@ -714,9 +715,9 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
     2>&1 | tee real_policy_h1_c1.log
 ```
 
-Type `ACTUATE`, `INITIALIZE`, then `RUN` only after visual inspection. If the approved
-starting pose was established manually, substitute `--initialization measured`, omit the
-pose-file flag, and there will be no `INITIALIZE` prompt.
+Press `r` at ACTUATE, INITIALIZE, and then RUN only after each displayed inspection. If
+the approved starting pose was established manually, substitute `--initialization
+measured`, omit the pose-file flag, and there will be no INITIALIZE gate.
 
 - [ ] First policy target direction agrees with the shadow prediction and intended task.
 - [ ] No discontinuity, limit clipping or unexpected uncommanded joint movement.

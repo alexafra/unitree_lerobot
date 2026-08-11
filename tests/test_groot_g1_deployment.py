@@ -23,14 +23,18 @@ import numpy as np
 
 from unitree_lerobot.eval_robot.eval_groot_g1 import (
     _active_command_action,
+    _confirm_before_authority,
     _confirm_while_armed,
     _confirm_goal_transition,
     _OperatorTerminal,
+    _readline_before_authority,
     _readline_while_armed,
+    _run_blocking_motion_with_immediate_release,
     _select_next_goal_while_holding,
     OperatorRelease,
     build_parser,
     confirm_custom_goal,
+    confirm_actuation,
     run as run_groot,
     select_instruction,
     show_camera_preview,
@@ -77,12 +81,17 @@ except ModuleNotFoundError as exc:
 else:
     image_client_import_error_message = ""
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
+    ARM_RELEASE_RAMP_S,
     CameraImages,
     G1Dex3StateReader,
+    ImmediateControlEvent,
     INITIALIZATION_MAX_ARM_STEP_RAD,
     INITIALIZATION_MAX_HAND_STEP_RAD,
     INITIALIZATION_MIN_MOVE_S,
+    MAX_ARM_DQ_RAD_S,
     MAX_ARM_TRACKING_ERROR_RAD,
+    MAX_CONDITIONED_ARM_STEP_RAD,
+    MAX_CONDITIONED_HAND_STEP_RAD,
     MAX_HAND_TRACKING_ERROR_RAD,
     PUBLISH_HZ,
     RobotState,
@@ -207,12 +216,12 @@ class GrootG1DeploymentTests(unittest.TestCase):
         with mock.patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["--task", "pick-red-cup", "--custom-goal", "another goal"])
 
-        with mock.patch("builtins.input", return_value="YES"):
+        with mock.patch.object(sys, "stdin", io.StringIO("YES\n")):
             confirm_custom_goal("move the cup beside the cylinder")
         for response in ("yes", "NO", ""):
             with (
                 self.subTest(response=response),
-                mock.patch("builtins.input", return_value=response),
+                mock.patch.object(sys, "stdin", io.StringIO(response + "\n")),
                 self.assertRaisesRegex(DeploymentError, "not confirmed"),
             ):
                 confirm_custom_goal("move the cup beside the cylinder")
@@ -252,14 +261,24 @@ class GrootG1DeploymentTests(unittest.TestCase):
         ):
             show_camera_preview(np.zeros((1, 1, 3), dtype=np.uint8), None)
 
-    def test_deployment_safety_defaults_are_not_relaxed(self):
-        self.assertEqual(MAX_ARM_STEP_RAD, 0.05)
-        self.assertEqual(MAX_HAND_STEP_RAD, 0.10)
+    def test_deployment_safety_values_match_reviewed_local_configuration(self):
+        # Relaxed local values remain pinned deliberately. CHANGEDSAFETY comments beside
+        # their definitions preserve the original adapter defaults; this test is not a
+        # hardware-safety qualification.
+        self.assertEqual(MAX_ARM_STEP_RAD, 0.10)
+        self.assertEqual(MAX_HAND_STEP_RAD, 0.60)
         self.assertEqual(JOINT_LIMIT_MARGIN_RAD, 0.03)
         self.assertEqual(HAND_LIMIT_TOLERANCE_RAD, 0.002)
         self.assertEqual(MEASURED_LIMIT_TOLERANCE_RAD, 0.01)
+        self.assertEqual(ARM_RELEASE_RAMP_S, 1.5)
+        self.assertEqual(MAX_ARM_DQ_RAD_S, 6.0)
         self.assertEqual(MAX_ARM_TRACKING_ERROR_RAD, 0.35)
-        self.assertEqual(MAX_HAND_TRACKING_ERROR_RAD, 0.50)
+        self.assertEqual(MAX_HAND_TRACKING_ERROR_RAD, 1.50)
+        self.assertAlmostEqual(MAX_CONDITIONED_ARM_STEP_RAD, 0.03)
+        np.testing.assert_allclose(
+            MAX_CONDITIONED_HAND_STEP_RAD,
+            np.array([0.06857, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12]),
+        )
 
     def _write_initial_pose(self, directory: str, **overrides):
         payload = {
@@ -676,7 +695,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 f"{module}.confirm_policy_warm_start",
                 side_effect=lambda *_args: events.append("confirm.WARMUP"),
             ),
-            mock.patch(f"{module}.confirm_policy_continue", side_effect=lambda *_args: events.append("confirm.CONTINUE")),
+            mock.patch(
+                f"{module}.confirm_policy_continue", side_effect=lambda *_args: events.append("confirm.CONTINUE")
+            ),
         ):
             run_groot(args)
 
@@ -928,14 +949,102 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
                 self.assertEqual(checks, expected_checks)
 
-    def test_armed_confirmation_keeps_watchdog_alive_and_accepts_only_exact_input(self):
+    def test_actuation_confirmation_uses_r_and_cancels_on_s_or_q(self):
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        with (
+            mock.patch.object(sys.stdin, "isatty", return_value=True),
+            mock.patch(f"{module}._confirm_before_authority", return_value="continue") as confirm,
+            mock.patch("builtins.print"),
+        ):
+            confirm_actuation(True, "pick-red-cup", TASKS["pick-red-cup"])
+        confirm.assert_called_once()
+
+        with (
+            mock.patch.object(sys.stdin, "isatty", return_value=True),
+            mock.patch(f"{module}._confirm_before_authority", return_value="stop"),
+            mock.patch("builtins.print"),
+            self.assertRaises(OperatorRelease),
+        ):
+            confirm_actuation(True, "pick-red-cup", TASKS["pick-red-cup"])
+
+        with (
+            mock.patch.object(sys.stdin, "isatty", return_value=True),
+            mock.patch(f"{module}._confirm_before_authority", side_effect=OperatorRelease),
+            mock.patch("builtins.print"),
+            self.assertRaises(OperatorRelease),
+        ):
+            confirm_actuation(True, "pick-red-cup", TASKS["pick-red-cup"])
+
+    def test_operator_cancellation_before_actuation_never_constructs_actuator(self):
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        contract = SimpleNamespace(
+            action_horizon=16,
+            video_keys=COLOUR_VIDEO_KEYS,
+            requires_depth=False,
+        )
+        policy = SimpleNamespace(
+            ping=lambda: True,
+            get_modality_config=lambda: {},
+            get_policy_metadata=lambda: {},
+            reset=lambda: None,
+            close=mock.Mock(),
+        )
+        reader = SimpleNamespace(close=mock.Mock())
+        camera = SimpleNamespace(
+            config={
+                "head_camera": {
+                    "type": "fake",
+                    "image_shape": [480, 640],
+                    "binocular": False,
+                    "fps": 30,
+                }
+            },
+            close=mock.Mock(),
+        )
+        args = argparse.Namespace(
+            task="pick-red-cup",
+            custom_goal=None,
+            policy_host="127.0.0.1",
+            policy_port=5555,
+            image_host="camera",
+            network_interface=None,
+            execution_horizon=1,
+            max_chunks=1,
+            initialization="measured",
+            initial_pose_file=None,
+            policy_warm_start=True,
+            show_camera=False,
+            sim=True,
+            actuate=True,
+            allow_unqualified_real=False,
+            confirm_sim_network_isolated=True,
+        )
+        actuator_factory = mock.Mock()
+        with (
+            mock.patch(f"{module}.Gr00tClient", return_value=policy),
+            mock.patch(f"{module}.validate_model_contract", return_value=contract),
+            mock.patch(f"{module}.validate_policy_metadata", return_value=None),
+            mock.patch(f"{module}.initialize_dds"),
+            mock.patch(f"{module}.G1Dex3StateReader", return_value=reader),
+            mock.patch(f"{module}.TeleimagerCamera", return_value=camera),
+            mock.patch(f"{module}.infer_chunk", return_value=(SimpleNamespace(length=1), 0.01)),
+            mock.patch(f"{module}.chunk_delta_summary", return_value="safe"),
+            mock.patch(f"{module}.confirm_actuation", side_effect=OperatorRelease),
+            mock.patch(f"{module}.SafeG1Dex3Actuator", actuator_factory),
+            self.assertRaises(OperatorRelease),
+        ):
+            run_groot(args)
+
+        actuator_factory.assert_not_called()
+
+    def test_armed_confirmation_keeps_watchdog_alive_and_accepts_only_three_key_input(self):
         actuator = SimpleNamespace(
             heartbeat=mock.Mock(),
             assert_healthy=mock.Mock(),
             hold=mock.Mock(),
         )
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
-        stdin = io.StringIO("RUN\n")
+        stdin = io.StringIO("r\n")
         with (
             mock.patch.object(sys, "stdin", stdin),
             mock.patch(
@@ -949,7 +1058,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertEqual(actuator.heartbeat.call_count, 2)
         self.assertEqual(actuator.assert_healthy.call_count, 2)
 
-        stdin = io.StringIO("s\nRUN\n")
+        stdin = io.StringIO("s\nr\n")
         with (
             mock.patch.object(sys, "stdin", stdin),
             mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
@@ -971,9 +1080,56 @@ class GrootG1DeploymentTests(unittest.TestCase):
             mock.patch.object(sys, "stdin", stdin),
             mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
             mock.patch("builtins.print"),
-            self.assertRaisesRegex(DeploymentError, "Expected RUN"),
+            self.assertRaisesRegex(DeploymentError, "Expected single-key r"),
         ):
             _confirm_while_armed(actuator, "ready", "RUN")
+
+    def test_pre_initialization_stop_stays_at_gate_until_r_without_calling_hold(self):
+        master_fd, slave_fd = pty.openpty()
+        stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+        original = termios.tcgetattr(slave_fd)
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        prompt = "Press r to INITIALIZE (no Enter); s STOP; q release: "
+        keys_sent = False
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+            hold=mock.Mock(),
+            request_immediate_hold=mock.Mock(side_effect=DeploymentError("actuator child is not started")),
+            request_immediate_release=mock.Mock(),
+        )
+
+        def write_stop_then_continue(*args, **_kwargs):
+            nonlocal keys_sent
+            if args and args[0] == prompt and not keys_sent:
+                keys_sent = True
+                os.write(master_fd, b"sr")
+
+        try:
+            with (
+                mock.patch.object(sys, "stdin", stdin),
+                mock.patch("builtins.print", side_effect=write_stop_then_continue) as printed,
+                mock.patch(f"{module}._finish_operator_stop") as finish_stop,
+            ):
+                _confirm_while_armed(
+                    actuator,
+                    "Initialization gate",
+                    "INITIALIZE",
+                    stop_is_already_held=True,
+                )
+
+            prompt_calls = [call for call in printed.call_args_list if call.args == (prompt,)]
+            self.assertTrue(keys_sent)
+            self.assertEqual(len(prompt_calls), 2)
+            actuator.request_immediate_hold.assert_called_once_with()
+            actuator.hold.assert_not_called()
+            finish_stop.assert_not_called()
+            actuator.request_immediate_release.assert_not_called()
+            self.assertEqual(termios.tcgetattr(slave_fd), original)
+        finally:
+            stdin.close()
+            os.close(master_fd)
+            os.close(slave_fd)
 
     def test_armed_confirmation_timeout_releases_control_flow_without_reading_stdin(self):
         actuator = SimpleNamespace(
@@ -1013,6 +1169,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             (b"S", "hold", "request_immediate_hold"),
             (b"q", "release", "request_immediate_release"),
             (b"Q", "release", "request_immediate_release"),
+            (b"\x11", "release", "request_immediate_release"),
         ):
             with self.subTest(key=key):
                 master_fd, slave_fd = pty.openpty()
@@ -1078,7 +1235,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             os.close(master_fd)
             os.close(slave_fd)
 
-    def test_armed_line_prompt_uses_shift_q_to_insert_literal_q_in_goal_text(self):
+    def test_armed_line_prompt_uses_alt_q_to_insert_literal_lowercase_q(self):
         master_fd, slave_fd = pty.openpty()
         stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
         original = termios.tcgetattr(slave_fd)
@@ -1090,9 +1247,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
         )
         try:
             with mock.patch.object(sys, "stdin", stdin), mock.patch("builtins.print"):
-                # Bare q is the global release key. Shift-Q escapes a literal
-                # lowercase q while keeping the remainder ordinary line input.
-                os.write(master_fd, b"Quickly hold the object beside it\n")
+                # Bare q/Q are global release keys. Alt+q (ESC q) escapes a
+                # literal lowercase q while keeping the rest ordinary input.
+                os.write(master_fd, b"\x1bquickly hold the object beside it\n")
                 response = _readline_while_armed(actuator, "Next goal> ", timeout_s=1.0)
 
             self.assertEqual(response, "quickly hold the object beside it")
@@ -1104,9 +1261,272 @@ class GrootG1DeploymentTests(unittest.TestCase):
             os.close(master_fd)
             os.close(slave_fd)
 
+    def test_armed_line_prompt_uses_alt_shift_q_to_insert_literal_uppercase_q(self):
+        master_fd, slave_fd = pty.openpty()
+        stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+        original = termios.tcgetattr(slave_fd)
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+            request_immediate_hold=mock.Mock(),
+            request_immediate_release=mock.Mock(),
+        )
+        try:
+            with mock.patch.object(sys, "stdin", stdin), mock.patch("builtins.print"):
+                os.write(master_fd, b"\x1bQuick\n")
+                response = _readline_while_armed(actuator, "Next goal> ", timeout_s=1.0)
+
+            self.assertEqual(response, "Quick")
+            actuator.request_immediate_hold.assert_not_called()
+            actuator.request_immediate_release.assert_not_called()
+            self.assertEqual(termios.tcgetattr(slave_fd), original)
+        finally:
+            stdin.close()
+            os.close(master_fd)
+            os.close(slave_fd)
+
+    def test_armed_line_prompt_expired_standalone_escape_cannot_suppress_q_release(self):
+        master_fd, slave_fd = pty.openpty()
+        stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+        original = termios.tcgetattr(slave_fd)
+        prompt_seen = threading.Event()
+        writer_finished = threading.Event()
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+            request_immediate_hold=mock.Mock(),
+            request_immediate_release=mock.Mock(),
+        )
+
+        def write_expired_escape_then_q():
+            if prompt_seen.wait(timeout=1.0):
+                os.write(master_fd, b"\x1b")
+                time.sleep(0.15)  # Longer than the 0.1 s Alt-prefix window.
+                os.write(master_fd, b"q")
+            writer_finished.set()
+
+        def mark_prompt(*args, **_kwargs):
+            if args and args[0] == "Next goal> ":
+                prompt_seen.set()
+
+        writer = threading.Thread(target=write_expired_escape_then_q, daemon=True)
+        try:
+            writer.start()
+            with (
+                mock.patch.object(sys, "stdin", stdin),
+                mock.patch("builtins.print", side_effect=mark_prompt),
+            ):
+                response = _readline_while_armed(actuator, "Next goal> ", timeout_s=1.0)
+
+            writer.join(timeout=1.0)
+            self.assertTrue(writer_finished.is_set())
+            self.assertEqual(response, "q")
+            actuator.request_immediate_release.assert_called_once_with()
+            actuator.request_immediate_hold.assert_not_called()
+            self.assertEqual(termios.tcgetattr(slave_fd), original)
+        finally:
+            writer.join(timeout=1.0)
+            stdin.close()
+            os.close(master_fd)
+            os.close(slave_fd)
+
+    def test_pre_authority_release_keys_need_no_enter_and_restore_tty(self):
+        for key in (b"q", b"Q"):
+            with self.subTest(key=key):
+                master_fd, slave_fd = pty.openpty()
+                stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+                original = termios.tcgetattr(slave_fd)
+                try:
+                    with (
+                        mock.patch.object(sys, "stdin", stdin),
+                        mock.patch("builtins.print"),
+                        self.assertRaises(OperatorRelease),
+                    ):
+                        os.write(master_fd, key)
+                        _readline_before_authority("Task number: ")
+
+                    self.assertEqual(termios.tcgetattr(slave_fd), original)
+                finally:
+                    stdin.close()
+                    os.close(master_fd)
+                    os.close(slave_fd)
+
+    def test_pre_authority_confirmation_uses_three_keys_without_enter(self):
+        for key, expected in (
+            (b"r", "continue"),
+            (b"R", "continue"),
+            (b"s", "stop"),
+            (b"S", "stop"),
+        ):
+            with self.subTest(key=key):
+                master_fd, slave_fd = pty.openpty()
+                stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+                original = termios.tcgetattr(slave_fd)
+
+                def write_key_when_prompt_is_ready(*args, **_kwargs):
+                    if args and args[0] == "Confirm> ":
+                        os.write(master_fd, key)
+
+                try:
+                    with (
+                        mock.patch.object(sys, "stdin", stdin),
+                        mock.patch(
+                            "builtins.print",
+                            side_effect=write_key_when_prompt_is_ready,
+                        ),
+                    ):
+                        started_at = time.monotonic()
+                        response = _confirm_before_authority("Confirm> ")
+                        elapsed = time.monotonic() - started_at
+
+                    self.assertEqual(response, expected)
+                    self.assertLess(elapsed, 0.25)
+                    self.assertEqual(termios.tcgetattr(slave_fd), original)
+                finally:
+                    stdin.close()
+                    os.close(master_fd)
+                    os.close(slave_fd)
+
+    def test_pre_authority_confirmation_release_keys_need_no_enter(self):
+        for key in (b"q", b"Q", b"\x11"):
+            with self.subTest(key=key):
+                master_fd, slave_fd = pty.openpty()
+                stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+                original = termios.tcgetattr(slave_fd)
+
+                def write_key_when_prompt_is_ready(*args, **_kwargs):
+                    if args and args[0] == "Confirm> ":
+                        os.write(master_fd, key)
+
+                try:
+                    with (
+                        mock.patch.object(sys, "stdin", stdin),
+                        mock.patch(
+                            "builtins.print",
+                            side_effect=write_key_when_prompt_is_ready,
+                        ),
+                        self.assertRaises(OperatorRelease),
+                    ):
+                        _confirm_before_authority("Confirm> ")
+
+                    self.assertEqual(termios.tcgetattr(slave_fd), original)
+                finally:
+                    stdin.close()
+                    os.close(master_fd)
+                    os.close(slave_fd)
+
+    def test_rapid_rq_releases_before_actuator_start_can_run(self):
+        master_fd, slave_fd = pty.openpty()
+        stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+        original = termios.tcgetattr(slave_fd)
+        actuator = SimpleNamespace(
+            start=mock.Mock(),
+            request_immediate_hold=mock.Mock(),
+            request_immediate_release=mock.Mock(),
+        )
+
+        def write_rapid_rq_when_prompt_is_ready(*args, **_kwargs):
+            if args and args[0] == "Confirm> ":
+                os.write(master_fd, b"rq")
+
+        try:
+            with (
+                mock.patch.object(sys, "stdin", stdin),
+                mock.patch(
+                    "builtins.print",
+                    side_effect=write_rapid_rq_when_prompt_is_ready,
+                ),
+            ):
+                self.assertEqual(_confirm_before_authority("Confirm> "), "continue")
+                with self.assertRaises(OperatorRelease):
+                    _run_blocking_motion_with_immediate_release(actuator, actuator.start)
+
+            # The confirmation reader must preserve the queued q, and the
+            # blocking-motion guard must drain it synchronously before start.
+            actuator.start.assert_not_called()
+            actuator.request_immediate_release.assert_called_once_with()
+            actuator.request_immediate_hold.assert_not_called()
+            self.assertEqual(termios.tcgetattr(slave_fd), original)
+        finally:
+            stdin.close()
+            os.close(master_fd)
+            os.close(slave_fd)
+
+    def test_pre_authority_ctrl_q_releases_after_raw_prompt_without_enter(self):
+        master_fd, slave_fd = pty.openpty()
+        stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+        original = termios.tcgetattr(slave_fd)
+
+        def write_ctrl_q_when_prompt_is_ready(*args, **_kwargs):
+            if args and args[0] == "Task number: ":
+                os.write(master_fd, b"\x11")
+
+        try:
+            with (
+                mock.patch.object(sys, "stdin", stdin),
+                mock.patch("builtins.print", side_effect=write_ctrl_q_when_prompt_is_ready),
+                self.assertRaises(OperatorRelease),
+            ):
+                _readline_before_authority("Task number: ")
+
+            self.assertEqual(termios.tcgetattr(slave_fd), original)
+        finally:
+            stdin.close()
+            os.close(master_fd)
+            os.close(slave_fd)
+
+    def test_blocking_motion_release_keys_need_no_enter_and_restore_tty(self):
+        for key in (b"q", b"Q", b"\x11"):
+            with self.subTest(key=key):
+                master_fd, slave_fd = pty.openpty()
+                stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+                original = termios.tcgetattr(slave_fd)
+                operation_started = threading.Event()
+                release_requested = threading.Event()
+                writer_finished = threading.Event()
+                actuator = SimpleNamespace(
+                    request_immediate_hold=mock.Mock(),
+                    request_immediate_release=mock.Mock(side_effect=lambda: release_requested.set()),
+                    immediate_control_requested=mock.Mock(
+                        side_effect=lambda: "release" if release_requested.is_set() else None
+                    ),
+                )
+
+                def blocking_operation():
+                    operation_started.set()
+                    if not release_requested.wait(timeout=1.0):
+                        raise AssertionError("q did not interrupt the blocking operation")
+                    raise ImmediateControlEvent("release")
+
+                def write_during_operation():
+                    if operation_started.wait(timeout=1.0):
+                        os.write(master_fd, key)
+                    writer_finished.set()
+
+                writer = threading.Thread(target=write_during_operation, daemon=True)
+                try:
+                    writer.start()
+                    with (
+                        mock.patch.object(sys, "stdin", stdin),
+                        self.assertRaises(OperatorRelease),
+                    ):
+                        _run_blocking_motion_with_immediate_release(actuator, blocking_operation)
+
+                    writer.join(timeout=1.0)
+                    self.assertTrue(writer_finished.is_set())
+                    actuator.request_immediate_release.assert_called_once_with()
+                    actuator.request_immediate_hold.assert_not_called()
+                    self.assertEqual(termios.tcgetattr(slave_fd), original)
+                finally:
+                    writer.join(timeout=1.0)
+                    stdin.close()
+                    os.close(master_fd)
+                    os.close(slave_fd)
+
     def test_armed_line_prompt_global_keys_do_not_require_enter(self):
         for key, expected, method_name in (
             (b"q", "q", "request_immediate_release"),
+            (b"Q", "q", "request_immediate_release"),
             (b"S", "stop", "request_immediate_hold"),
         ):
             with self.subTest(key=key):
@@ -1132,6 +1552,209 @@ class GrootG1DeploymentTests(unittest.TestCase):
                     os.close(master_fd)
                     os.close(slave_fd)
 
+    def test_armed_confirmation_mode_uses_three_keys_without_enter(self):
+        cases = (
+            (b"r", "continue", None),
+            (b"R", "continue", None),
+            (b"s", "stop", "request_immediate_hold"),
+            (b"S", "stop", "request_immediate_hold"),
+            (b"q", "q", "request_immediate_release"),
+            (b"Q", "q", "request_immediate_release"),
+            (b"\x11", "q", "request_immediate_release"),
+        )
+        for key, expected, expected_method in cases:
+            with self.subTest(key=key):
+                master_fd, slave_fd = pty.openpty()
+                stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+                original = termios.tcgetattr(slave_fd)
+                actuator = SimpleNamespace(
+                    heartbeat=mock.Mock(),
+                    assert_healthy=mock.Mock(),
+                    request_immediate_hold=mock.Mock(),
+                    request_immediate_release=mock.Mock(),
+                )
+
+                def write_key_when_prompt_is_ready(*args, **_kwargs):
+                    if args and args[0] == "Confirm> ":
+                        os.write(master_fd, key)
+
+                try:
+                    with (
+                        mock.patch.object(sys, "stdin", stdin),
+                        mock.patch(
+                            "builtins.print",
+                            side_effect=write_key_when_prompt_is_ready,
+                        ),
+                    ):
+                        started_at = time.monotonic()
+                        response = _readline_while_armed(
+                            actuator,
+                            "Confirm> ",
+                            timeout_s=1.0,
+                            confirmation_mode=True,
+                        )
+                        elapsed = time.monotonic() - started_at
+
+                    self.assertEqual(response, expected)
+                    self.assertLess(elapsed, 0.25)
+                    if expected_method is None:
+                        actuator.request_immediate_hold.assert_not_called()
+                        actuator.request_immediate_release.assert_not_called()
+                    else:
+                        getattr(actuator, expected_method).assert_called_once_with()
+                    self.assertEqual(termios.tcgetattr(slave_fd), original)
+                finally:
+                    stdin.close()
+                    os.close(master_fd)
+                    os.close(slave_fd)
+
+    def test_armed_line_prompt_ctrl_q_releases_without_enter(self):
+        master_fd, slave_fd = pty.openpty()
+        stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+        original = termios.tcgetattr(slave_fd)
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+            request_immediate_hold=mock.Mock(),
+            request_immediate_release=mock.Mock(),
+        )
+
+        def write_ctrl_q_when_prompt_is_ready(*args, **_kwargs):
+            if args and args[0] == "Next goal> ":
+                os.write(master_fd, b"\x11")
+
+        try:
+            with (
+                mock.patch.object(sys, "stdin", stdin),
+                mock.patch("builtins.print", side_effect=write_ctrl_q_when_prompt_is_ready),
+            ):
+                response = _readline_while_armed(actuator, "Next goal> ", timeout_s=1.0)
+
+            self.assertEqual(response, "q")
+            actuator.request_immediate_release.assert_called_once_with()
+            actuator.request_immediate_hold.assert_not_called()
+            self.assertEqual(termios.tcgetattr(slave_fd), original)
+        finally:
+            stdin.close()
+            os.close(master_fd)
+            os.close(slave_fd)
+
+    def test_armed_line_prompt_rapid_stop_then_release_preserves_queued_q(self):
+        master_fd, slave_fd = pty.openpty()
+        stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+        original = termios.tcgetattr(slave_fd)
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+            request_immediate_hold=mock.Mock(),
+            request_immediate_release=mock.Mock(),
+        )
+        try:
+            with mock.patch.object(sys, "stdin", stdin), mock.patch("builtins.print"):
+                # Both keys arrive during one raw-mode prompt. S returns STOP;
+                # restoration must not flush the already queued q.
+                os.write(master_fd, b"Sq")
+                first = _readline_while_armed(actuator, "Next goal> ", timeout_s=1.0)
+                second_started_at = time.monotonic()
+                second = _readline_while_armed(actuator, "Next goal> ", timeout_s=1.0)
+                second_elapsed = time.monotonic() - second_started_at
+
+            self.assertEqual(first, "stop")
+            self.assertEqual(second, "q")
+            self.assertLess(second_elapsed, 0.25)
+            actuator.request_immediate_hold.assert_called_once_with()
+            actuator.request_immediate_release.assert_called_once_with()
+            self.assertEqual(termios.tcgetattr(slave_fd), original)
+        finally:
+            stdin.close()
+            os.close(master_fd)
+            os.close(slave_fd)
+
+    def test_armed_line_prompt_q_as_prompt_appears_needs_no_enter(self):
+        master_fd, slave_fd = pty.openpty()
+        stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+        original = termios.tcgetattr(slave_fd)
+        self.assertTrue(original[3] & termios.ICANON)
+        prompt_seen = threading.Event()
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+            request_immediate_hold=mock.Mock(),
+            request_immediate_release=mock.Mock(),
+        )
+
+        def write_q_when_prompt_is_printed(*args, **_kwargs):
+            if args and args[0] == "Next goal> ":
+                # Inject q as soon as the raw-mode prompt appears, without a newline.
+                os.write(master_fd, b"q")
+                prompt_seen.set()
+
+        try:
+            with (
+                mock.patch.object(sys, "stdin", stdin),
+                mock.patch("builtins.print", side_effect=write_q_when_prompt_is_printed),
+            ):
+                started_at = time.monotonic()
+                response = _readline_while_armed(actuator, "Next goal> ", timeout_s=0.5)
+                elapsed = time.monotonic() - started_at
+
+            self.assertTrue(prompt_seen.is_set())
+            self.assertEqual(response, "q")
+            self.assertLess(elapsed, 0.25)
+            actuator.request_immediate_release.assert_called_once_with()
+            actuator.request_immediate_hold.assert_not_called()
+            self.assertEqual(termios.tcgetattr(slave_fd), original)
+        finally:
+            stdin.close()
+            os.close(master_fd)
+            os.close(slave_fd)
+
+    def test_next_goal_line_prompt_does_not_treat_r_as_immediate_continue(self):
+        master_fd, slave_fd = pty.openpty()
+        stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+        original = termios.tcgetattr(slave_fd)
+        prompt_seen = threading.Event()
+        newline_sent = threading.Event()
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+            request_immediate_hold=mock.Mock(),
+            request_immediate_release=mock.Mock(),
+        )
+
+        def write_r_then_delayed_enter(*args, **_kwargs):
+            if args and args[0] == "Next goal> ":
+                prompt_seen.set()
+                os.write(master_fd, b"r")
+
+                def finish_line():
+                    time.sleep(0.15)
+                    os.write(master_fd, b"\n")
+                    newline_sent.set()
+
+                threading.Thread(target=finish_line, daemon=True).start()
+
+        try:
+            with (
+                mock.patch.object(sys, "stdin", stdin),
+                mock.patch("builtins.print", side_effect=write_r_then_delayed_enter),
+            ):
+                started_at = time.monotonic()
+                response = _readline_while_armed(actuator, "Next goal> ", timeout_s=1.0)
+                elapsed = time.monotonic() - started_at
+
+            self.assertTrue(prompt_seen.is_set())
+            self.assertTrue(newline_sent.wait(timeout=1.0))
+            self.assertEqual(response, "r")
+            self.assertGreaterEqual(elapsed, 0.12)
+            actuator.request_immediate_hold.assert_not_called()
+            actuator.request_immediate_release.assert_not_called()
+            self.assertEqual(termios.tcgetattr(slave_fd), original)
+        finally:
+            stdin.close()
+            os.close(master_fd)
+            os.close(slave_fd)
+
     def test_active_terminal_restores_tty_when_active_runner_raises(self):
         master_fd, slave_fd = pty.openpty()
         stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
@@ -1156,16 +1779,20 @@ class GrootG1DeploymentTests(unittest.TestCase):
     def test_goal_transition_prompts_honor_global_hold_and_release_commands(self):
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
         actuator = SimpleNamespace(hold=mock.Mock())
-        for response, expected in (("WARMUP", "continue"), ("s", "hold"), ("q", "release")):
+        for response, expected in (("continue", "continue"), ("stop", "hold"), ("q", "release")):
             with (
                 self.subTest(response=response),
-                mock.patch(f"{module}._readline_while_armed", return_value=response),
+                mock.patch(
+                    f"{module}._readline_while_armed",
+                    return_value=response,
+                ) as readline,
                 mock.patch("builtins.print"),
             ):
                 self.assertEqual(
                     _confirm_goal_transition(actuator, "transition", "WARMUP"),
                     expected,
                 )
+                self.assertTrue(readline.call_args.kwargs["confirmation_mode"])
         actuator.hold.assert_called_once_with()
 
     def test_held_goal_selector_services_heartbeat_and_rejects_unconfirmed_custom_text(self):
@@ -2231,6 +2858,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         with mock.patch.object(actuator, "_wait_status", return_value=7) as wait_status:
             actuator.finish_immediate_hold()
         wait_status.assert_called_once_with("urgent_holding", timeout_s=1.0)
+        self.assertEqual(actuator._command_queue.get_nowait(), ("urgent_hold_barrier",))
         self.assertIsNone(actuator.immediate_control_requested())
         self.assertTrue(actuator._holding)
         self.assertFalse(actuator._warm_started)
@@ -2241,6 +2869,67 @@ class GrootG1DeploymentTests(unittest.TestCase):
         actuator.request_immediate_release()
         self.assertEqual(actuator.immediate_control_requested(), "release")
         self.assertTrue(actuator._stop_event.is_set())
+
+    def test_parent_immediate_stop_fence_ignores_obsolete_rtc_terminal_status(self):
+        class _AliveProcess:
+            @staticmethod
+            def is_alive() -> bool:
+                return True
+
+        actuator = object.__new__(SafeG1Dex3Actuator)
+        actuator._initialized = True
+        actuator._closed = False
+        actuator._holding = False
+        actuator._warm_started = True
+        actuator._chunk_in_flight = True
+        actuator._pending_sequence = 7
+        actuator._sequence = 7
+        actuator._rtc_active = True
+        actuator._rtc_terminal = ("hold", {"obsolete": True})
+        actuator._urgent_hold_event = threading.Event()
+        actuator._stop_event = threading.Event()
+        actuator._control_lock = threading.Lock()
+        actuator._command_queue = queue.Queue(maxsize=1)
+        actuator._status_queue = queue.Queue(maxsize=32)
+        actuator._status_queue.put(("rtc_rejected", {"sequence": 7, "obsolete": True}))
+        actuator._status_queue.put(("urgent_holding", 7))
+        actuator._immediate_hold_requested = threading.Event()
+        actuator._immediate_hold_requested.set()
+        actuator._immediate_release_requested = threading.Event()
+        actuator._stopped_acknowledged = False
+        actuator._process = _AliveProcess()
+        actuator._heartbeat = FakeHeartbeat(time.monotonic())
+
+        self.assertEqual(actuator.finish_immediate_hold(), "hold")
+        self.assertEqual(actuator._command_queue.get_nowait(), ("urgent_hold_barrier",))
+        self.assertIsNone(actuator._rtc_terminal)
+        self.assertTrue(actuator._holding)
+        self.assertFalse(actuator._rtc_active)
+        self.assertFalse(actuator._chunk_in_flight)
+        self.assertIsNone(actuator._pending_sequence)
+
+    def test_release_during_status_wait_caches_consumed_stopped_ack_for_close(self):
+        actuator = object.__new__(SafeG1Dex3Actuator)
+        actuator._immediate_hold_requested = threading.Event()
+        actuator._immediate_release_requested = threading.Event()
+        actuator._stopped_acknowledged = False
+        actuator._heartbeat = FakeHeartbeat(time.monotonic())
+
+        class _ReleaseThenStopQueue:
+            @staticmethod
+            def get(*, timeout):
+                del timeout
+                actuator._immediate_release_requested.set()
+                return "stopped", None
+
+        actuator._status_queue = _ReleaseThenStopQueue()
+
+        with self.assertRaises(ImmediateControlEvent) as raised:
+            actuator._wait_status("armed", timeout_s=1.0)
+
+        self.assertEqual(raised.exception.action, "release")
+        # close() reads this exact cache before draining any remaining statuses.
+        self.assertTrue(actuator._stopped_acknowledged)
 
     def test_child_reports_initializing_then_initialized_before_accepting_actions(self):
         commands = queue.Queue(maxsize=1)

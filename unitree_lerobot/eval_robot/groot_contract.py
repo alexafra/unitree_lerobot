@@ -83,8 +83,23 @@ INITIAL_POSE_SCHEMA_VERSION = 1
 
 # These are deliberately fixed deployment ceilings, not tuning flags.  They need
 # hardware qualification before being relaxed.
-MAX_ARM_STEP_RAD = 0.1  # 0.05
-MAX_HAND_STEP_RAD = 0.60  # 0.10
+# CHANGEDSAFETY: original local adapter default was 0.05 rad; current is 0.10 rad.
+# This is the raw 30 Hz ceiling when conditioning is disabled and remains a
+# hard final-command backstop when conditioning is enabled. The 100 Hz
+# conditioner derives a stricter 0.03 rad ceiling to preserve the same 3 rad/s
+# ordinary effective slew; a minimum inward recovery from a measured-only
+# tolerance may exceed it but remains below this hard backstop. It is not an
+# official Unitree velocity limit.
+MAX_ARM_STEP_RAD = 0.10
+# CHANGEDSAFETY: original local adapter default was 0.10 rad; current is 0.60 rad.
+# This is the raw 30 Hz ceiling when conditioning is disabled and remains a
+# hard final-command backstop when conditioning is enabled. The default 100 Hz
+# conditioner uses the stricter per-joint velocity maxima from the checked-in
+# Unitree Dex3 URDF (6.857 rad/s for thumb0, 12 rad/s otherwise); a minimum
+# inward recovery from a measured-only tolerance may exceed that ordinary
+# conditioner ceiling but remains below this hard backstop. This 0.60-rad
+# backstop itself is not an official Unitree velocity limit.
+MAX_HAND_STEP_RAD = 0.60
 JOINT_LIMIT_MARGIN_RAD = 0.03
 HAND_LIMIT_TOLERANCE_RAD = 0.002
 MEASURED_LIMIT_TOLERANCE_RAD = 0.01
@@ -803,28 +818,24 @@ def _check_step_size(
         )
 
 
-def validate_action_chunk(
-    chunk: ActionChunk,
-    current_arm: np.ndarray,
-    current_left: np.ndarray,
-    current_right: np.ndarray,
-) -> None:
-    """Independently validate an already parsed chunk against fresh state."""
+def validate_action_chunk_limits(chunk: ActionChunk) -> None:
+    """Validate policy-action structure, finiteness, and absolute joint limits.
+
+    This deliberately excludes target-to-target slew.  A deployment-side
+    conditioner may turn a discontinuous but finite, in-range policy plan into
+    the commands that are actually published.  Those final commands must still
+    pass :func:`validate_action_chunk` before they reach DDS.
+    """
 
     arm = np.asarray(chunk.arm, dtype=np.float64)
     left = np.asarray(chunk.left_hand, dtype=np.float64)
     right = np.asarray(chunk.right_hand, dtype=np.float64)
-    current_arm = np.asarray(current_arm, dtype=np.float64)
-    current_left = np.asarray(current_left, dtype=np.float64)
-    current_right = np.asarray(current_right, dtype=np.float64)
     if arm.ndim != 2 or arm.shape[1] != ARM_DOF or arm.shape[0] < 1:
         raise DeploymentError(f"Invalid arm chunk shape {arm.shape}")
     if left.shape != (arm.shape[0], HAND_DOF) or right.shape != left.shape:
         raise DeploymentError(f"Invalid hand chunk shapes {left.shape} and {right.shape}")
-    if current_arm.shape != (ARM_DOF,) or current_left.shape != (HAND_DOF,) or current_right.shape != (HAND_DOF,):
-        raise DeploymentError("Fresh robot state has the wrong shape")
-    if not all(np.all(np.isfinite(values)) for values in (arm, left, right, current_arm, current_left, current_right)):
-        raise DeploymentError("Action chunk or robot state contains NaN or infinity")
+    if not all(np.all(np.isfinite(values)) for values in (arm, left, right)):
+        raise DeploymentError("Action chunk contains NaN or infinity")
 
     _check_limits(
         "arm",
@@ -859,6 +870,27 @@ def validate_action_chunk(
         tolerance=HAND_LIMIT_TOLERANCE_RAD,
         tolerance_constant="HAND_LIMIT_TOLERANCE_RAD",
     )
+
+
+def validate_action_chunk(
+    chunk: ActionChunk,
+    current_arm: np.ndarray,
+    current_left: np.ndarray,
+    current_right: np.ndarray,
+) -> None:
+    """Validate an already parsed chunk and every commanded target transition."""
+
+    validate_action_chunk_limits(chunk)
+    arm = np.asarray(chunk.arm, dtype=np.float64)
+    left = np.asarray(chunk.left_hand, dtype=np.float64)
+    right = np.asarray(chunk.right_hand, dtype=np.float64)
+    current_arm = np.asarray(current_arm, dtype=np.float64)
+    current_left = np.asarray(current_left, dtype=np.float64)
+    current_right = np.asarray(current_right, dtype=np.float64)
+    if current_arm.shape != (ARM_DOF,) or current_left.shape != (HAND_DOF,) or current_right.shape != (HAND_DOF,):
+        raise DeploymentError("Fresh robot state has the wrong shape")
+    if not all(np.all(np.isfinite(values)) for values in (current_arm, current_left, current_right)):
+        raise DeploymentError("Robot state contains NaN or infinity")
     _check_step_size(
         "arm",
         arm,
@@ -938,15 +970,17 @@ def parse_action_plan(
     current_left: np.ndarray,
     current_right: np.ndarray,
     validate_initial_step: bool = True,
+    validate_target_steps: bool = True,
 ) -> ActionChunk:
     """Parse and rate-check the full prediction horizon used by RTC."""
 
     result = _parse_full_action(action, model_horizon)
-    if validate_initial_step:
-        validation_state = (current_arm, current_left, current_right)
-    else:
-        validation_state = (result.arm[0], result.left_hand[0], result.right_hand[0])
-    validate_action_chunk(result, *validation_state)
+    if validate_target_steps:
+        if validate_initial_step:
+            validation_state = (current_arm, current_left, current_right)
+        else:
+            validation_state = (result.arm[0], result.left_hand[0], result.right_hand[0])
+        validate_action_chunk(result, *validation_state)
     return result
 
 
@@ -958,6 +992,7 @@ def parse_action_chunk(
     current_left: np.ndarray,
     current_right: np.ndarray,
     validate_initial_step: bool = True,
+    validate_target_steps: bool = True,
 ) -> ActionChunk:
     if not 1 <= execution_horizon <= model_horizon:
         raise DeploymentError(
@@ -972,13 +1007,14 @@ def parse_action_chunk(
         left_hand=np.ascontiguousarray(full.left_hand[:execution_horizon]),
         right_hand=np.ascontiguousarray(full.right_hand[:execution_horizon]),
     )
-    if validate_initial_step:
-        validation_state = (current_arm, current_left, current_right)
-    else:
-        # This result is either an unexecuted shadow prediction or a discarded
-        # preflight/warm-start prediction.  Still enforce every shape,
-        # finite/range check and every within-prefix rate step, but do not
-        # interpret measured-q -> action[0] as a commanded transition.
-        validation_state = (result.arm[0], result.left_hand[0], result.right_hand[0])
-    validate_action_chunk(result, *validation_state)
+    if validate_target_steps:
+        if validate_initial_step:
+            validation_state = (current_arm, current_left, current_right)
+        else:
+            # This result is either an unexecuted shadow prediction or a discarded
+            # preflight/warm-start prediction.  Still enforce every shape,
+            # finite/range check and every within-prefix rate step, but do not
+            # interpret measured-q -> action[0] as a commanded transition.
+            validation_state = (result.arm[0], result.left_hand[0], result.right_hand[0])
+        validate_action_chunk(result, *validation_state)
     return result

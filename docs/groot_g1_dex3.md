@@ -75,6 +75,40 @@ The default remains `--inference-mode synchronous`: capture one observation, wai
 one prediction, execute its `--execution-horizon` prefix, then repeat. This is the
 simpler baseline for comparisons.
 
+Actuated runs also default to `--command-conditioning xr`. Raw model output must still
+have the exact schema, finite values, and absolute joint positions inside the guarded
+physical ranges. The watchdog-owning child then treats each 30 Hz policy row as a
+desired target and forms the final command at 100 Hz before applying step checks or
+publishing DDS:
+
+- Arms use XR's missing downstream measured-relative vector limiter. The largest
+  desired-minus-measured component is globally rescaled to a 0.08 rad command lead,
+  ramping to 0.12 rad over five seconds. These are the exact 20/250 and 30/250 values
+  from XR's 250 Hz publisher; using 20/100 would incorrectly allow 2.5 times more lead.
+- Hands are not passed through alpha=0.2 again. Dex3 actions in the dataset already
+  contain XR's retargeting filter, so a second copy would add untrained lag. They go
+  directly through guarded position projection and the final 100 Hz slew limiter.
+- Ordinary final command-to-command changes are capped at 0.03 rad for arms at
+  100 Hz. Hands use the checked-in Unitree Dex3 URDF velocity maxima: 0.06857 rad/write
+  for thumb0 (6.857 rad/s), and 0.12 rad/write for the other joints (12 rad/s). A single
+  hand-wide scale preserves the desired multi-joint motion direction while satisfying
+  every joint's ceiling. The original 0.10/0.60-rad limits remain hard backstops, and
+  every conditioned command is projected into the existing guarded position range
+  before DDS publication. If a measured HOLD seed is just outside that stricter command
+  range, its first resumed write may use the minimum inward correction needed to re-enter
+  it, still under the original hard backstop.
+- Hand tracking uses each left/right DDS callback's local receipt time to select
+  the newest successfully published target that already existed for that sample.
+  Re-reading one 50 Hz Isaac sample in the 100 Hz loop therefore cannot compare it
+  with a newer command or count it repeatedly. A time-aligned 1.50-rad error is the
+  hard fault; the original 0.50-rad level must persist across distinct samples for
+  0.20 s before producing a warning, and clears below 0.40 rad.
+
+Initialization, policy warm-start, STOP/HOLD, and terminal RTC paths reseed the
+conditioner from their held command. They never inherit an unexecuted future filter
+state. `--command-conditioning none` retains the old raw-target rejection behavior for
+controlled comparisons; it is not the default.
+
 `--inference-mode rtc` enables experimental asynchronous **Real-Time Chunking** for a
 checkpoint whose configured action horizon is at least 32. The server must advertise
 the RTC v1 physical-tail capability; an old server, ReplayPolicy, or wrapped simulator
@@ -90,8 +124,10 @@ policy is rejected before DDS is initialized. The exact queue handoff is:
 4. The child continues executing `A` during camera capture, network transfer, model
    inference and decoding. GR00T inpaints a new plan `B`, freezing the estimated
    end-to-end delay prefix and smoothly denoising the remaining overlap.
-5. At handoff the child measures `k = current_index - r`, validates the old commanded
-   target to `B[k]` boundary, discards `B[:k]`, and atomically continues with `B[k:]`.
+5. At handoff the child measures `k = current_index - r`, discards `B[:k]`, and
+   atomically selects `B[k:]`. In default XR conditioning mode, the persistent 100 Hz
+   conditioner forms and validates the final outgoing boundary; with conditioning
+   disabled, the raw old-target to `B[k]` boundary retains the original hard check.
 6. A stale generation, invalid boundary, failed request, or `k` exhausting the supplied
    overlap is never replayed. The child enters powered HOLD (or the existing actuator
    fault/release path for a hard safety fault).
@@ -106,7 +142,9 @@ capture, serialization/network, inference, parsing and handoff. Leave
 Publisher-free RTC shadow mode runs the same wire protocol against a virtual 30 Hz
 action clock. It is useful for latency, stale-response and buffer-budget measurements,
 but the real robot does not follow the virtual targets, so it cannot demonstrate
-closed-loop smoothness or task quality.
+closed-loop smoothness, the child-owned output conditioner, or task quality. Raw
+schema/finiteness/absolute ranges remain hard in shadow; qualify conditioned motion in
+isolated IsaacLab before real hardware.
 
 ## 3. Run a publisher-free shadow test
 
@@ -166,22 +204,23 @@ For example, to request XR-compatible staging, add:
 --initialization xr-home
 ```
 
-After `ACTUATE`/`SIMULATE`, command authority begins by holding measured positions. A moving initialization then requires typing `INITIALIZE`. Immediately before moving, the actuator again requires a fresh, stationary state at the held target. It follows a fixed, slow 100 Hz smooth joint-space interpolation, keeps its heartbeat/state/mode/tracking checks active, and reports completion only after arm/hand position stability and arm velocity satisfy a continuous dwell. This is the same XR joint-zero **target**, with a deliberately slower guarded motion profile. The interpolation is not collision-aware, so a clear workspace, support and an emergency-stop operator remain mandatory. Finally, the operator visually checks the robot and scene and types `RUN`. Only then does the client reset GR00T, capture fresh state/images, run new inference, apply executable step checks, and submit a policy action. The earlier publisher-free model result is never executed.
+At the SIMULATE/ACTUATE gate, press `r` once (no Enter) to create command publishers; `s` or `q` cancels before authority is created. Command authority begins by holding measured positions. At a moving initialization gate, press `r` again to start the displayed initialization. Pressing `s` at that gate simply remains at the existing measured hold. Immediately before moving, the actuator again requires a fresh, stationary state at the held target. It follows a fixed, slow 100 Hz smooth joint-space interpolation, keeps its heartbeat/state/mode/tracking checks active, and reports completion only after arm/hand position stability and arm velocity satisfy a continuous dwell. This is the same XR joint-zero **target**, with a deliberately slower guarded motion profile. The interpolation is not collision-aware, so a clear workspace, support and an emergency-stop operator remain mandatory. Finally, the operator visually checks the robot and scene and presses `r` at the RUN gate. Only then does the client reset GR00T, capture fresh state/images, run new inference, validate raw values, condition executable commands, and submit policy motion. The earlier publisher-free model result is never executed.
 
-Actuated runs use policy warm-start by default. After `RUN`, the client performs one fresh inference while deliberately skipping only the current-pose-to-first-target jump check. It still validates the full response, joint limits, finiteness, and within-chunk step sizes. After the operator types `WARMUP`, the actuator follows its existing bounded 100 Hz interpolation to that first target. The entire inferred chunk is then discarded. After `CONTINUE`, the client resets GR00T, captures a new observation from the reached pose, and restores the normal 0.05-rad arm and 0.10-rad hand action-step ceilings for every executed chunk. Use `--no-policy-warm-start` only when deliberately testing the strict direct-start behavior.
+Actuated runs use policy warm-start by default. After the RUN gate, the client performs one fresh inference while deliberately skipping the current-pose-to-first-target jump check. It still validates the full response, joint limits, and finiteness. After the operator presses `r` at the WARMUP gate, the actuator follows its existing bounded 100 Hz interpolation to that first target. The entire inferred chunk is then discarded. Pressing `r` at the CONTINUE gate resets GR00T, captures a new observation from the reached pose, and reseeds the output conditioner there. The 0.03-rad arm ceiling and the per-joint Dex3 ceilings described above govern ordinary final 100 Hz commands; the narrow minimum-inward-recovery exception can exceed them, while `MAX_ARM_STEP_RAD` and `MAX_HAND_STEP_RAD` remain hard backstops. With `--command-conditioning none`, the original constants instead apply directly to raw policy targets at 30 Hz. Use `--no-policy-warm-start` only when deliberately testing the direct-start behavior.
 
-This transition is available in both IsaacLab and the explicitly unqualified real path. It is a per-goal joint-space transition, not collision-aware planning and not a general license for large policy jumps. On the real robot, `WARMUP` and `CONTINUE` are separate confirmations so the operator can inspect the target delta and the reached pose.
+This transition is available in both IsaacLab and the explicitly unqualified real path. It is a per-goal joint-space transition, not collision-aware planning and not a general license for large policy jumps. WARMUP and CONTINUE remain separate visual-inspection gates; each advances only when `r` is pressed.
 
-During a synchronous actuated run, terminal commands are read at safe action-chunk
-boundaries. RTC polls them continuously while its child owns the exact 30 Hz handoff:
+During either synchronous or RTC actuation, the terminal has immediate single-key
+operator controls; Enter is not required:
 
-- `hold` or `h`, followed by Enter, captures the current measured arm/hand pose and keeps publishing it at 100 Hz. The client stops making GR00T requests and displays a next-goal prompt. This is a powered position hold, not a passive brake or collision-safe freeze; it can continue exerting force and requires the client/watchdog to remain alive.
-- At the HOLD prompt, enter a trained task ID, its menu number, its exact training sentence, or custom goal text. Unknown text again requires exact `YES`. The new goal repeats GR00T reset, fresh inference, `WARMUP`, discarded chunk, `CONTINUE`, reset, and fresh strict inference.
-- `quit` or `q` requests orderly release and exits. `Ctrl-C` also enters cleanup from any state. On real hardware, cleanup retains the final arm target while ramping `arm_sdk` authority to zero over 1.5 seconds, then sends Dex3 `stopMotors`; final pose and grasp after Unitree retakes authority are not guaranteed.
+- At each standard authority or motion gate, `r` or `R` performs the displayed action. It does not resume an old goal from the STOP next-goal prompt, where `r` remains ordinary goal text until Enter. Arbitrary custom goals still require exact `YES` plus Enter.
+- `s` or `S` immediately captures the current measured arm/hand pose and keeps publishing it at 100 Hz. The client stops making GR00T requests and displays a next-goal prompt. This is a powered position STOP, not a passive brake or collision-safe freeze; it can continue exerting force and requires the client/watchdog to remain alive.
+- At the STOP prompt, enter a trained task ID, its menu number, its exact training sentence, or custom goal text. Either `q` or `Q` is the no-Enter release key. For literal goal text, hold Alt while pressing the key: `Alt+q` inserts `q`, and `Alt+Shift+q` inserts `Q`. Uppercase `S` remains stopped. Unknown text again requires exact `YES`. The new goal repeats GR00T reset, fresh inference, `WARMUP`, discarded chunk, `CONTINUE`, reset, and fresh strict inference.
+- `q` or `Q` during active motion or at an armed line prompt requests orderly release immediately. `Ctrl-C` remains the independent release path. On real hardware, cleanup retains the final arm target while ramping `arm_sdk` authority to zero over 1.5 seconds, then sends Dex3 `stopMotors`; final pose and grasp after Unitree retakes authority are not guaranteed.
 
-A command typed while a synchronous inference request is already running cannot cancel that network request. Its result is discarded before submission, then HOLD or release occurs. In RTC, `h` interrupts the active plan into powered HOLD and drains/discards any in-flight reply before accepting a new goal; `q` begins orderly release without waiting for the reply. Reaching finite `--max-chunks` without a HOLD command still exits through normal release; use a sufficiently large but finite bound for an interactive pick/put session.
+A key pressed while a synchronous inference request is already running cannot cancel the network request itself. The actuator nevertheless responds immediately: `s` enters powered STOP and `q` starts release; any later server result is discarded. RTC uses the same keys, cancels its active plan, and discards any in-flight reply before accepting a new goal. Reaching finite `--max-chunks` without a STOP command still exits through normal release; use a sufficiently large but finite bound for an interactive pick/put session.
 
-Armed `INITIALIZE`, `RUN`, `WARMUP`, and `CONTINUE` prompts time out after 60 seconds. The HOLD goal prompt may wait indefinitely while continuing the heartbeat and safety checks. `Ctrl-C`, rejection, timeout or a watchdog fault enters the existing authority-release and Dex3 `stopMotors` cleanup path.
+The INITIALIZE, RUN, WARMUP, and CONTINUE gates time out after 60 seconds. The STOP goal prompt may wait indefinitely while continuing the heartbeat and safety checks. During the guarded initialization and warm-start interpolations themselves, `q`/`Q` remains the immediate orderly-abort key; `s` is intentionally not a mid-interpolation pause command. During policy execution, `s` is immediate powered STOP. `Ctrl-C`, rejection, timeout or a watchdog fault enters the existing authority-release and Dex3 `stopMotors` cleanup path. These are terminal keystrokes, so the client terminal must retain keyboard focus; they do not replace the robot's physical emergency stop.
 
 A pose file has this strict schema (all 28 `joint_names` must appear in the exact training order). The structure below is deliberately non-runnable: export and review one real episode's frame-zero values before replacing the arm placeholder.
 
@@ -303,4 +342,4 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
     --allow-unqualified-real
 ```
 
-The program still completes a publisher-free observation/inference/action preflight and requires typing `ACTUATE`, then `INITIALIZE` for the moving XR-home request, and finally `RUN`. The default warm-start additionally requires `WARMUP` before each new goal's transition and `CONTINUE` before fresh strict inference. On arming, its child process requires fresh state and a stationary 0.5-second dwell, initializes targets from that measured state, and ramps `arm_sdk` weight while holding it. During command execution, state older than 75 ms faults the actuator. These conservative thresholds may need to become stricter after hardware measurement; they are not a substitute for qualification. Orderly SIGINT, SIGTERM, and terminal-hangup cleanup attempts to ramp arm authority back to zero, then sends Unitree's Dex3 `stopMotors` command to both hands; the CLI reports a failed or unacknowledged local release. SIGKILL, power loss, and a wedged DDS/network path can bypass those attempts. The override is not a safety guarantee or certification.
+The program still completes a publisher-free observation/inference/action preflight. Each standard gate—ACTUATE/SIMULATE, INITIALIZE, RUN, WARMUP, and CONTINUE—advances with one `r` keypress and no Enter. On arming, its child process requires fresh state and a stationary 0.5-second dwell, initializes targets from that measured state, and ramps `arm_sdk` weight while holding it. During command execution, state older than 75 ms faults the actuator. These conservative thresholds may need to become stricter after hardware measurement; they are not a substitute for qualification. Orderly SIGINT, SIGTERM, and terminal-hangup cleanup attempts to ramp arm authority back to zero, then sends Unitree's Dex3 `stopMotors` command to both hands; the CLI reports a failed or unacknowledged local release. SIGKILL, power loss, and a wedged DDS/network path can bypass those attempts. The override is not a safety guarantee or certification.

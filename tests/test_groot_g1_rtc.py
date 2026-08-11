@@ -13,7 +13,6 @@ import numpy as np
 from unitree_lerobot.eval_robot.eval_groot_g1 import (
     _RtcInferenceWorker,
     _RtcRequest,
-    _RtcResponse,
     _run_active_goal_rtc,
     _run_active_goal_rtc_controlled,
     _rtc_options,
@@ -24,13 +23,17 @@ from unitree_lerobot.eval_robot.eval_groot_g1 import (
 from unitree_lerobot.eval_robot.groot_client import DeploymentError, Gr00tClient
 from unitree_lerobot.eval_robot.groot_contract import (
     ActionChunk,
+    ARM_UPPER,
     MAX_ARM_STEP_RAD,
     load_initialization_spec,
 )
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
+    MAX_CONDITIONED_ARM_STEP_RAD,
+    MAX_CONDITIONED_HAND_STEP_RAD,
     RobotState,
     RtcTerminalEvent,
     SafeG1Dex3Actuator,
+    XrPolicyOutputConditioner,
     _actuator_main,
 )
 
@@ -161,9 +164,48 @@ class _GatedRecordingBackend(_RecordingBackend):
             self.continue_publish.wait(timeout=1.0)
 
 
+class _RecordingConditioner(XrPolicyOutputConditioner):
+    instance: _RecordingConditioner | None = None
+
+    def __init__(self) -> None:
+        super().__init__()
+        type(self).instance = self
+        self.reset_count = 0
+        self.desired: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+
+    def reset(self, arm: np.ndarray, left: np.ndarray, right: np.ndarray) -> None:
+        self.reset_count += 1
+        super().reset(arm, left, right)
+
+    def set_desired(
+        self,
+        arm: np.ndarray,
+        left: np.ndarray,
+        right: np.ndarray,
+        *,
+        now: float,
+    ) -> None:
+        self.desired.append(
+            (
+                np.asarray(arm).copy(),
+                np.asarray(left).copy(),
+                np.asarray(right).copy(),
+            )
+        )
+        super().set_desired(arm, left, right, now=now)
+
+
 class _ChildHarness:
-    def __init__(self, backend_type: type[_RecordingBackend] = _RecordingBackend):
+    def __init__(
+        self,
+        backend_type: type[_RecordingBackend] = _RecordingBackend,
+        *,
+        command_conditioning: str = "none",
+        conditioner_type: type[XrPolicyOutputConditioner] | None = None,
+    ):
         self.backend_type = backend_type
+        self.command_conditioning = command_conditioning
+        self.conditioner_type = conditioner_type
         self.commands: queue.Queue = queue.Queue(maxsize=1)
         self.statuses: queue.Queue = queue.Queue(maxsize=32)
         self.stop = threading.Event()
@@ -180,6 +222,8 @@ class _ChildHarness:
 
     def __enter__(self) -> _ChildHarness:
         self._stack.enter_context(mock.patch(f"{_SAFE_MODULE}._G1Dex3CommandBackend", self.backend_type))
+        if self.conditioner_type is not None:
+            self._stack.enter_context(mock.patch(f"{_SAFE_MODULE}.XrPolicyOutputConditioner", self.conditioner_type))
         self._stack.enter_context(mock.patch(f"{_SAFE_MODULE}.INITIALIZATION_START_DWELL_S", 0.0))
         self._stack.enter_context(mock.patch(f"{_SAFE_MODULE}.INITIALIZATION_CONVERGENCE_DWELL_S", 0.0))
         self._stack.enter_context(mock.patch(f"{_SAFE_MODULE}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 1))
@@ -195,6 +239,7 @@ class _ChildHarness:
                 self.stop,
                 self.heartbeat,
                 self.urgent_hold,
+                self.command_conditioning,
             ),
             daemon=True,
         )
@@ -281,6 +326,7 @@ def _parent_handle_for_child(child: _ChildHarness) -> SafeG1Dex3Actuator:
     actuator._pending_sequence = None
     actuator._rtc_active = False
     actuator._rtc_terminal = None
+    actuator._command_conditioning = child.command_conditioning
     actuator._control_lock = threading.Lock()
     actuator._immediate_hold_requested = threading.Event()
     actuator._immediate_release_requested = threading.Event()
@@ -290,6 +336,204 @@ def _parent_handle_for_child(child: _ChildHarness) -> SafeG1Dex3Actuator:
 
 
 class GrootG1RtcTests(unittest.TestCase):
+    @staticmethod
+    def _conditioner_jump_plan(horizon: int = 1) -> ActionChunk:
+        arm = np.zeros((horizon, 14), dtype=np.float64)
+        left = np.zeros((horizon, 7), dtype=np.float64)
+        right = np.zeros((horizon, 7), dtype=np.float64)
+        arm[:, 0] = 0.5
+        left[:, 0] = 1.0
+        right[:, 0] = 1.0
+        return ActionChunk(arm=arm, left_hand=left, right_hand=right)
+
+    def test_conditioned_child_sync_publishes_final_outputs_not_raw_policy_targets(self):
+        with _ChildHarness(command_conditioning="xr") as child:
+            plan = self._conditioner_jump_plan()
+            child.commands.put(
+                (
+                    "chunk",
+                    1,
+                    time.monotonic(),
+                    plan.arm,
+                    plan.left_hand,
+                    plan.right_hand,
+                ),
+                timeout=0.2,
+            )
+            child.wait_for_target_count(1)
+
+            first_arm, first_left, first_right = child.backend.target_snapshot()[0]
+            self.assertAlmostEqual(first_arm[0], MAX_CONDITIONED_ARM_STEP_RAD)
+            self.assertAlmostEqual(first_left[0], MAX_CONDITIONED_HAND_STEP_RAD[0])
+            self.assertAlmostEqual(first_right[0], MAX_CONDITIONED_HAND_STEP_RAD[0])
+            self.assertFalse(np.array_equal(first_arm, plan.arm[0]))
+            self.assertFalse(np.array_equal(first_left, plan.left_hand[0]))
+            self.assertTrue(child.thread.is_alive())
+
+    def test_conditioned_child_rtc_publishes_final_outputs_not_raw_policy_targets(self):
+        with _ChildHarness(command_conditioning="xr") as child:
+            plan = self._conditioner_jump_plan(horizon=4)
+            child.commands.put(_rtc_start_command(1, plan, action_budget=1), timeout=0.2)
+            self.assertEqual(child.assert_status("rtc_started"), 1)
+            child.wait_for_target_count(1)
+
+            first_arm, first_left, first_right = child.backend.target_snapshot()[0]
+            self.assertAlmostEqual(first_arm[0], MAX_CONDITIONED_ARM_STEP_RAD)
+            self.assertAlmostEqual(first_left[0], MAX_CONDITIONED_HAND_STEP_RAD[0])
+            self.assertAlmostEqual(first_right[0], MAX_CONDITIONED_HAND_STEP_RAD[0])
+            self.assertFalse(np.array_equal(first_arm, plan.arm[0]))
+            self.assertFalse(np.array_equal(first_left, plan.left_hand[0]))
+            self.assertTrue(child.thread.is_alive())
+
+    def test_conditioner_persists_across_sync_chunks_and_powered_hold_resets_it(self):
+        with _ChildHarness(
+            command_conditioning="xr",
+            conditioner_type=_RecordingConditioner,
+        ) as child:
+            conditioner = _RecordingConditioner.instance
+            assert conditioner is not None
+            self.assertEqual(conditioner.reset_count, 1)  # initialization endpoint
+
+            first = self._conditioner_jump_plan()
+            child.commands.put(
+                (
+                    "chunk",
+                    1,
+                    time.monotonic(),
+                    first.arm,
+                    first.left_hand,
+                    first.right_hand,
+                ),
+                timeout=0.2,
+            )
+            self.assertEqual(child.assert_status("completed"), 1)
+
+            second = self._conditioner_jump_plan()
+            second.arm[:, 0] = 0.7
+            second.left_hand[:, 0] = -0.5
+            second.right_hand[:, 0] = -0.5
+            child.commands.put(
+                (
+                    "chunk",
+                    2,
+                    time.monotonic(),
+                    second.arm,
+                    second.left_hand,
+                    second.right_hand,
+                ),
+                timeout=0.2,
+            )
+            self.assertEqual(child.assert_status("completed"), 2)
+            self.assertEqual(conditioner.reset_count, 1)
+            self.assertEqual(len(conditioner.desired), 2)
+            np.testing.assert_array_equal(conditioner.desired[-1][0], second.arm[0])
+
+            child.commands.put(("hold", time.monotonic()), timeout=0.2)
+            self.assertEqual(child.assert_status("holding"), 2)
+            self.assertEqual(conditioner.reset_count, 2)
+            self.assertIsNone(conditioner._started_at)
+            np.testing.assert_array_equal(conditioner._desired_arm, child.backend._arm_target)
+            np.testing.assert_array_equal(conditioner._desired_left, child.backend._left_target)
+            np.testing.assert_array_equal(conditioner._desired_right, child.backend._right_target)
+
+            child.urgent_hold.set()
+            self.assertEqual(child.assert_status("holding"), 2)
+            self.assertEqual(conditioner.reset_count, 3)
+            child.commands.put(("urgent_hold_barrier",), timeout=0.2)
+            self.assertEqual(child.assert_status("urgent_holding"), 2)
+            self.assertEqual(conditioner.reset_count, 4)
+
+    def test_conditioner_persists_across_rtc_replacement(self):
+        with _ChildHarness(
+            command_conditioning="xr",
+            conditioner_type=_RecordingConditioner,
+        ) as child:
+            conditioner = _RecordingConditioner.instance
+            assert conditioner is not None
+            original = self._conditioner_jump_plan(horizon=32)
+            child.commands.put(_rtc_start_command(1, original, action_budget=100), timeout=0.2)
+            self.assertEqual(child.assert_status("rtc_started"), 1)
+            child.wait_for_target_count(1)
+
+            child.commands.put(("rtc_snapshot", 1), timeout=0.2)
+            snapshot = child.assert_status("rtc_snapshot")
+            request_index = int(snapshot["action_index"])
+            overlap = original.length - request_index
+            replacement = self._conditioner_jump_plan(horizon=32)
+            replacement.arm[:, 0] = -0.5
+            replacement.left_hand[:, 0] = -0.5
+            replacement.right_hand[:, 0] = -0.5
+            child.commands.put(
+                (
+                    "rtc_replace",
+                    2,
+                    time.monotonic(),
+                    1,
+                    request_index,
+                    overlap,
+                    replacement.arm,
+                    replacement.left_hand,
+                    replacement.right_hand,
+                    replacement.length,
+                ),
+                timeout=0.2,
+            )
+            acknowledgement = child.assert_status("rtc_replaced")
+            self.assertGreaterEqual(int(acknowledgement["action_index"]), 0)
+
+            deadline = time.monotonic() + 0.2
+            while (
+                not any(desired_arm[0] < 0.0 for desired_arm, _, _ in conditioner.desired)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.002)
+            replacement_desired = [desired for desired in conditioner.desired if desired[0][0] < 0.0]
+            self.assertGreaterEqual(len(replacement_desired), 1)
+            self.assertEqual(conditioner.reset_count, 1)
+            np.testing.assert_array_equal(replacement_desired[0][0], replacement.arm[0])
+            self.assertTrue(child.thread.is_alive())
+
+    def test_conditioned_child_still_rejects_raw_nan_and_out_of_range_targets(self):
+        cases = []
+        nan_plan = self._conditioner_jump_plan()
+        nan_plan.arm[0, 0] = np.nan
+        cases.append(("NaN", nan_plan, "NaN or infinity"))
+        out_of_range = self._conditioner_jump_plan()
+        out_of_range.arm[0, 0] = ARM_UPPER[0] + 1.0
+        cases.append(("out of range", out_of_range, "outside its safety-margined joint range"))
+
+        for name, plan, expected in cases:
+            with self.subTest(name=name), _ChildHarness(command_conditioning="xr") as child:
+                child.commands.put(
+                    (
+                        "chunk",
+                        1,
+                        time.monotonic(),
+                        plan.arm,
+                        plan.left_hand,
+                        plan.right_hand,
+                    ),
+                    timeout=0.2,
+                )
+                kind, detail = child.statuses.get(timeout=1.0)
+                self.assertEqual(kind, "fault")
+                self.assertIn(expected, detail)
+                child.thread.join(timeout=1.0)
+                self.assertFalse(child.thread.is_alive())
+                self.assertEqual(child.backend.target_snapshot(), [])
+
+    def test_conditioned_child_rtc_still_rejects_raw_out_of_range_target(self):
+        with _ChildHarness(command_conditioning="xr") as child:
+            plan = self._conditioner_jump_plan(horizon=4)
+            plan.arm[2, 0] = ARM_UPPER[0] + 1.0
+            child.commands.put(_rtc_start_command(1, plan, action_budget=4), timeout=0.2)
+            kind, detail = child.statuses.get(timeout=1.0)
+            self.assertEqual(kind, "fault")
+            self.assertIn("outside its safety-margined joint range", detail)
+            child.thread.join(timeout=1.0)
+            self.assertFalse(child.thread.is_alive())
+            self.assertEqual(child.backend.target_snapshot(), [])
+
     def test_initial_rtc_inference_result_is_discarded_after_immediate_operator_key(self):
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
         args = SimpleNamespace(
@@ -693,6 +937,7 @@ class GrootG1RtcTests(unittest.TestCase):
 
             actuator.finish_immediate_hold()
             self.assertEqual(sequence, 1)
+            self.assertEqual(actuator._sequence, 1)
             self.assertTrue(actuator._holding)
             self.assertFalse(actuator._chunk_in_flight)
             self.assertIsNone(actuator._pending_sequence)
@@ -735,6 +980,7 @@ class GrootG1RtcTests(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertEqual(result, [1])
             actuator.finish_immediate_hold()
+            self.assertEqual(actuator._sequence, 1)
             self.assertTrue(actuator._holding)
             self.assertFalse(actuator._rtc_active)
             self.assertFalse(actuator._chunk_in_flight)

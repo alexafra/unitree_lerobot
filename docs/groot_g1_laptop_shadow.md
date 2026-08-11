@@ -177,7 +177,7 @@ Required output includes:
 ```text
 GR00T contract verified
 TeleImager head stream is live
-Publisher-free preflight passed
+Publisher-free raw-contract preflight passed
 SHADOW MODE: no command publishers were created
 Shadow chunk 5/5
 ```

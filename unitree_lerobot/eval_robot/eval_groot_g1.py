@@ -21,6 +21,7 @@ import sys
 import termios
 import threading
 import time
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -54,6 +55,7 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
 LOGGER = logging.getLogger("eval_groot_g1")
 LOCAL_POLICY_HOSTS = {"127.0.0.1", "localhost"}
 OPERATOR_CONFIRMATION_TIMEOUT_S = 60.0
+ALT_ESCAPE_WINDOW_S = 0.1
 PREVIEW_WINDOWS = ("GR00T input: ego_view", "GR00T input: depth_gray_view")
 STOP_COMMANDS = {"stop", "s"}
 EXIT_COMMANDS = {"quit", "q"}
@@ -73,13 +75,14 @@ class _OperatorTerminal:
     """Capture active-motion ``s``/``q`` keys without requiring Enter.
 
     Raw key capture is enabled only while a policy goal is actively executing.
-    Armed line prompts use their own explicit q/Shift-Q/Shift-S mapping.
+    Armed line prompts use their own explicit q/Alt-Q/uppercase-S mapping.
     The reader thread performs only thread-safe event signalling; it never
     consumes actuator status acknowledgements.
     """
 
-    def __init__(self, actuator: SafeG1Dex3Actuator):
+    def __init__(self, actuator: SafeG1Dex3Actuator, *, stop_enabled: bool = True):
         self._actuator = actuator
+        self._stop_enabled = stop_enabled
         self._commands: queue.Queue[str | BaseException] = queue.Queue()
         self._stopping = threading.Event()
         self._thread: threading.Thread | None = None
@@ -98,6 +101,7 @@ class _OperatorTerminal:
             saved = termios.tcgetattr(fd)
             active = saved.copy()
             active[6] = saved[6][:]
+            active[0] &= ~termios.IXON
             active[3] &= ~(termios.ICANON | termios.ECHO)
             active[6][termios.VMIN] = 1
             active[6][termios.VTIME] = 0
@@ -106,17 +110,41 @@ class _OperatorTerminal:
             raise DeploymentError("Immediate operator keys require an interactive POSIX terminal") from exc
         self._fd = fd
         self._saved_attributes = saved
+        stop_sent = False
+        release_sent = False
+        # Drain keys that landed in the tiny transition from the preceding
+        # prompt before starting the reader thread. This ensures a rapid rq
+        # cannot launch a motion before q becomes visible to the operator
+        # control path.
+        try:
+            while True:
+                readable, _, _ = select.select([fd], [], [], 0.0)
+                if not readable:
+                    break
+                value = os.read(fd, 1)
+                if value == b"":
+                    raise DeploymentError("stdin closed while command authority was active")
+                stop_sent = self._handle_key(value, stop_sent)
+                if value in {b"q", b"Q", b"\x11"}:
+                    release_sent = True
+                    break
+        except (OSError, ValueError, DeploymentError) as exc:
+            termios.tcsetattr(fd, termios.TCSANOW, saved)
+            self._actuator.request_immediate_release()
+            raise DeploymentError("Could not poll buffered operator keys") from exc
+        if release_sent:
+            return self
         self._thread = threading.Thread(
             target=self._read_keys,
             name="groot-operator-keys",
             daemon=True,
+            args=(stop_sent,),
         )
         self._thread.start()
         return self
 
-    def _read_keys(self) -> None:
+    def _read_keys(self, stop_sent: bool = False) -> None:
         assert self._fd is not None
-        stop_sent = False
         try:
             while not self._stopping.is_set():
                 readable, _, _ = select.select([self._fd], [], [], 0.05)
@@ -126,7 +154,7 @@ class _OperatorTerminal:
                 if value == b"":
                     raise DeploymentError("stdin closed while command authority was active")
                 stop_sent = self._handle_key(value, stop_sent)
-                if value in {b"q", b"Q"}:
+                if value in {b"q", b"Q", b"\x11"}:
                     return
         except BaseException as exc:
             # Input failure is fail-closed: begin release even if the main
@@ -137,11 +165,11 @@ class _OperatorTerminal:
                 self._commands.put(exc)
 
     def _handle_key(self, value: bytes, stop_sent: bool) -> bool:
-        if value in {b"s", b"S"} and not stop_sent:
+        if self._stop_enabled and value in {b"s", b"S"} and not stop_sent:
             self._actuator.request_immediate_hold()
             self._commands.put("hold")
             return True
-        if value in {b"q", b"Q"}:
+        if value in {b"q", b"Q", b"\x11"}:
             self._actuator.request_immediate_release()
             self._commands.put("release")
         return stop_sent
@@ -185,10 +213,111 @@ class _OperatorTerminal:
                 stop_sent = self._handle_key(value, stop_sent)
         if self._fd is not None and self._saved_attributes is not None:
             try:
-                termios.tcsetattr(self._fd, termios.TCSAFLUSH, self._saved_attributes)
+                # Preserve a q/Q that lands just after the final drain so the
+                # next armed phase can still honor it without Enter.
+                termios.tcsetattr(self._fd, termios.TCSANOW, self._saved_attributes)
             except (OSError, ValueError, termios.error) as exc:
                 self._actuator.request_immediate_release()
                 raise DeploymentError("Could not restore the operator terminal; releasing authority") from exc
+
+
+def _readline_before_authority(prompt: str, *, confirmation_mode: bool = False) -> str:
+    """Read unarmed text or an r/s/q single-key confirmation."""
+
+    if not sys.stdin.isatty():
+        print(prompt, end="", flush=True)
+        response = sys.stdin.readline()
+        if response == "":
+            raise DeploymentError("stdin closed while waiting for operator input")
+        response = response.strip()
+        if not confirmation_mode:
+            return response
+        lowered = response.lower()
+        if lowered == "r":
+            return "continue"
+        if lowered == "s":
+            return "stop"
+        if lowered == "q":
+            raise OperatorRelease
+        raise DeploymentError("Expected single-key r to continue, s to cancel, or q to quit")
+    try:
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        active = saved.copy()
+        active[6] = saved[6][:]
+        active[0] &= ~termios.IXON
+        active[3] &= ~(termios.ICANON | termios.ECHO)
+        active[6][termios.VMIN] = 1
+        active[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, active)
+    except (AttributeError, OSError, TypeError, ValueError, termios.error) as exc:
+        print()
+        raise DeploymentError("Operator input requires an interactive POSIX terminal") from exc
+
+    print(prompt, end="", flush=True)
+    entered = bytearray()
+    try:
+        while True:
+            value = os.read(fd, 1)
+            if value == b"":
+                raise DeploymentError("stdin closed while waiting for operator input")
+            if value in {b"q", b"Q", b"\x11"}:
+                print()
+                raise OperatorRelease
+            if confirmation_mode:
+                if value in {b"r", b"R"}:
+                    print()
+                    return "continue"
+                if value in {b"s", b"S"}:
+                    print()
+                    return "stop"
+                # Confirmation prompts deliberately ignore every other key;
+                # no line or Enter key is required.
+                continue
+            if value in {b"\r", b"\n"}:
+                print()
+                try:
+                    return entered.decode("utf-8").strip()
+                except UnicodeDecodeError as exc:
+                    raise DeploymentError("Operator input is not valid UTF-8") from exc
+            if value in {b"\x08", b"\x7f"}:
+                if entered:
+                    entered.pop()
+                    print("\b \b", end="", flush=True)
+                continue
+            if value >= b" " and value != b"\x7f":
+                entered.extend(value)
+                print(value.decode("utf-8", errors="ignore"), end="", flush=True)
+    finally:
+        # Do not discard a q that arrived immediately after r. The next
+        # operator-key monitor must be able to release before any motion starts.
+        termios.tcsetattr(fd, termios.TCSANOW, saved)
+
+
+def _confirm_before_authority(prompt: str) -> str:
+    """Return ``continue``/``stop`` from one r/s key; q raises release."""
+
+    return _readline_before_authority(prompt, confirmation_mode=True)
+
+
+def _run_blocking_motion_with_immediate_release(
+    actuator: SafeG1Dex3Actuator,
+    operation: Callable[[], None],
+) -> None:
+    """Keep q/Q live while an initialization-style motion blocks the main thread."""
+
+    with _OperatorTerminal(actuator, stop_enabled=False) as terminal:
+        if terminal.poll_control() == "release":
+            raise OperatorRelease
+        try:
+            operation()
+        except ImmediateControlEvent as exc:
+            if exc.action == "release":
+                raise OperatorRelease from exc
+            raise
+    checker = getattr(actuator, "immediate_control_requested", None)
+    if callable(checker) and checker() == "release":
+        raise OperatorRelease
 
 
 @dataclass(frozen=True)
@@ -297,7 +426,7 @@ def select_instruction(task_name: str | None, custom_goal: str | None = None) ->
     for index, name in enumerate(task_names, start=1):
         print(f"  {index}. {name:16s}  {TASKS[name]}")
     try:
-        selected = int(input("Task number: ").strip())
+        selected = int(_readline_before_authority("Task number: "))
         name = task_names[selected - 1]
     except (EOFError, ValueError, IndexError) as exc:
         raise DeploymentError("A valid trained task must be selected") from exc
@@ -309,11 +438,8 @@ def confirm_custom_goal(instruction: str) -> None:
         f"\nCUSTOM GOAL IS NOT AN EXACT TRAINING INSTRUCTION:\n  {instruction}\n"
         "Behavior may be outside the fine-tuning distribution. All normal motion checks remain active."
     )
-    try:
-        response = input("Type YES to send this custom goal to GR00T: ")
-    except EOFError as exc:
-        raise DeploymentError("Custom goal confirmation requires interactive input") from exc
-    if response.strip() != "YES":
+    response = _readline_before_authority("Type YES to send this custom goal to GR00T: ")
+    if response != "YES":
         raise DeploymentError("Custom goal was not confirmed")
 
 
@@ -386,9 +512,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise DeploymentError("--rtc-ramp-rate must be a finite positive number")
     if inference_mode != "rtc" and (rtc_frozen_steps is not None or rtc_ramp_rate is not None):
         raise DeploymentError("RTC tuning options require --inference-mode rtc")
+    command_conditioning = getattr(args, "command_conditioning", "xr")
+    if command_conditioning not in {"none", "xr"}:
+        raise DeploymentError("--command-conditioning must be none or xr")
 
 
 def confirm_actuation(simulation: bool, task_name: str, instruction: str) -> None:
+    if not sys.stdin.isatty():
+        raise DeploymentError("Actuation requires an interactive TTY so immediate s/q operator keys are available")
     if simulation:
         print(
             f"\nSIMULATION DDS COMMANDS ENABLED for {task_name!r}: {instruction}\n"
@@ -397,8 +528,6 @@ def confirm_actuation(simulation: bool, task_name: str, instruction: str) -> Non
         )
         required = "SIMULATE"
     else:
-        if not sys.stdin.isatty():
-            raise DeploymentError("Real actuation requires an interactive terminal; piped confirmations are refused")
         print(
             "\nREAL ROBOT ACTUATION ENABLED. Confirm Regular motion mode, a clear and "
             "supported workspace, correct DDS interface, and an operator holding the "
@@ -410,8 +539,11 @@ def confirm_actuation(simulation: bool, task_name: str, instruction: str) -> Non
         )
         print(f"Task {task_name!r}: {instruction}")
         required = "ACTUATE"
-    if input(f"Type {required} to create command publishers: ").strip() != required:
-        raise DeploymentError("Actuation was not confirmed")
+    response = _confirm_before_authority(
+        f"Press r to confirm {required} and create command publishers (no Enter); s/q cancels: "
+    )
+    if response != "continue":
+        raise OperatorRelease
 
 
 def _readline_while_armed(
@@ -419,13 +551,20 @@ def _readline_while_armed(
     prompt: str,
     *,
     timeout_s: float | None,
+    confirmation_mode: bool = False,
 ) -> str:
     """Read a terminal line while continuously servicing the actuator watchdog."""
 
-    print(prompt, end="", flush=True)
     deadline = None if timeout_s is None else time.monotonic() + timeout_s
     if sys.stdin.isatty():
-        return _readline_with_immediate_prompt_controls(actuator, deadline)
+        return _readline_with_immediate_prompt_controls(
+            actuator,
+            prompt,
+            deadline,
+            confirmation_mode=confirmation_mode,
+        )
+    LOGGER.warning("stdin is not a TTY; armed input is line-buffered and immediate keys are unavailable")
+    print(prompt, end="", flush=True)
     while True:
         actuator.heartbeat()
         actuator.assert_healthy()
@@ -444,18 +583,32 @@ def _readline_while_armed(
         response = sys.stdin.readline()
         if response == "":
             raise DeploymentError("stdin closed while command authority was active")
-        return response.strip()
+        response = response.strip()
+        if not confirmation_mode:
+            return response
+        lowered = response.lower()
+        if lowered == "r":
+            return "continue"
+        if lowered == "s":
+            return "stop"
+        if lowered == "q":
+            return "q"
+        raise DeploymentError("Expected single-key r to continue, s to STOP, or q to release")
 
 
 def _readline_with_immediate_prompt_controls(
     actuator: SafeG1Dex3Actuator,
+    prompt: str,
     deadline: float | None,
+    *,
+    confirmation_mode: bool = False,
 ) -> str:
-    """Read an armed line while keeping lowercase ``q`` as a global release key.
+    """Read an armed line while keeping the physical Q key fail-safe.
 
-    Shift-Q inserts a literal lowercase q into custom text. Lowercase s remains
-    ordinary prompt text, while Shift-S requests the powered STOP state. Both
-    common Backspace byte encodings remain available for editing.
+    Either q/Q releases immediately. Alt-q inserts a literal lowercase q and
+    Alt-Shift-q inserts a literal capital Q into custom text. Lowercase s
+    remains ordinary prompt text, while uppercase S requests the powered STOP
+    state. Both common Backspace encodings remain available for editing.
     """
 
     try:
@@ -463,6 +616,7 @@ def _readline_with_immediate_prompt_controls(
         saved = termios.tcgetattr(fd)
         active = saved.copy()
         active[6] = saved[6][:]
+        active[0] &= ~termios.IXON
         active[3] &= ~(termios.ICANON | termios.ECHO)
         active[6][termios.VMIN] = 1
         active[6][termios.VTIME] = 0
@@ -471,7 +625,12 @@ def _readline_with_immediate_prompt_controls(
         print()
         raise DeploymentError("Armed input requires an interactive POSIX terminal") from exc
 
+    # Display the prompt only after ICANON is disabled. Otherwise a fast key
+    # pressed as the prompt appears can enter the old canonical input buffer
+    # and remain unavailable until Enter is pressed.
+    print(prompt, end="", flush=True)
     entered = bytearray()
+    alt_prefix_at: float | None = None
     try:
         while True:
             actuator.heartbeat()
@@ -479,9 +638,7 @@ def _readline_with_immediate_prompt_controls(
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0.0:
                 print()
-                raise DeploymentError(
-                    "Timed out waiting for armed operator input; releasing command authority"
-                )
+                raise DeploymentError("Timed out waiting for armed operator input; releasing command authority")
             wait_s = 0.1 if remaining is None else min(0.1, remaining)
             try:
                 readable, _, _ = select.select([fd], [], [], wait_s)
@@ -493,15 +650,29 @@ def _readline_with_immediate_prompt_controls(
             value = os.read(fd, 1)
             if value == b"":
                 raise DeploymentError("stdin closed while command authority was active")
-            if value == b"q":
+            now = time.monotonic()
+            if value == b"\x1b":
+                # Most POSIX terminals encode an Alt chord as ESC followed by
+                # the modified character. Keep the escape window deliberately
+                # short so a standalone Escape cannot suppress a later q.
+                alt_prefix_at = now
+                continue
+            is_alt_q = (
+                value in {b"q", b"Q"} and alt_prefix_at is not None and now - alt_prefix_at <= ALT_ESCAPE_WINDOW_S
+            )
+            alt_prefix_at = None
+            if is_alt_q:
+                entered.extend(value)
+                print(value.decode("ascii"), end="", flush=True)
+                continue
+            if value in {b"q", b"Q", b"\x11"}:
                 actuator.request_immediate_release()
                 print()
                 return "q"
-            if value == b"Q":  # Shift-Q: escaped literal q
-                entered.extend(b"q")
-                print("q", end="", flush=True)
-                continue
-            if value == b"S":  # Shift-S: powered STOP command
+            if confirmation_mode and value in {b"r", b"R"}:
+                print()
+                return "continue"
+            if value == b"S" or (confirmation_mode and value == b"s"):
                 try:
                     actuator.request_immediate_hold()
                 except DeploymentError:
@@ -510,6 +681,11 @@ def _readline_with_immediate_prompt_controls(
                     pass
                 print()
                 return "stop"
+            if confirmation_mode:
+                # The three-key confirmation protocol needs no line editing
+                # and deliberately ignores every unrelated key, including
+                # Enter. Only r/s/q can change state.
+                continue
             if value in {b"\r", b"\n"}:
                 print()
                 try:
@@ -526,7 +702,11 @@ def _readline_with_immediate_prompt_controls(
                 print(value.decode("utf-8", errors="ignore"), end="", flush=True)
     finally:
         try:
-            termios.tcsetattr(fd, termios.TCSAFLUSH, saved)
+            # Preserve any key that arrived just after an uppercase-S STOP.
+            # In particular, a following q/Q must remain available to win at
+            # the next armed read rather than being discarded during the
+            # STOP-to-HOLD transition.
+            termios.tcsetattr(fd, termios.TCSANOW, saved)
         except (OSError, ValueError, termios.error) as exc:
             actuator.request_immediate_release()
             raise DeploymentError("Could not restore the armed terminal; releasing authority") from exc
@@ -536,6 +716,8 @@ def _confirm_while_armed(
     actuator: SafeG1Dex3Actuator,
     message: str,
     required: str,
+    *,
+    stop_is_already_held: bool = False,
 ) -> None:
     """Wait for bounded operator confirmation without starving the heartbeat."""
 
@@ -544,23 +726,25 @@ def _confirm_while_armed(
         try:
             response = _readline_while_armed(
                 actuator,
-                f"Type {required} to continue: ",
+                f"Press r to {required} (no Enter); s STOP; q release: ",
                 timeout_s=OPERATOR_CONFIRMATION_TIMEOUT_S,
+                confirmation_mode=True,
             )
         except DeploymentError as exc:
             if str(exc).startswith("Timed out waiting for armed operator input"):
                 raise DeploymentError(f"Timed out waiting for {required}; releasing command authority") from exc
             raise
-        if response == required:
+        if response == "continue":
             return
         lowered = response.lower()
         if lowered in EXIT_COMMANDS:
             raise OperatorRelease
         if lowered in STOP_COMMANDS:
-            _finish_operator_stop(actuator)
-            LOGGER.info("Command remains stopped; still waiting for exact %s", required)
+            if not stop_is_already_held:
+                _finish_operator_stop(actuator)
+            LOGGER.info("Command remains stopped; press r to %s when ready", required)
             continue
-        raise DeploymentError(f"Expected {required}; releasing command authority")
+        raise DeploymentError(f"Expected r to {required}; releasing command authority")
 
 
 def _poll_active_command(terminal: _OperatorTerminal | None = None) -> str | None:
@@ -600,8 +784,8 @@ def _select_next_goal_while_holding(
     print(
         "\nSTOPPED IN A POWERED POSITION HOLD. GR00T requests are stopped.\n"
         "Enter a trained task ID/number/exact instruction, or arbitrary custom goal text.\n"
-        "Press q to release immediately (no Enter); use Shift-Q to type a literal q. "
-        "Press Shift-S to remain stopped. Ctrl-C also releases."
+        "Press q or Q to release immediately (no Enter); Alt-q types q and "
+        "Alt-Shift-q types Q. Press uppercase S to remain stopped. Ctrl-C also releases."
     )
     for index, (task_name, instruction) in enumerate(TASKS.items(), start=1):
         print(f"  {index}. {task_name:16s}  {instruction}")
@@ -655,7 +839,12 @@ def confirm_initialization(actuator: SafeG1Dex3Actuator, spec: InitializationSpe
         warning += " XR-home targets all 14 arm joints and both 7-joint Dex3 hands to zero; both hands must be empty."
     elif spec.moves_hands:
         warning += " This pose explicitly moves one or both hands; verify their contents."
-    _confirm_while_armed(actuator, warning, "INITIALIZE")
+    _confirm_while_armed(
+        actuator,
+        warning,
+        "INITIALIZE",
+        stop_is_already_held=True,
+    )
 
 
 def confirm_policy_start(actuator: SafeG1Dex3Actuator, spec: InitializationSpec) -> None:
@@ -677,10 +866,11 @@ def _confirm_goal_transition(
     print(message)
     response = _readline_while_armed(
         actuator,
-        f"Type {required} to continue (Shift-S STOP; q immediately releases): ",
+        f"Press r to {required} (no Enter); s STOP; q release: ",
         timeout_s=OPERATOR_CONFIRMATION_TIMEOUT_S,
+        confirmation_mode=True,
     )
-    if response == required:
+    if response == "continue":
         return "continue"
     lowered = response.lower()
     if lowered in STOP_COMMANDS:
@@ -689,7 +879,7 @@ def _confirm_goal_transition(
         return "hold"
     if lowered in EXIT_COMMANDS:
         return "release"
-    raise DeploymentError(f"Expected {required}; releasing command authority")
+    raise DeploymentError(f"Expected r to {required}; releasing command authority")
 
 
 def confirm_policy_warm_start(actuator: SafeG1Dex3Actuator, delta_summary: str) -> str:
@@ -792,6 +982,7 @@ def infer_chunk(
     actuator: SafeG1Dex3Actuator | None = None,
     camera_timeout_s: float = 0.5,
     validate_initial_step: bool = True,
+    command_conditioning: str = "none",
     show_camera: bool = False,
     allow_custom_instruction: bool = False,
 ) -> tuple[ActionChunk, float]:
@@ -823,6 +1014,7 @@ def infer_chunk(
         current_left=state.left_hand,
         current_right=state.right_hand,
         validate_initial_step=validate_initial_step,
+        validate_target_steps=command_conditioning == "none",
     )
     return chunk, inference_s
 
@@ -836,6 +1028,7 @@ def infer_plan(
     actuator: SafeG1Dex3Actuator | None = None,
     camera_timeout_s: float = 0.5,
     validate_initial_step: bool = True,
+    command_conditioning: str = "none",
     show_camera: bool = False,
     allow_custom_instruction: bool = False,
 ) -> tuple[ActionChunk, float]:
@@ -867,6 +1060,7 @@ def infer_plan(
             current_left=state.left_hand,
             current_right=state.right_hand,
             validate_initial_step=validate_initial_step,
+            validate_target_steps=command_conditioning == "none",
         ),
         inference_s,
     )
@@ -897,23 +1091,35 @@ def _prepare_policy_goal(
 ) -> str:
     """Reset a goal session and optionally perform its guarded warm-start."""
 
-    policy.reset()
-    if not getattr(args, "policy_warm_start", False):
-        return "ready"
+    try:
+        _run_with_immediate_operator_keys(actuator, policy.reset)
+        if not getattr(args, "policy_warm_start", False):
+            return "ready"
 
-    warm_start_chunk, inference_s = infer_chunk(
-        policy,
-        state_reader,
-        camera,
-        instruction,
-        contract,
-        args.execution_horizon,
-        actuator,
-        validate_initial_step=False,
-        show_camera=getattr(args, "show_camera", False),
-        allow_custom_instruction=allow_custom_instruction,
-    )
-    delta_summary = chunk_delta_summary(warm_start_chunk, state_reader)
+        warm_start_chunk, inference_s = _run_with_immediate_operator_keys(
+            actuator,
+            lambda: infer_chunk(
+                policy,
+                state_reader,
+                camera,
+                instruction,
+                contract,
+                args.execution_horizon,
+                actuator,
+                validate_initial_step=False,
+                command_conditioning=getattr(args, "command_conditioning", "xr"),
+                show_camera=getattr(args, "show_camera", False),
+                allow_custom_instruction=allow_custom_instruction,
+            ),
+        )
+        delta_summary = _run_with_immediate_operator_keys(
+            actuator,
+            lambda: chunk_delta_summary(warm_start_chunk, state_reader),
+        )
+    except OperatorStop:
+        return "hold"
+    except OperatorRelease:
+        return "release"
     LOGGER.warning(
         "Fresh policy warm-start target inferred in %.3fs: %s",
         inference_s,
@@ -922,12 +1128,20 @@ def _prepare_policy_goal(
     decision = confirm_policy_warm_start(actuator, delta_summary)
     if decision in {"hold", "release"}:
         return decision
-    actuator.warm_start(warm_start_chunk)
+    _run_blocking_motion_with_immediate_release(
+        actuator,
+        lambda: actuator.warm_start(warm_start_chunk),
+    )
     LOGGER.warning("Policy warm-start reached the first target; inferred chunk discarded")
     decision = confirm_policy_continue(actuator)
     if decision in {"hold", "release"}:
         return decision
-    policy.reset()
+    try:
+        _run_with_immediate_operator_keys(actuator, policy.reset)
+    except OperatorStop:
+        return "hold"
+    except OperatorRelease:
+        return "release"
     return "ready"
 
 
@@ -956,6 +1170,33 @@ def _finish_operator_stop(actuator: SafeG1Dex3Actuator) -> None:
             raise OperatorRelease
     else:
         actuator.hold()
+
+
+def _run_with_immediate_operator_keys(
+    actuator: SafeG1Dex3Actuator,
+    operation: Callable[[], object],
+) -> object:
+    """Run one blocking policy/client call while s/q remain immediate."""
+
+    with _OperatorTerminal(actuator):
+        try:
+            result = operation()
+        except ImmediateControlEvent as exc:
+            if exc.action == "release":
+                raise OperatorRelease from exc
+            _finish_operator_stop(actuator)
+            raise OperatorStop from exc
+        except OperatorStop:
+            _finish_operator_stop(actuator)
+            raise
+    checker = getattr(actuator, "immediate_control_requested", None)
+    requested = checker() if callable(checker) else None
+    if requested == "release":
+        raise OperatorRelease
+    if requested == "hold":
+        _finish_operator_stop(actuator)
+        raise OperatorStop
+    return result
 
 
 def _run_active_goal(
@@ -1040,6 +1281,7 @@ def _run_active_goal_controlled(
             contract,
             args.execution_horizon,
             actuator,
+            command_conditioning=getattr(args, "command_conditioning", "xr"),
             show_camera=getattr(args, "show_camera", False),
             allow_custom_instruction=allow_custom_instruction,
         )
@@ -1201,6 +1443,7 @@ def _run_active_goal_rtc_controlled(
         instruction,
         contract,
         actuator,
+        command_conditioning=getattr(args, "command_conditioning", "xr"),
         show_camera=getattr(args, "show_camera", False),
         allow_custom_instruction=allow_custom_instruction,
     )
@@ -1289,6 +1532,7 @@ def _run_active_goal_rtc_controlled(
                         # independently validates the actual old-target -> B[k]
                         # handoff after measuring how many actions elapsed.
                         validate_initial_step=False,
+                        validate_target_steps=getattr(args, "command_conditioning", "xr") == "none",
                     )
                     current_sequence, actual_delay = actuator.replace_rtc(
                         replacement,
@@ -1471,6 +1715,7 @@ def _run_shadow_rtc(
                     current_left=reference_state.left_hand,
                     current_right=reference_state.right_hand,
                     validate_initial_step=False,
+                    validate_target_steps=getattr(args, "command_conditioning", "xr") == "none",
                 )
                 actual_delay = plan_index - int(pending["request_index"])
                 if actual_delay < 0 or actual_delay >= int(pending["overlap"]):
@@ -1481,12 +1726,13 @@ def _run_shadow_rtc(
                     right_hand=np.ascontiguousarray(replacement.right_hand[actual_delay:]),
                 )
                 previous_index = max(0, plan_index - 1)
-                validate_action_chunk(
-                    suffix,
-                    plan.arm[previous_index],
-                    plan.left_hand[previous_index],
-                    plan.right_hand[previous_index],
-                )
+                if getattr(args, "command_conditioning", "xr") == "none":
+                    validate_action_chunk(
+                        suffix,
+                        plan.arm[previous_index],
+                        plan.left_hand[previous_index],
+                        plan.right_hand[previous_index],
+                    )
                 plan = replacement
                 plan_index = actual_delay
                 generation += 1
@@ -1643,6 +1889,14 @@ def run(args: argparse.Namespace) -> None:
             ",".join(contract.video_keys),
             contract.action_horizon,
         )
+        if getattr(args, "command_conditioning", "xr") == "xr":
+            LOGGER.info(
+                "XR command conditioning enabled: 100 Hz arm lead 0.08->0.12 rad/5s; "
+                "no second Dex3 low-pass; nominal final slew arm=0.03 rad/write, "
+                "hand=0.06857 thumb0/0.12 other joints rad/write"
+            )
+        else:
+            LOGGER.warning("XR command conditioning disabled; raw policy target-step rejection is active")
 
         initialize_dds(args.sim, args.network_interface)
         state_reader = G1Dex3StateReader(simulation=args.sim)
@@ -1672,6 +1926,7 @@ def run(args: argparse.Namespace) -> None:
                 show_camera=getattr(args, "show_camera", False),
                 allow_custom_instruction=allow_custom_instruction,
                 validate_initial_step=preflight_validation,
+                command_conditioning=getattr(args, "command_conditioning", "xr"),
             )
         else:
             preflight, inference_s = infer_chunk(
@@ -1685,12 +1940,20 @@ def run(args: argparse.Namespace) -> None:
                 show_camera=getattr(args, "show_camera", False),
                 allow_custom_instruction=allow_custom_instruction,
                 # Shadow never executes or warm-starts this result, so its passive
-                # measured pose is not a meaningful execution reference. Skip only
-                # measured-q -> action[0]; all remaining checks stay enabled.
+                # measured pose is not a meaningful execution reference. Raw
+                # structure/finiteness/ranges remain hard; with XR conditioning,
+                # executable step checks occur later on final child commands.
                 validate_initial_step=preflight_validation,
+                command_conditioning=getattr(args, "command_conditioning", "xr"),
             )
+        preflight_label = (
+            "Publisher-free raw-contract preflight"
+            if getattr(args, "command_conditioning", "xr") == "xr"
+            else "Publisher-free preflight"
+        )
         LOGGER.info(
-            "Publisher-free preflight passed in %.3fs: %s",
+            "%s passed in %.3fs: %s",
+            preflight_label,
             inference_s,
             chunk_delta_summary(preflight, state_reader),
         )
@@ -1728,9 +1991,10 @@ def run(args: argparse.Namespace) -> None:
                     allow_custom_instruction=allow_custom_instruction,
                     # No shadow action is executed, so each request remains
                     # anchored to the unchanged passive robot pose.  Report
-                    # that pose gap below, but do not treat it as a commanded
-                    # 30 Hz transition.
+                    # that pose gap below. Raw structure/finiteness/ranges remain
+                    # hard, but there is no actuator child to exercise conditioning.
                     validate_initial_step=False,
+                    command_conditioning=getattr(args, "command_conditioning", "xr"),
                 )
                 LOGGER.info(
                     "Shadow chunk %d/%d: inference %.3fs, %s",
@@ -1742,13 +2006,20 @@ def run(args: argparse.Namespace) -> None:
             return
 
         confirm_actuation(args.sim, task_name, instruction)
-        actuator = SafeG1Dex3Actuator(args.sim, args.network_interface)
-        actuator.start()
-        actuator.arm()
+        actuator = SafeG1Dex3Actuator(
+            args.sim,
+            args.network_interface,
+            getattr(args, "command_conditioning", "xr"),
+        )
+        _run_blocking_motion_with_immediate_release(actuator, actuator.start)
+        _run_blocking_motion_with_immediate_release(actuator, actuator.arm)
         LOGGER.warning("%s COMMAND MODE ARMED", "SIMULATION" if args.sim else "REAL ROBOT")
 
         confirm_initialization(actuator, initialization)
-        actuator.initialize(initialization)
+        _run_blocking_motion_with_immediate_release(
+            actuator,
+            lambda: actuator.initialize(initialization),
+        )
         LOGGER.warning("Initialization completed: %s", initialization.label)
         confirm_policy_start(actuator, initialization)
 
@@ -1859,6 +2130,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Blocking chunk execution (default) or experimental asynchronous Real-Time Chunking",
     )
     parser.add_argument(
+        "--command-conditioning",
+        choices=("xr", "none"),
+        default="xr",
+        help=(
+            "Condition final policy commands in the 100 Hz actuator (default: xr): apply XR's "
+            "measured-relative arm command-lead limiter and final arm/hand slew limits. Dex3 policy "
+            "targets are not low-pass filtered a second time. Raw shape/finite/joint-limit "
+            "validation remains mandatory; use none only for comparison"
+        ),
+    )
+    parser.add_argument(
         "--rtc-frozen-steps",
         type=int,
         help=(
@@ -1901,7 +2183,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--actuate",
         action="store_true",
-        help="Create command publishers after preflight and confirmation",
+        help="Create command publishers after preflight and the single-key r confirmation",
     )
     parser.add_argument(
         "--allow-unqualified-real",

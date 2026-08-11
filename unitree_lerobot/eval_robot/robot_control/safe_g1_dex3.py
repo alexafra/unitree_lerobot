@@ -8,6 +8,7 @@ leave an action chunk advancing indefinitely.
 from __future__ import annotations
 
 import contextlib
+from collections import deque
 from dataclasses import dataclass
 import logging
 import multiprocessing as mp
@@ -26,15 +27,27 @@ from unitree_lerobot.eval_robot.groot_client import DeploymentError
 from unitree_lerobot.eval_robot.image_server.rgbd_protocol import RGBD_PROTOCOL
 from unitree_lerobot.eval_robot.groot_contract import (
     ActionChunk,
+    ARM_DOF,
     ARM_JOINT_NAMES,
+    ARM_LOWER,
+    ARM_UPPER,
     CONTROL_HZ,
     DepthEncodingContract,
     EXPECTED_DEPTH_VIEW_SHAPE,
     EXPECTED_EGO_VIEW_SHAPE,
+    HAND_LIMIT_TOLERANCE_RAD,
     InitializationSpec,
+    HAND_DOF,
+    JOINT_LIMIT_MARGIN_RAD,
+    LEFT_HAND_LOWER,
     LEFT_HAND_JOINT_NAMES,
+    LEFT_HAND_UPPER,
+    MAX_ARM_STEP_RAD,
+    RIGHT_HAND_LOWER,
     RIGHT_HAND_JOINT_NAMES,
+    RIGHT_HAND_UPPER,
     validate_action_chunk,
+    validate_action_chunk_limits,
     validate_initialization_spec,
     validate_measured_state,
 )
@@ -48,12 +61,27 @@ ACTUATOR_STATE_MAX_AGE_S = 0.075
 HEARTBEAT_TIMEOUT_S = 1.0
 CHUNK_MAX_AGE_S = 0.25
 ARM_AUTHORITY_RAMP_S = 1.5
+# CHANGEDSAFETY: original local adapter default was 1.0 s; current is 1.5 s.
+# This is the orderly arm_sdk authority ramp-down duration.
 ARM_RELEASE_RAMP_S = 1.5
 PUBLISH_HZ = 100.0
 DDS_WRITE_TIMEOUT_S = 0.5
-MAX_ARM_DQ_RAD_S = 12.0
+# CHANGEDSAFETY: original local adapter default was 6.0 rad/s, it was experimentally
+# relaxed to 12.0 rad/s, and the current reviewed value restores the original 6.0 rad/s.
+# This is the local measured arm-dq watchdog ceiling, not an official Unitree limit.
+MAX_ARM_DQ_RAD_S = 6.0
 MAX_ARM_TRACKING_ERROR_RAD = 0.35
-MAX_HAND_TRACKING_ERROR_RAD = 1
+# CHANGEDSAFETY: original local adapter default was 0.50 rad; current is 1.50 rad.
+# This is max abs(measured hand q - commanded hand q), not a speed limit.
+MAX_HAND_TRACKING_ERROR_RAD = 1.5
+# The original 0.50-rad threshold remains a warning-only diagnostic.  It must
+# persist across distinct hand-state samples for 0.20 s; 0.40 rad hysteresis
+# prevents repeated warnings at the boundary.  Only the aligned 1.50-rad gate
+# above is an actuator fault.
+HAND_TRACKING_WARNING_RAD = 0.50
+HAND_TRACKING_WARNING_CLEAR_RAD = 0.40
+HAND_TRACKING_WARNING_DWELL_S = 0.20
+HAND_COMMAND_HISTORY_SIZE = 128
 TRACKING_GRACE_S = 0.50
 MAX_ACTION_LATENESS_S = 0.02
 # OFFICIAL: Unitree G1 asset mapping identifies mode_machine 5 as
@@ -80,6 +108,32 @@ INITIALIZATION_HAND_TOLERANCE_RAD = 0.10
 INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S = 0.10
 INITIALIZATION_MAX_POSITION_DRIFT_RAD = 0.02
 INITIALIZATION_COMMAND_MAX_AGE_S = 0.25
+
+# CHANGEDSAFETY: the original deployment adapter had no policy-output
+# conditioner. XR conditioning is now the CLI default; ``none`` preserves the
+# original fail-on-raw-step behavior for controlled comparisons.
+# XR's recorded arm action is already the post-IK, four-sample moving-average
+# target.  The final real-arm publisher target was not recorded: at 250 Hz it
+# globally rescaled desired-minus-measured q to a 0.08 rad lead, ramping to
+# 0.12 rad over five seconds.  Preserve those command-lead values at this
+# adapter's 100 Hz publisher instead of incorrectly multiplying 20/30 rad/s by
+# the slower period.
+XR_ARM_INITIAL_COMMAND_LEAD_RAD = 20.0 / 250.0
+XR_ARM_FINAL_COMMAND_LEAD_RAD = 30.0 / 250.0
+XR_ARM_COMMAND_LEAD_RAMP_S = 5.0
+# Dex3 targets in the dataset already passed XR's alpha=0.2 retargeting filter.
+# Do not apply that filter again here. The policy target feeds the final range
+# and command-slew conditioner directly.
+# CHANGEDSAFETY: the immediately pre-conditioner configuration checked 0.10 rad
+# arm and 0.60 rad hand target steps at 30 Hz and had no 100 Hz conditioner.
+# Preserve the arm's 3 rad/s effective target slew at the publisher rate.
+MAX_CONDITIONED_ARM_STEP_RAD = MAX_ARM_STEP_RAD * CONTROL_HZ / PUBLISH_HZ
+# OFFICIAL: velocity maxima from both checked-in Unitree Dex3 URDFs. This is a
+# better-grounded outgoing ceiling than the prior invented 18 rad/s scalar, but
+# a URDF maximum is not by itself a completed real-hardware qualification.
+DEX3_URDF_MAX_VELOCITY_RAD_S = np.array([6.857, 12.0, 12.0, 12.0, 12.0, 12.0, 12.0])
+MAX_CONDITIONED_HAND_STEP_RAD = DEX3_URDF_MAX_VELOCITY_RAD_S / PUBLISH_HZ
+COMMAND_CONDITIONING_MODES = ("none", "xr")
 
 # IsaacLab publishes/consumes its right hand as thumb, middle, index.  The real
 # Dex3 and recorded dataset use thumb, index, middle.  This permutation is its own
@@ -117,6 +171,11 @@ class RobotState:
     arm_dq: np.ndarray
     left_hand: np.ndarray
     right_hand: np.ndarray
+    # DDS hand messages have no qualified capture timestamp. These are local
+    # monotonic callback-receipt times, kept separately so a 50 Hz hand sample
+    # is not compared with a newer 100 Hz command or counted twice.
+    left_hand_received_at: float | None = None
+    right_hand_received_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +192,307 @@ class RtcExecutionSnapshot:
     plan_length: int
     total_actions: int
     action_budget: int
+
+
+@dataclass(frozen=True)
+class PublishedHandTarget:
+    """Canonical hand target recorded after its DDS Write succeeded."""
+
+    completed_at: float
+    target: np.ndarray
+
+
+class HandTrackingWatchdog:
+    """Time-align hand feedback to successful DDS targets and track warnings."""
+
+    def __init__(self) -> None:
+        self._last_sample_at = np.full(2, -np.inf, dtype=np.float64)
+        self._violation_since = np.full((2, HAND_DOF), np.nan, dtype=np.float64)
+        self._warning_active = np.zeros((2, HAND_DOF), dtype=bool)
+
+    def reset(self, backend: Any | None = None) -> None:
+        self._last_sample_at.fill(-np.inf)
+        self._violation_since.fill(np.nan)
+        self._warning_active.fill(False)
+        if backend is not None:
+            reset_history = getattr(backend, "reset_hand_publish_history", None)
+            if reset_history is not None:
+                reset_history()
+
+    @staticmethod
+    def _aligned_target(history: Any, sample_at: float) -> PublishedHandTarget | None:
+        if history is None:
+            return None
+        for entry in reversed(history):
+            if entry.completed_at <= sample_at:
+                return entry
+        return None
+
+    @staticmethod
+    def _target_slew(history: Any, joint: int) -> float | None:
+        if history is None or len(history) < 2:
+            return None
+        latest = history[-1]
+        previous = history[-2]
+        elapsed = latest.completed_at - previous.completed_at
+        if elapsed <= 0.0:
+            return None
+        return float((latest.target[joint] - previous.target[joint]) / elapsed)
+
+    def enforce(
+        self,
+        backend: Any,
+        state: RobotState,
+        *,
+        now: float | None = None,
+        context: str = "unknown",
+        desired_left: np.ndarray | None = None,
+        desired_right: np.ndarray | None = None,
+    ) -> bool:
+        """Check each newly received hand sample; return whether history was used."""
+
+        histories = (
+            getattr(backend, "_left_hand_publish_history", None),
+            getattr(backend, "_right_hand_publish_history", None),
+        )
+        if histories[0] is None or histories[1] is None:
+            return False
+
+        checked_at = time.monotonic() if now is None else float(now)
+        hands = (
+            (
+                "left hand",
+                np.asarray(state.left_hand, dtype=np.float64),
+                state.left_hand_received_at,
+                LEFT_HAND_JOINT_NAMES,
+                desired_left,
+            ),
+            (
+                "right hand",
+                np.asarray(state.right_hand, dtype=np.float64),
+                state.right_hand_received_at,
+                RIGHT_HAND_JOINT_NAMES,
+                desired_right,
+            ),
+        )
+        for hand_index, ((hand_name, measured, received_at, joint_names, desired), history) in enumerate(
+            zip(hands, histories, strict=True)
+        ):
+            sample_at = float(state.captured_at if received_at is None else received_at)
+            if sample_at <= self._last_sample_at[hand_index]:
+                continue
+            self._last_sample_at[hand_index] = sample_at
+
+            aligned = self._aligned_target(history, sample_at)
+            if aligned is None:
+                # This is expected only for feedback received before the first
+                # successful post-reset hand command. A subsequent fresh sample
+                # will have a matching history entry.
+                continue
+
+            errors = measured - aligned.target
+            joint = int(np.argmax(np.abs(errors)))
+            error = float(errors[joint])
+            if abs(error) > MAX_HAND_TRACKING_ERROR_RAD:
+                latest = history[-1]
+                latest_target = float(latest.target[joint])
+                latest_error = float(measured[joint] - latest_target)
+                raw_desired = None if desired is None else float(np.asarray(desired)[joint])
+                slew = self._target_slew(history, joint)
+                violation_since = self._violation_since[hand_index, joint]
+                violation_duration = 0.0 if np.isnan(violation_since) else sample_at - violation_since
+                raise DeploymentError(
+                    f"{hand_name.title()} time-aligned tracking error at joint {joint} "
+                    f"({joint_names[joint]}) is {error:+.3f} rad (measured minus aligned target); "
+                    f"MAX_HAND_TRACKING_ERROR_RAD={MAX_HAND_TRACKING_ERROR_RAD:.3f} rad; "
+                    f"measured_q={float(measured[joint]):+.4f}, "
+                    f"aligned_target_q={float(aligned.target[joint]):+.4f}, "
+                    f"latest_published_q={latest_target:+.4f}, latest_error={latest_error:+.4f}, "
+                    f"raw_desired_q={raw_desired!r}, target_slew_rad_s={slew!r}, "
+                    f"state_age_s={max(0.0, checked_at - sample_at):.4f}, "
+                    f"aligned_command_age_s={max(0.0, sample_at - aligned.completed_at):.4f}, "
+                    f"violation_duration_s={max(0.0, violation_duration):.4f}, context={context}"
+                )
+
+            magnitudes = np.abs(errors)
+            for joint_index, magnitude in enumerate(magnitudes):
+                if magnitude >= HAND_TRACKING_WARNING_RAD:
+                    since = self._violation_since[hand_index, joint_index]
+                    if np.isnan(since):
+                        self._violation_since[hand_index, joint_index] = sample_at
+                    elif (
+                        sample_at - since >= HAND_TRACKING_WARNING_DWELL_S
+                        and not self._warning_active[hand_index, joint_index]
+                    ):
+                        self._warning_active[hand_index, joint_index] = True
+                        LOGGER.warning(
+                            "%s tracking error persisted for %.3fs at joint %d (%s): "
+                            "%+.3f rad measured-minus-aligned-target; warning threshold=%.3f rad; %s",
+                            hand_name.title(),
+                            sample_at - since,
+                            joint_index,
+                            joint_names[joint_index],
+                            float(errors[joint_index]),
+                            HAND_TRACKING_WARNING_RAD,
+                            context,
+                        )
+                elif magnitude <= HAND_TRACKING_WARNING_CLEAR_RAD:
+                    if self._warning_active[hand_index, joint_index]:
+                        LOGGER.info(
+                            "%s tracking warning recovered at joint %d (%s): %+.3f rad",
+                            hand_name.title(),
+                            joint_index,
+                            joint_names[joint_index],
+                            float(errors[joint_index]),
+                        )
+                    self._violation_since[hand_index, joint_index] = np.nan
+                    self._warning_active[hand_index, joint_index] = False
+        return True
+
+
+class XrPolicyOutputConditioner:
+    """Fast stateful XR-style final-command conditioner for policy targets.
+
+    Raw model plans are validated separately for shape, finiteness, and joint
+    position limits.  This object owns only deployment-time continuity.  It is
+    reset by initialization, warm-start, STOP/HOLD, and terminal RTC paths, but
+    not by normal synchronous chunks or RTC replacements.
+    """
+
+    def __init__(self) -> None:
+        self._desired_arm: np.ndarray | None = None
+        self._desired_left: np.ndarray | None = None
+        self._desired_right: np.ndarray | None = None
+        self._started_at: float | None = None
+
+    def reset(self, arm: np.ndarray, left: np.ndarray, right: np.ndarray) -> None:
+        arrays = tuple(np.asarray(value, dtype=np.float64) for value in (arm, left, right))
+        if tuple(value.shape for value in arrays) != ((ARM_DOF,), (HAND_DOF,), (HAND_DOF,)):
+            raise DeploymentError("XR policy-output conditioner reset target has the wrong shape")
+        if not all(np.all(np.isfinite(value)) for value in arrays):
+            raise DeploymentError("XR policy-output conditioner reset target is not finite")
+        self._desired_arm = arrays[0].copy()
+        self._desired_left = arrays[1].copy()
+        self._desired_right = arrays[2].copy()
+        self._started_at = None
+
+    def set_desired(self, arm: np.ndarray, left: np.ndarray, right: np.ndarray, *, now: float) -> None:
+        target = ActionChunk(
+            arm=np.asarray(arm, dtype=np.float64)[None],
+            left_hand=np.asarray(left, dtype=np.float64)[None],
+            right_hand=np.asarray(right, dtype=np.float64)[None],
+        )
+        validate_action_chunk_limits(target)
+        self._desired_arm = target.arm[0].copy()
+        self._desired_left = target.left_hand[0].copy()
+        self._desired_right = target.right_hand[0].copy()
+        if self._started_at is None:
+            self._started_at = float(now)
+
+    def next_command(
+        self,
+        measured_arm: np.ndarray,
+        current_arm: np.ndarray,
+        current_left: np.ndarray,
+        current_right: np.ndarray,
+        *,
+        now: float,
+    ) -> ActionChunk:
+        if self._desired_arm is None or self._desired_left is None or self._desired_right is None:
+            raise DeploymentError("XR policy-output conditioner has not been seeded")
+        measured_arm = np.asarray(measured_arm, dtype=np.float64)
+        current_arm = np.asarray(current_arm, dtype=np.float64)
+        current_left = np.asarray(current_left, dtype=np.float64)
+        current_right = np.asarray(current_right, dtype=np.float64)
+        if self._started_at is None:
+            ramp = 0.0
+        else:
+            ramp = np.clip((float(now) - self._started_at) / XR_ARM_COMMAND_LEAD_RAMP_S, 0.0, 1.0)
+        arm_lead = XR_ARM_INITIAL_COMMAND_LEAD_RAD + ramp * (
+            XR_ARM_FINAL_COMMAND_LEAD_RAD - XR_ARM_INITIAL_COMMAND_LEAD_RAD
+        )
+        arm_delta = self._desired_arm - measured_arm
+        arm_scale = max(1.0, float(np.max(np.abs(arm_delta))) / arm_lead)
+        arm = measured_arm + arm_delta / arm_scale
+        left = self._desired_left.copy()
+        right = self._desired_right.copy()
+        # The desired policy target has already passed hard range validation.
+        # Project only the measured-dependent conditioned candidate.  This lets
+        # a hand state admitted by the wider measured-state tolerance move
+        # inward without making an out-of-range DDS target.  The subsequent
+        # command-step limiter remains authoritative.
+        arm_lower = ARM_LOWER + JOINT_LIMIT_MARGIN_RAD
+        arm_upper = ARM_UPPER - JOINT_LIMIT_MARGIN_RAD
+        left_lower = LEFT_HAND_LOWER - HAND_LIMIT_TOLERANCE_RAD
+        left_upper = LEFT_HAND_UPPER + HAND_LIMIT_TOLERANCE_RAD
+        right_lower = RIGHT_HAND_LOWER - HAND_LIMIT_TOLERANCE_RAD
+        right_upper = RIGHT_HAND_UPPER + HAND_LIMIT_TOLERANCE_RAD
+        arm = np.clip(arm, arm_lower, arm_upper)
+        left = np.clip(
+            left,
+            left_lower,
+            left_upper,
+        )
+        right = np.clip(
+            right,
+            right_lower,
+            right_upper,
+        )
+        # Feedback-relative lead limiting alone does not bound a command
+        # reversal: measured+lead -> measured-lead could jump by twice the lead.
+        # Rescale each command group once more against the last published target
+        # so conditioning happens before, rather than merely tripping, the hard
+        # final step invariant.
+        arm_command_delta = arm - current_arm
+        arm_command_scale = max(
+            1.0,
+            float(np.max(np.abs(arm_command_delta))) / MAX_CONDITIONED_ARM_STEP_RAD,
+        )
+        arm = current_arm + arm_command_delta / arm_command_scale
+        left_delta = left - current_left
+        left_scale = max(
+            1.0,
+            float(np.max(np.abs(left_delta) / MAX_CONDITIONED_HAND_STEP_RAD)),
+        )
+        left = current_left + left_delta / left_scale
+        right_delta = right - current_right
+        right_scale = max(
+            1.0,
+            float(np.max(np.abs(right_delta) / MAX_CONDITIONED_HAND_STEP_RAD)),
+        )
+        right = current_right + right_delta / right_scale
+        # A group-wide slew scale can otherwise leave a different joint just
+        # outside its target range after reset from a measured-only tolerance.
+        # Project once more after slew limiting. This changes an ordinary
+        # in-range step by zero; for an out-of-range held seed it performs only
+        # the minimum inward recovery needed to make the outgoing target legal.
+        arm = np.clip(arm, arm_lower, arm_upper)
+        left = np.clip(left, left_lower, left_upper)
+        right = np.clip(right, right_lower, right_upper)
+        result = ActionChunk(
+            arm=np.ascontiguousarray(arm[None]),
+            left_hand=np.ascontiguousarray(left[None]),
+            right_hand=np.ascontiguousarray(right[None]),
+        )
+        # This is the final outgoing command.  It must satisfy both absolute
+        # limits and target-to-target step ceilings before DDS sees it.
+        validate_action_chunk(result, current_arm, current_left, current_right)
+        arm_recovery = np.maximum.reduce((arm_lower - current_arm, current_arm - arm_upper, np.zeros(ARM_DOF)))
+        left_recovery = np.maximum.reduce((left_lower - current_left, current_left - left_upper, np.zeros(HAND_DOF)))
+        right_recovery = np.maximum.reduce(
+            (right_lower - current_right, current_right - right_upper, np.zeros(HAND_DOF))
+        )
+        if np.any(np.abs(result.arm[0] - current_arm) > np.maximum(MAX_CONDITIONED_ARM_STEP_RAD, arm_recovery) + 1e-12):
+            raise DeploymentError("XR conditioned arm command exceeded its 100 Hz slew ceiling")
+        if np.any(
+            np.abs(result.left_hand[0] - current_left)
+            > np.maximum(MAX_CONDITIONED_HAND_STEP_RAD, left_recovery) + 1e-12
+        ) or np.any(
+            np.abs(result.right_hand[0] - current_right)
+            > np.maximum(MAX_CONDITIONED_HAND_STEP_RAD, right_recovery) + 1e-12
+        ):
+            raise DeploymentError("XR conditioned hand command exceeded its 100 Hz slew ceiling")
+        return result
 
 
 def _largest_named_value(
@@ -296,6 +656,8 @@ class G1Dex3StateReader:
             arm_dq=arm_dq,
             left_hand=left,
             right_hand=right,
+            left_hand_received_at=updated_at["left"],
+            right_hand_received_at=updated_at["right"],
         )
 
     def read(self, timeout_s: float = 3.0) -> RobotState:
@@ -642,6 +1004,8 @@ class _G1Dex3CommandBackend:
         self._arm_target = initial.arm.copy()
         self._left_target = initial.left_hand.copy()
         self._right_target = initial.right_hand.copy()
+        self._left_hand_publish_history: deque[PublishedHandTarget] = deque(maxlen=HAND_COMMAND_HISTORY_SIZE)
+        self._right_hand_publish_history: deque[PublishedHandTarget] = deque(maxlen=HAND_COMMAND_HISTORY_SIZE)
         self._configure_messages(initial)
 
     def _configure_messages(self, initial: RobotState) -> None:
@@ -741,6 +1105,10 @@ class _G1Dex3CommandBackend:
         self._left_target = np.asarray(left, dtype=np.float64).copy()
         self._right_target = np.asarray(right, dtype=np.float64).copy()
 
+    def reset_hand_publish_history(self) -> None:
+        self._left_hand_publish_history.clear()
+        self._right_hand_publish_history.clear()
+
     def _publish_arm(self, require_qualified_state: bool = True) -> None:
         for offset, index in enumerate(self._arm_indices):
             self._arm_message.motor_cmd[index].q = float(self._arm_target[offset])
@@ -760,8 +1128,12 @@ class _G1Dex3CommandBackend:
         self._has_published = True
 
     def _publish_hands(self) -> None:
-        left_command = self._left_target
-        right_command = self._right_target
+        # Snapshot canonical-order targets before either Write. History is
+        # appended independently only after the corresponding Write succeeds.
+        left_target = self._left_target.copy()
+        right_target = self._right_target.copy()
+        left_command = left_target
+        right_command = right_target
         if self.simulation:
             right_command = right_command[SIM_RIGHT_HAND_PERMUTATION]
         for offset, index in enumerate(self._left_indices):
@@ -771,8 +1143,10 @@ class _G1Dex3CommandBackend:
 
         if self._left_publisher.Write(self._left_message, timeout=DDS_WRITE_TIMEOUT_S) is not True:
             raise DeploymentError("Left Dex3 DDS Write failed")
+        self._left_hand_publish_history.append(PublishedHandTarget(completed_at=time.monotonic(), target=left_target))
         if self._right_publisher.Write(self._right_message, timeout=DDS_WRITE_TIMEOUT_S) is not True:
             raise DeploymentError("Right Dex3 DDS Write failed")
+        self._right_hand_publish_history.append(PublishedHandTarget(completed_at=time.monotonic(), target=right_target))
 
     def _stop_hands(self) -> None:
         """Send Unitree's documented Dex3 ``stopMotors`` command once per hand."""
@@ -880,7 +1254,16 @@ def _tracking_errors(backend: _G1Dex3CommandBackend, state: RobotState) -> tuple
     return arm_error, hand_error
 
 
-def _enforce_tracking(backend: _G1Dex3CommandBackend, state: RobotState) -> None:
+def _enforce_tracking(
+    backend: _G1Dex3CommandBackend,
+    state: RobotState,
+    hand_watchdog: HandTrackingWatchdog | None = None,
+    *,
+    now: float | None = None,
+    context: str = "unknown",
+    desired_left: np.ndarray | None = None,
+    desired_right: np.ndarray | None = None,
+) -> None:
     _, arm_joint, arm_name, arm_delta = _largest_named_value(
         (("arm", state.arm - backend._arm_target, ARM_JOINT_NAMES),)
     )
@@ -890,6 +1273,18 @@ def _enforce_tracking(backend: _G1Dex3CommandBackend, state: RobotState) -> None
             f"(measured minus target); MAX_ARM_TRACKING_ERROR_RAD="
             f"{MAX_ARM_TRACKING_ERROR_RAD:.3f} rad"
         )
+    if hand_watchdog is not None and hand_watchdog.enforce(
+        backend,
+        state,
+        now=now,
+        context=context,
+        desired_left=desired_left,
+        desired_right=desired_right,
+    ):
+        return
+
+    # Compatibility fallback for focused tests and older internal fake
+    # backends that do not expose successful-publish history.
     hand_group, hand_joint, hand_name, hand_delta = _largest_named_value(
         (
             ("left hand", state.left_hand - backend._left_target, LEFT_HAND_JOINT_NAMES),
@@ -918,6 +1313,7 @@ def _wait_for_initialization_start(
     backend: _G1Dex3CommandBackend,
     stop_event: Any,
     heartbeat: Any,
+    hand_watchdog: HandTrackingWatchdog | None = None,
 ) -> RobotState | None:
     """Hold the current command until fresh measured state is stationary again."""
 
@@ -936,7 +1332,13 @@ def _wait_for_initialization_start(
         now = time.monotonic()
         if now - latest.captured_at > PREARM_STATE_MAX_AGE_S:
             raise DeploymentError("Robot state is not fresh enough to start initialization")
-        _enforce_tracking(backend, latest)
+        _enforce_tracking(
+            backend,
+            latest,
+            hand_watchdog,
+            now=now,
+            context="initialization-start dwell",
+        )
         arm_error, hand_error = _tracking_errors(backend, latest)
 
         stationary = (
@@ -991,6 +1393,9 @@ def _execute_initialization(
     stop_event: Any,
     heartbeat: Any,
     tracking_checks_after: float,
+    hand_watchdog: HandTrackingWatchdog | None = None,
+    *,
+    context: str = "initialization",
 ) -> bool:
     """Execute and verify one bounded initialization path in the DDS owner."""
 
@@ -1022,7 +1427,7 @@ def _execute_initialization(
                 endpoint_deadline = now + INITIALIZATION_CONVERGENCE_TIMEOUT_S
 
         if now >= tracking_checks_after:
-            _enforce_tracking(backend, state)
+            _enforce_tracking(backend, state, hand_watchdog, now=now, context=context)
 
         if endpoint_deadline is not None:
             arm_error, hand_error = _tracking_errors(backend, state)
@@ -1068,6 +1473,44 @@ def _execute_initialization(
     return False
 
 
+def _set_direct_target(
+    backend: _G1Dex3CommandBackend,
+    conditioner: XrPolicyOutputConditioner | None,
+    hand_watchdog: HandTrackingWatchdog | None,
+    arm: np.ndarray,
+    left: np.ndarray,
+    right: np.ndarray,
+) -> None:
+    """Set a non-policy target and make it the conditioner's new origin."""
+
+    backend.set_target(arm, left, right)
+    if conditioner is not None:
+        conditioner.reset(backend._arm_target, backend._left_target, backend._right_target)
+    if hand_watchdog is not None:
+        hand_watchdog.reset(backend)
+
+
+def _validate_policy_target_input(
+    chunk: ActionChunk,
+    current_arm: np.ndarray,
+    current_left: np.ndarray,
+    current_right: np.ndarray,
+    conditioner: XrPolicyOutputConditioner | None,
+    *,
+    context: str,
+) -> None:
+    """Keep raw value checks hard while making raw slew diagnostic in XR mode."""
+
+    if conditioner is None:
+        validate_action_chunk(chunk, current_arm, current_left, current_right)
+        return
+    validate_action_chunk_limits(chunk)
+    try:
+        validate_action_chunk(chunk, current_arm, current_left, current_right)
+    except DeploymentError as exc:
+        LOGGER.warning("%s raw target discontinuity will be conditioned before DDS: %s", context, exc)
+
+
 def _actuator_main(
     simulation: bool,
     network_interface: str | None,
@@ -1076,6 +1519,7 @@ def _actuator_main(
     stop_event: Any,
     heartbeat: Any,
     urgent_hold_event: Any | None = None,
+    command_conditioning: str = "none",
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if threading.current_thread() is threading.main_thread():
@@ -1091,11 +1535,19 @@ def _actuator_main(
     if urgent_hold_event is None:
         # Keeps direct/threaded tests and older internal callers compatible.
         urgent_hold_event = threading.Event()
+    if command_conditioning not in COMMAND_CONDITIONING_MODES:
+        _status(status_queue, "fault", f"Unknown command conditioning mode {command_conditioning!r}")
+        _status(status_queue, "stopped")
+        return
 
     last_sequence = 0
     tracking_checks_after = float("inf")
+    conditioner: XrPolicyOutputConditioner | None = None
+    hand_watchdog = HandTrackingWatchdog()
     try:
         backend = _G1Dex3CommandBackend(simulation, network_interface)
+        if command_conditioning == "xr":
+            conditioner = XrPolicyOutputConditioner()
         _status(status_queue, "ready")
 
         # Publishers now exist but no message has been written.  Wait for the
@@ -1155,7 +1607,8 @@ def _actuator_main(
                     raise DeploymentError("Initialization command timestamp is invalid") from exc
                 if not np.isfinite(command_age) or not 0.0 <= command_age <= INITIALIZATION_COMMAND_MAX_AGE_S:
                     raise DeploymentError("Initialization command expired before execution")
-                state = _wait_for_initialization_start(backend, stop_event, heartbeat)
+                hand_watchdog.reset(backend)
+                state = _wait_for_initialization_start(backend, stop_event, heartbeat, hand_watchdog)
                 if state is None:
                     _status(status_queue, "initialization_cancelled", initialization.mode)
                     return
@@ -1186,17 +1639,27 @@ def _actuator_main(
                     stop_event,
                     heartbeat,
                     tracking_checks_after,
+                    hand_watchdog,
+                    context=f"initialization mode={initialization.mode}",
                 )
                 if not initialized:
                     _status(status_queue, "initialization_cancelled", initialization.mode)
                     return
+                if conditioner is not None:
+                    conditioner.reset(backend._arm_target, backend._left_target, backend._right_target)
+                hand_watchdog.reset(backend)
                 tracking_checks_after = time.monotonic()
                 _status(status_queue, "initialized", initialization.mode)
                 break
 
             state = backend.state()
             if time.monotonic() >= tracking_checks_after:
-                _enforce_tracking(backend, state)
+                _enforce_tracking(
+                    backend,
+                    state,
+                    hand_watchdog,
+                    context="pre-initialization hold",
+                )
             backend.publish()
             elapsed = time.monotonic() - loop_started
             stop_event.wait(max(0.0, period - elapsed))
@@ -1233,7 +1696,14 @@ def _actuator_main(
                     # feeder thread. Capture the final measured pose, then
                     # acknowledge the fully serialized powered STOP.
                     state = backend.state()
-                    backend.set_target(state.arm, state.left_hand, state.right_hand)
+                    _set_direct_target(
+                        backend,
+                        conditioner,
+                        hand_watchdog,
+                        state.arm,
+                        state.left_hand,
+                        state.right_hand,
+                    )
                     chunk = None
                     chunk_index = 0
                     rtc_mode = False
@@ -1257,7 +1727,14 @@ def _actuator_main(
                     if not np.isfinite(command_age) or not 0.0 <= command_age <= CHUNK_MAX_AGE_S:
                         raise DeploymentError("Hold command expired before execution")
                     state = backend.state()
-                    backend.set_target(state.arm, state.left_hand, state.right_hand)
+                    _set_direct_target(
+                        backend,
+                        conditioner,
+                        hand_watchdog,
+                        state.arm,
+                        state.left_hand,
+                        state.right_hand,
+                    )
                     chunk = None
                     chunk_index = 0
                     rtc_mode = False
@@ -1281,7 +1758,13 @@ def _actuator_main(
                     if not np.isfinite(command_age) or not 0.0 <= command_age <= INITIALIZATION_COMMAND_MAX_AGE_S:
                         raise DeploymentError("Policy warm-start command expired before execution")
 
-                    state = _wait_for_initialization_start(backend, stop_event, heartbeat)
+                    hand_watchdog.reset(backend)
+                    state = _wait_for_initialization_start(
+                        backend,
+                        stop_event,
+                        heartbeat,
+                        hand_watchdog,
+                    )
                     if state is None:
                         _status(status_queue, "warm_start_cancelled")
                         return
@@ -1308,10 +1791,15 @@ def _actuator_main(
                         stop_event,
                         heartbeat,
                         tracking_checks_after,
+                        hand_watchdog,
+                        context="policy warm-start",
                     )
                     if not completed:
                         _status(status_queue, "warm_start_cancelled")
                         return
+                    if conditioner is not None:
+                        conditioner.reset(backend._arm_target, backend._left_target, backend._right_target)
+                    hand_watchdog.reset(backend)
                     tracking_checks_after = time.monotonic()
                     holding = False
                     _status(status_queue, "warm_started", warm_start.label)
@@ -1332,7 +1820,14 @@ def _actuator_main(
                         continue
                     if chunk_index >= chunk.length:
                         state = backend.state()
-                        backend.set_target(state.arm, state.left_hand, state.right_hand)
+                        _set_direct_target(
+                            backend,
+                            conditioner,
+                            hand_watchdog,
+                            state.arm,
+                            state.left_hand,
+                            state.right_hand,
+                        )
                         tracking_checks_after = time.monotonic()
                         terminal_kind = "rtc_completed" if rtc_total_actions >= rtc_action_budget else "rtc_underrun"
                         _status(status_queue, terminal_kind, rtc_total_actions)
@@ -1377,7 +1872,14 @@ def _actuator_main(
                     if proposed.length != expected_horizon:
                         raise DeploymentError("RTC plan length changed in transit")
                     state = backend.state()
-                    validate_action_chunk(proposed, state.arm, state.left_hand, state.right_hand)
+                    _validate_policy_target_input(
+                        proposed,
+                        state.arm,
+                        state.left_hand,
+                        state.right_hand,
+                        conditioner,
+                        context="Initial RTC plan",
+                    )
                     chunk = proposed
                     chunk_sequence = int(sequence)
                     chunk_index = 0
@@ -1406,7 +1908,14 @@ def _actuator_main(
                     ) = command
                     if rtc_mode and rtc_total_actions >= rtc_action_budget:
                         state = backend.state()
-                        backend.set_target(state.arm, state.left_hand, state.right_hand)
+                        _set_direct_target(
+                            backend,
+                            conditioner,
+                            hand_watchdog,
+                            state.arm,
+                            state.left_hand,
+                            state.right_hand,
+                        )
                         chunk = None
                         chunk_index = 0
                         rtc_mode = False
@@ -1426,7 +1935,14 @@ def _actuator_main(
                     )
                     if stale:
                         state = backend.state()
-                        backend.set_target(state.arm, state.left_hand, state.right_hand)
+                        _set_direct_target(
+                            backend,
+                            conditioner,
+                            hand_watchdog,
+                            state.arm,
+                            state.left_hand,
+                            state.right_hand,
+                        )
                         chunk = None
                         chunk_index = 0
                         rtc_mode = False
@@ -1446,18 +1962,28 @@ def _actuator_main(
                     replacement = ActionChunk(arm=arm, left_hand=left, right_hand=right)
                     if replacement.length != expected_horizon:
                         raise DeploymentError("RTC replacement length changed in transit")
-                    # Validate every predicted target and internal step, including
-                    # the portion that elapsed during inference.
+                    # Validate every raw value, including the portion that elapsed
+                    # during inference. Raw step jumps are diagnostic only when the
+                    # final-command conditioner is enabled.
                     try:
-                        validate_action_chunk(
+                        _validate_policy_target_input(
                             replacement,
                             replacement.arm[0],
                             replacement.left_hand[0],
                             replacement.right_hand[0],
+                            conditioner,
+                            context="RTC replacement plan",
                         )
                     except DeploymentError as exc:
                         state = backend.state()
-                        backend.set_target(state.arm, state.left_hand, state.right_hand)
+                        _set_direct_target(
+                            backend,
+                            conditioner,
+                            hand_watchdog,
+                            state.arm,
+                            state.left_hand,
+                            state.right_hand,
+                        )
                         chunk = None
                         chunk_index = 0
                         rtc_mode = False
@@ -1468,7 +1994,14 @@ def _actuator_main(
                     elapsed_actions = chunk_index - request_index
                     if elapsed_actions >= expected_overlap or elapsed_actions >= replacement.length:
                         state = backend.state()
-                        backend.set_target(state.arm, state.left_hand, state.right_hand)
+                        _set_direct_target(
+                            backend,
+                            conditioner,
+                            hand_watchdog,
+                            state.arm,
+                            state.left_hand,
+                            state.right_hand,
+                        )
                         chunk = None
                         chunk_index = 0
                         rtc_mode = False
@@ -1490,18 +2023,25 @@ def _actuator_main(
                         left_hand=np.ascontiguousarray(replacement.left_hand[elapsed_actions:]),
                         right_hand=np.ascontiguousarray(replacement.right_hand[elapsed_actions:]),
                     )
-                    # Command slew is target-to-target. Measured tracking lag is
-                    # independently bounded by _enforce_tracking below.
                     try:
-                        validate_action_chunk(
+                        _validate_policy_target_input(
                             suffix,
                             backend._arm_target,
                             backend._left_target,
                             backend._right_target,
+                            conditioner,
+                            context="RTC handoff",
                         )
                     except DeploymentError as exc:
                         state = backend.state()
-                        backend.set_target(state.arm, state.left_hand, state.right_hand)
+                        _set_direct_target(
+                            backend,
+                            conditioner,
+                            hand_watchdog,
+                            state.arm,
+                            state.left_hand,
+                            state.right_hand,
+                        )
                         chunk = None
                         chunk_index = 0
                         rtc_mode = False
@@ -1542,7 +2082,14 @@ def _actuator_main(
                         raise DeploymentError(f"Action chunk {sequence} expired before execution")
                     state = backend.state()
                     proposed = ActionChunk(arm=arm, left_hand=left, right_hand=right)
-                    validate_action_chunk(proposed, state.arm, state.left_hand, state.right_hand)
+                    _validate_policy_target_input(
+                        proposed,
+                        state.arm,
+                        state.left_hand,
+                        state.right_hand,
+                        conditioner,
+                        context="Synchronous plan",
+                    )
                     chunk = proposed
                     chunk_sequence = int(sequence)
                     chunk_index = 0
@@ -1559,7 +2106,14 @@ def _actuator_main(
             if urgent_hold_event.is_set():
                 if not urgent_hold_active or chunk is not None or rtc_mode or not holding:
                     state = backend.state()
-                    backend.set_target(state.arm, state.left_hand, state.right_hand)
+                    _set_direct_target(
+                        backend,
+                        conditioner,
+                        hand_watchdog,
+                        state.arm,
+                        state.left_hand,
+                        state.right_hand,
+                    )
                     chunk = None
                     chunk_index = 0
                     rtc_mode = False
@@ -1570,7 +2124,13 @@ def _actuator_main(
                 now = time.monotonic()
                 state = backend.state()
                 if now >= tracking_checks_after:
-                    _enforce_tracking(backend, state)
+                    _enforce_tracking(
+                        backend,
+                        state,
+                        hand_watchdog,
+                        now=now,
+                        context=f"powered STOP sequence={last_sequence}",
+                    )
                 backend.publish()
                 elapsed = time.monotonic() - loop_started
                 stop_event.wait(max(0.0, period - elapsed))
@@ -1581,11 +2141,19 @@ def _actuator_main(
                 if chunk_index < chunk.length:
                     if now - next_action_at > MAX_ACTION_LATENESS_S:
                         raise DeploymentError(f"Action scheduler is {now - next_action_at:.3f}s late")
-                    backend.set_target(
-                        chunk.arm[chunk_index],
-                        chunk.left_hand[chunk_index],
-                        chunk.right_hand[chunk_index],
-                    )
+                    if conditioner is None:
+                        backend.set_target(
+                            chunk.arm[chunk_index],
+                            chunk.left_hand[chunk_index],
+                            chunk.right_hand[chunk_index],
+                        )
+                    else:
+                        conditioner.set_desired(
+                            chunk.arm[chunk_index],
+                            chunk.left_hand[chunk_index],
+                            chunk.right_hand[chunk_index],
+                            now=now,
+                        )
                     chunk_index += 1
                     if rtc_mode:
                         rtc_total_actions += 1
@@ -1600,7 +2168,14 @@ def _actuator_main(
                 else:
                     if rtc_mode:
                         state = backend.state()
-                        backend.set_target(state.arm, state.left_hand, state.right_hand)
+                        _set_direct_target(
+                            backend,
+                            conditioner,
+                            hand_watchdog,
+                            state.arm,
+                            state.left_hand,
+                            state.right_hand,
+                        )
                         tracking_checks_after = time.monotonic()
                         if rtc_total_actions >= rtc_action_budget:
                             _status(status_queue, "rtc_completed", rtc_total_actions)
@@ -1624,7 +2199,37 @@ def _actuator_main(
 
             state = backend.state()
             if now >= tracking_checks_after:
-                _enforce_tracking(backend, state)
+                # In conditioned mode this compares against the last target that
+                # was actually published. The next conditioned command is formed
+                # only below, so a fresh policy step is not misreported as servo lag.
+                desired_left = None if conditioner is None else conditioner._desired_left
+                desired_right = None if conditioner is None else conditioner._desired_right
+                _enforce_tracking(
+                    backend,
+                    state,
+                    hand_watchdog,
+                    now=now,
+                    context=(
+                        f"active sequence={chunk_sequence} next_action_index={chunk_index} "
+                        f"rtc={rtc_mode} holding={holding}"
+                    ),
+                    desired_left=desired_left,
+                    desired_right=desired_right,
+                )
+
+            if conditioner is not None and not holding:
+                conditioned = conditioner.next_command(
+                    state.arm,
+                    backend._arm_target,
+                    backend._left_target,
+                    backend._right_target,
+                    now=now,
+                )
+                backend.set_target(
+                    conditioned.arm[0],
+                    conditioned.left_hand[0],
+                    conditioned.right_hand[0],
+                )
 
             backend.publish()
             elapsed = time.monotonic() - loop_started
@@ -1647,7 +2252,14 @@ def _actuator_main(
 class SafeG1Dex3Actuator:
     """Parent-side handle for the watchdog-owning actuator process."""
 
-    def __init__(self, simulation: bool, network_interface: str | None):
+    def __init__(
+        self,
+        simulation: bool,
+        network_interface: str | None,
+        command_conditioning: str = "none",
+    ):
+        if command_conditioning not in COMMAND_CONDITIONING_MODES:
+            raise DeploymentError(f"Unknown command conditioning mode {command_conditioning!r}")
         context = mp.get_context("spawn")
         self._command_queue = context.Queue(maxsize=1)
         self._status_queue = context.Queue(maxsize=32)
@@ -1664,6 +2276,7 @@ class SafeG1Dex3Actuator:
                 self._stop_event,
                 self._heartbeat,
                 self._urgent_hold_event,
+                command_conditioning,
             ),
             name="groot-g1-dex3-actuator",
         )
@@ -1677,6 +2290,7 @@ class SafeG1Dex3Actuator:
         self._pending_sequence: int | None = None
         self._rtc_active = False
         self._rtc_terminal: tuple[str, Any] | None = None
+        self._command_conditioning = command_conditioning
         self._control_lock = threading.Lock()
         self._immediate_hold_requested = threading.Event()
         self._immediate_release_requested = threading.Event()
@@ -1711,14 +2325,14 @@ class SafeG1Dex3Actuator:
                 if self._immediate_release_requested.is_set():
                     raise ImmediateControlEvent("release")
                 raise DeploymentError("Actuator stopped before the requested operation completed")
-            if kind in {"rtc_underrun", "rtc_rejected"} and kind != expected:
+            if kind in {"rtc_underrun", "rtc_rejected"} and kind != expected and expected != "urgent_holding":
                 self._rtc_terminal = ("hold", value)
                 self._chunk_in_flight = False
                 self._pending_sequence = None
                 self._rtc_active = False
                 self._holding = True
                 raise RtcTerminalEvent("hold", value)
-            if kind == "rtc_completed" and kind != expected:
+            if kind == "rtc_completed" and kind != expected and expected != "urgent_holding":
                 self._rtc_terminal = ("complete", value)
                 self._chunk_in_flight = False
                 self._pending_sequence = None
@@ -1803,7 +2417,10 @@ class SafeG1Dex3Actuator:
 
         if not self._initialized or not self._holding or self._chunk_in_flight:
             raise DeploymentError("Policy warm-start requires initialized HOLD with no chunk in flight")
-        validate_action_chunk(chunk, chunk.arm[0], chunk.left_hand[0], chunk.right_hand[0])
+        if getattr(self, "_command_conditioning", "none") == "xr":
+            validate_action_chunk_limits(chunk)
+        else:
+            validate_action_chunk(chunk, chunk.arm[0], chunk.left_hand[0], chunk.right_hand[0])
         target = InitializationSpec(
             mode="pose-file",
             label="first policy target",
@@ -1869,7 +2486,10 @@ class SafeG1Dex3Actuator:
             raise DeploymentError("An action plan is already active")
         if isinstance(action_budget, bool) or not isinstance(action_budget, int) or action_budget < 1:
             raise DeploymentError("RTC action budget must be a positive integer")
-        validate_action_chunk(plan, plan.arm[0], plan.left_hand[0], plan.right_hand[0])
+        if getattr(self, "_command_conditioning", "none") == "xr":
+            validate_action_chunk_limits(plan)
+        else:
+            validate_action_chunk(plan, plan.arm[0], plan.left_hand[0], plan.right_hand[0])
         self.assert_healthy()
         with self._control_lock:
             immediate = self.immediate_control_requested()
@@ -1942,7 +2562,10 @@ class SafeG1Dex3Actuator:
 
         if not self._rtc_active or expected_sequence != self._pending_sequence:
             raise DeploymentError("RTC response is stale for the active plan generation")
-        validate_action_chunk(plan, plan.arm[0], plan.left_hand[0], plan.right_hand[0])
+        if getattr(self, "_command_conditioning", "none") == "xr":
+            validate_action_chunk_limits(plan)
+        else:
+            validate_action_chunk(plan, plan.arm[0], plan.left_hand[0], plan.right_hand[0])
         event = self.poll_rtc_event()
         if event is not None:
             raise RtcTerminalEvent(*event)
@@ -2034,11 +2657,6 @@ class SafeG1Dex3Actuator:
             return
         self._immediate_hold_requested.set()
         self._urgent_hold_event.set()
-        # Wait for any submission already inside its critical section. Once
-        # this returns, future submissions see the pending STOP and refuse,
-        # while the child-side event has already stopped target advancement.
-        with self._control_lock:
-            pass
 
     def request_immediate_release(self) -> None:
         """Start the existing orderly release path without waiting for the main thread."""
@@ -2053,6 +2671,7 @@ class SafeG1Dex3Actuator:
             return "release"
         if not self._immediate_hold_requested.is_set() and self._holding:
             return "hold"
+        self._rtc_terminal = None
         # This command is queued after every submission that could have raced
         # the raw-key thread. The child keeps its STOP latch set until it
         # consumes this barrier, so none of those plans can advance a target.
