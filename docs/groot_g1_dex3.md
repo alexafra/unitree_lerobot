@@ -323,7 +323,11 @@ For that reason, real `--actuate` is rejected by default. Before any real test, 
 - motion mode ownership, arm tracking/rate limits, and authority ramps;
 - absence of every competing XR, replay, or arm/hand DDS publisher.
 
-This adapter accepts only `mode_machine == 5`, corresponding to the current `g1_29dof_with_hand_rev_1_0` asset, and checks it continuously. Mode 2 or another G1 embodiment needs a separately qualified adapter.
+This adapter accepts only `mode_machine == 6`, corresponding to
+`g1_29dof_lock_waist_with_hand_rev_1_0`, the one-DoF lock-waist embodiment used for
+data collection and training. Waist yaw remains active; waist roll and pitch are locked.
+The adapter checks the mode continuously; mode 5, mode 2, or another G1 embodiment
+needs a separately qualified adapter.
 
 After those qualifications, the syntax for an explicitly unqualified research test is shown below so the override cannot be mistaken for a default:
 
@@ -342,4 +346,4 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
     --allow-unqualified-real
 ```
 
-The program still completes a publisher-free observation/inference/action preflight. Each standard gate—ACTUATE/SIMULATE, INITIALIZE, RUN, WARMUP, and CONTINUE—advances with one `r` keypress and no Enter. On arming, its child process requires fresh state and a stationary 0.5-second dwell, initializes targets from that measured state, and ramps `arm_sdk` weight while holding it. During command execution, state older than 75 ms faults the actuator. These conservative thresholds may need to become stricter after hardware measurement; they are not a substitute for qualification. Orderly SIGINT, SIGTERM, and terminal-hangup cleanup attempts to ramp arm authority back to zero, then sends Unitree's Dex3 `stopMotors` command to both hands; the CLI reports a failed or unacknowledged local release. SIGKILL, power loss, and a wedged DDS/network path can bypass those attempts. The override is not a safety guarantee or certification.
+The program still completes a publisher-free observation/inference/action preflight. Each standard gate—ACTUATE/SIMULATE, INITIALIZE, RUN, WARMUP, and CONTINUE—advances with one `r` keypress and no Enter. On arming, its child process requires fresh state and a stationary 0.5-second dwell, initializes targets from that measured state, and ramps `arm_sdk` weight while holding it. During command execution, arm state older than 75 ms faults the actuator. A Dex3 state age above 75 ms instead freezes the exact outgoing targets; five distinct fresh paired hand samples are required to recover. An interrupted policy plan is discarded and remains in powered HOLD rather than resuming against an old clock. A hand age above 250 ms remains a hard fault. These measured thresholds are not a substitute for qualification. Orderly SIGINT, SIGTERM, and terminal-hangup cleanup attempts a time-based arm-authority ramp to zero, then sends Unitree's Dex3 `stopMotors` command to both hands; the CLI reports separate local release and resource-cleanup acknowledgments. SIGKILL, power loss, and a wedged DDS/network path can bypass those attempts. The override is not a safety guarantee or certification.

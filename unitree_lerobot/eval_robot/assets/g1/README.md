@@ -16,6 +16,7 @@ MJCF/URDF for the G1 robot:
 | `g1_29dof_rev_1_0`            |       5        |           22.5           | Up-to-date    |  6\*2   |     3     |  7\*2   |    0     |
 | `g1_29dof_with_hand_rev_1_0`  |       5        |           22.5           | Up-to-date    |  6\*2   |     3     |  7\*2   |   7\*2   |
 | `g1_29dof_lock_waist_rev_1_0` |       6        |           22.5           | Up-to-date    |  6\*2   |     1     |  7\*2   |    0     |
+| `g1_29dof_lock_waist_with_hand_rev_1_0` | 6 | 22.5 | Up-to-date | 6\*2 | 1 | 7\*2 | 7\*2 |
 | `g1_dual_arm`                 |       9        |           null           | Up-to-date    |    0    |     0     |  7\*2   |    0     |
 
 ## Visualization with [MuJoCo](https://github.com/google-deepmind/mujoco)

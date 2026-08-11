@@ -44,16 +44,18 @@ def _parse_args() -> argparse.Namespace:
 
 def _confirm() -> None:
     token = f"RAMP-ONLY-{secrets.randbelow(900000) + 100000}"
-    with open("/dev/tty", "r+", buffering=1) as tty:
-        termios.tcflush(tty.fileno(), termios.TCIFLUSH)
-        tty.write("\nREAL RAMP-ONLY DIAGNOSTIC.\n")
-        tty.write("This creates arm and Dex3 command publishers and can move the robot.\n")
-        tty.write("It cannot initialize, warm-start, contact GR00T, or submit policy actions.\n")
-        tty.write("Use Regular mode, clear/support the workspace, hold the physical E-stop,\n")
-        tty.write("and stop every other arm/hand writer. Never press Ctrl-Z.\n")
-        tty.write(f"Type exactly {token} then Enter; anything else cancels: ")
-        if tty.readline().strip() != token:
-            raise SystemExit("Cancelled before command-publisher construction")
+    # ``tee`` redirects stdout but leaves stdin attached to the terminal.  Use
+    # that existing descriptor: some PTYs reject a text-mode ``r+`` wrapper on
+    # /dev/tty as non-seekable.
+    termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    print("\nREAL RAMP-ONLY DIAGNOSTIC.", flush=True)
+    print("This creates arm and Dex3 command publishers and can move the robot.", flush=True)
+    print("It cannot initialize, warm-start, contact GR00T, or submit policy actions.", flush=True)
+    print("Use Regular mode, clear/support the workspace, hold the physical E-stop,", flush=True)
+    print("and stop every other arm/hand writer. Never press Ctrl-Z.", flush=True)
+    print(f"Type exactly {token} then Enter; anything else cancels: ", end="", flush=True)
+    if sys.stdin.readline().strip() != token:
+        raise SystemExit("Cancelled before command-publisher construction")
 
 
 def _raise_interrupt(signum: int, _frame: object) -> None:

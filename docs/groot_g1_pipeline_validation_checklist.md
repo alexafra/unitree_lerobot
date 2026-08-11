@@ -571,8 +571,9 @@ bounded release when the Unitree DDS write or physical network itself wedges.
 With Unitree-supported procedures, appropriate support/harness, a clear workspace and an
 operator on the physical emergency stop, establish and document:
 
-- [ ] Correct robot model and `mode_machine == 5`
-  (`g1_29dof_with_hand_rev_1_0`).
+- [ ] Correct robot model and `mode_machine == 6`
+  (`g1_29dof_lock_waist_with_hand_rev_1_0`; yaw active, roll/pitch locked),
+  matching the data-collection embodiment.
 - [ ] Regular/motion mode continues to own the lower body as intended.
 - [ ] Exactly one arm/Dex3 DDS command owner exists.
 - [ ] `arm_sdk` authority acquisition while holding measured pose causes no jump.
