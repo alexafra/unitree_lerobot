@@ -47,12 +47,14 @@ from unitree_lerobot.eval_robot.groot_contract import (
     RIGHT_HAND_LOWER,
     RIGHT_HAND_JOINT_NAMES,
     RIGHT_HAND_UPPER,
+    SurfaceNormalEncodingContract,
     validate_action_chunk,
     validate_action_chunk_limits,
     validate_initialization_spec,
     validate_measured_state,
 )
 from unitree_lerobot.utils.depth_encoding import encode_depth_gray_rgb
+from unitree_lerobot.utils.surface_normal_encoding import encode_surface_normals_rgb
 
 
 LOGGER = logging.getLogger(__name__)
@@ -276,6 +278,7 @@ class HandStateFreshnessGate:
 class CameraImages:
     rgb: np.ndarray
     depth_gray: np.ndarray | None = None
+    surface_normals: np.ndarray | None = None
     sequence: int | None = None
 
 
@@ -1041,15 +1044,20 @@ def _validate_live_head_config(
     port_key = "zmq_port"
     depth_scale: float | None = None
     if requires_depth:
+        if head.get("image_shape") != EXPECTED_DEPTH_VIEW_SHAPE[:2]:
+            raise DeploymentError(
+                "Aligned-depth geometry requires the calibrated 640x480 color frame; "
+                f"TeleImager reported image_shape={head.get('image_shape')!r}"
+            )
         if str(head.get("type", "")).lower() != "realsense":
-            raise DeploymentError("RGBD checkpoint requires a RealSense TeleImager head camera")
+            raise DeploymentError("Aligned-depth geometry requires a RealSense TeleImager head camera")
         if not head.get("enable_depth", False):
-            raise DeploymentError("RGBD checkpoint requires TeleImager aligned depth")
+            raise DeploymentError("Geometry checkpoint requires TeleImager aligned depth")
         if head.get("binocular", False):
-            raise DeploymentError("RGBD checkpoint does not support a binocular head-camera layout")
+            raise DeploymentError("Geometry checkpoint does not support a binocular head-camera layout")
         if head.get("rgbd_protocol") != RGBD_PROTOCOL:
             raise DeploymentError(
-                f"RGBD checkpoint requires rgbd_protocol={RGBD_PROTOCOL!r}; got {head.get('rgbd_protocol')!r}"
+                f"Geometry checkpoint requires rgbd_protocol={RGBD_PROTOCOL!r}; got {head.get('rgbd_protocol')!r}"
             )
         port_key = "rgbd_zmq_port"
         try:
@@ -1068,14 +1076,22 @@ def _validate_live_head_config(
 
 
 class TeleimagerCamera:
-    """TeleImager client selected automatically for colour or atomic RGBD."""
+    """TeleImager client for colour or client-encoded atomic RGBD geometry."""
 
-    def __init__(self, host: str, depth_encoding: DepthEncodingContract | None = None):
+    def __init__(
+        self,
+        host: str,
+        depth_encoding: DepthEncodingContract | None = None,
+        surface_normal_encoding: SurfaceNormalEncodingContract | None = None,
+    ):
         from unitree_lerobot.eval_robot.image_server.image_client import ImageClient
 
+        if depth_encoding is not None and surface_normal_encoding is not None:
+            raise DeploymentError("Camera cannot emit depth_gray_view and surface_normals_view together")
         self._client = None
         self._depth_encoding = depth_encoding
-        self._requires_depth = depth_encoding is not None
+        self._surface_normal_encoding = surface_normal_encoding
+        self._requires_depth = depth_encoding is not None or surface_normal_encoding is not None
         self._last_rgbd_sequence: int | None = None
         live_config = request_live_camera_config(host)
         stream_port, depth_scale = _validate_live_head_config(
@@ -1173,21 +1189,41 @@ class TeleimagerCamera:
                         f"Aligned depth shape {depth_u16.shape} does not match the training contract "
                         f"{tuple(EXPECTED_DEPTH_VIEW_SHAPE[:2])}"
                     )
-                assert self._depth_encoding is not None
                 try:
-                    depth_gray = encode_depth_gray_rgb(
-                        depth_u16,
-                        scale_m_per_unit=self._depth_scale_m_per_unit,
-                        near_m=self._depth_encoding.near_m,
-                        far_m=self._depth_encoding.far_m,
-                    )
+                    depth_encoding = getattr(self, "_depth_encoding", None)
+                    surface_normal_encoding = getattr(self, "_surface_normal_encoding", None)
+                    if depth_encoding is not None:
+                        depth_gray = encode_depth_gray_rgb(
+                            depth_u16,
+                            scale_m_per_unit=self._depth_scale_m_per_unit,
+                            near_m=depth_encoding.near_m,
+                            far_m=depth_encoding.far_m,
+                        )
+                        surface_normals = None
+                    elif surface_normal_encoding is not None:
+                        depth_gray = None
+                        surface_normals = encode_surface_normals_rgb(
+                            depth_u16,
+                            scale_m_per_unit=self._depth_scale_m_per_unit,
+                            intrinsics=surface_normal_encoding.intrinsics,
+                            max_neighbor_depth_delta_m=(
+                                surface_normal_encoding.max_neighbor_depth_delta_m
+                            ),
+                        )
+                    else:
+                        raise DeploymentError("RGBD camera has no selected geometry encoding")
                 except ValueError as exc:
-                    raise DeploymentError(f"Could not encode aligned depth: {exc}") from exc
+                    raise DeploymentError(f"Could not encode aligned depth geometry: {exc}") from exc
                 self._last_rgbd_sequence = frame.sequence
                 if not self._reported_stream_fps:
                     LOGGER.info("TeleImager atomic RGBD stream is live at %.1f measured FPS", measured_fps)
                     self._reported_stream_fps = True
-                return CameraImages(rgb=rgb, depth_gray=depth_gray, sequence=frame.sequence)
+                return CameraImages(
+                    rgb=rgb,
+                    depth_gray=depth_gray,
+                    surface_normals=surface_normals,
+                    sequence=frame.sequence,
+                )
             except TimeoutError as exc:
                 last_error = exc
                 time.sleep(0.005)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a supported colour or colour+aligned-depth GR00T policy on G1/Dex3.
+"""Run a supported colour or colour+aligned-depth-derived GR00T policy on G1/Dex3.
 
 The default is read-only shadow mode.  ``--actuate`` creates a separate,
 watchdog-owning DDS actuator process only after model, camera, state, and action
@@ -32,8 +32,10 @@ from unitree_lerobot.eval_robot.groot_contract import (
     INITIALIZATION_MODES,
     TASKS,
     ActionChunk,
+    DepthEncodingContract,
     InitializationSpec,
     ModelContract,
+    SurfaceNormalEncodingContract,
     load_initialization_spec,
     make_observation,
     parse_action_chunk,
@@ -50,13 +52,19 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     TeleimagerCamera,
     initialize_dds,
 )
+from unitree_lerobot.utils.depth_encoding import DEPTH_OUTPUT_KEY
+from unitree_lerobot.utils.surface_normal_encoding import SURFACE_NORMAL_OUTPUT_KEY
 
 
 LOGGER = logging.getLogger("eval_groot_g1")
 LOCAL_POLICY_HOSTS = {"127.0.0.1", "localhost"}
 OPERATOR_CONFIRMATION_TIMEOUT_S = 60.0
 ALT_ESCAPE_WINDOW_S = 0.1
-PREVIEW_WINDOWS = ("GR00T input: ego_view", "GR00T input: depth_gray_view")
+PREVIEW_WINDOWS = (
+    "GR00T input: ego_view",
+    f"GR00T input: {DEPTH_OUTPUT_KEY}",
+    f"GR00T input: {SURFACE_NORMAL_OUTPUT_KEY}",
+)
 STOP_COMMANDS = {"stop", "s"}
 EXIT_COMMANDS = {"quit", "q"}
 RTC_MIN_MODEL_HORIZON = 32
@@ -901,13 +909,19 @@ def confirm_policy_continue(actuator: SafeG1Dex3Actuator) -> str:
     )
 
 
-def show_camera_preview(rgb: np.ndarray, depth_gray: np.ndarray | None) -> None:
+def show_camera_preview(
+    rgb: np.ndarray,
+    geometry: np.ndarray | None,
+    geometry_key: str = DEPTH_OUTPUT_KEY,
+) -> None:
     """Display exactly the decoded image arrays being placed in the observation."""
 
     try:
         cv2.imshow(PREVIEW_WINDOWS[0], cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-        if depth_gray is not None:
-            cv2.imshow(PREVIEW_WINDOWS[1], cv2.cvtColor(depth_gray, cv2.COLOR_RGB2BGR))
+        if geometry is not None:
+            if geometry_key not in (DEPTH_OUTPUT_KEY, SURFACE_NORMAL_OUTPUT_KEY):
+                raise DeploymentError(f"Cannot preview unsupported geometry view {geometry_key!r}")
+            cv2.imshow(f"GR00T input: {geometry_key}", cv2.cvtColor(geometry, cv2.COLOR_RGB2BGR))
         if cv2.waitKey(1) & 0xFF == ord("q"):
             raise DeploymentError("Camera preview closed by user")
     except cv2.error as exc:
@@ -953,8 +967,12 @@ def capture_policy_observation(
         _raise_if_immediate_control(actuator)
         actuator.heartbeat()
     images = camera.read(timeout_s=camera_timeout_s)
+    depth_gray = getattr(images, "depth_gray", None)
+    surface_normals = getattr(images, "surface_normals", None)
     if show_camera:
-        show_camera_preview(images.rgb, images.depth_gray)
+        geometry = depth_gray if depth_gray is not None else surface_normals
+        geometry_key = DEPTH_OUTPUT_KEY if depth_gray is not None else SURFACE_NORMAL_OUTPUT_KEY
+        show_camera_preview(images.rgb, geometry, geometry_key)
     if actuator is not None:
         _raise_if_immediate_control(actuator)
         actuator.heartbeat()
@@ -966,7 +984,8 @@ def capture_policy_observation(
         state.right_hand,
         instruction,
         video_keys=model_contract.video_keys,
-        depth_gray=images.depth_gray,
+        depth_gray=depth_gray,
+        surface_normals=surface_normals,
         allow_custom_instruction=allow_custom_instruction,
     )
     return observation, state
@@ -1847,9 +1866,20 @@ def run(args: argparse.Namespace) -> None:
             raise DeploymentError(f"GR00T server at {args.policy_host}:{args.policy_port} did not answer ping")
         contract = validate_model_contract(policy.get_modality_config())
         policy_metadata = policy.get_policy_metadata()
-        depth_encoding = validate_policy_metadata(
+        requires_surface_normals = getattr(
+            contract,
+            "requires_surface_normals",
+            contract.video_keys == ("ego_view", SURFACE_NORMAL_OUTPUT_KEY),
+        )
+        requires_depth_gray = getattr(
+            contract,
+            "requires_depth_gray",
+            contract.video_keys == ("ego_view", DEPTH_OUTPUT_KEY),
+        )
+        visual_encoding = validate_policy_metadata(
             policy_metadata,
-            requires_depth=contract.requires_depth,
+            requires_depth=requires_depth_gray,
+            requires_surface_normals=requires_surface_normals,
         )
         if args.execution_horizon > contract.action_horizon:
             raise DeploymentError(
@@ -1900,7 +1930,15 @@ def run(args: argparse.Namespace) -> None:
 
         initialize_dds(args.sim, args.network_interface)
         state_reader = G1Dex3StateReader(simulation=args.sim)
-        camera = TeleimagerCamera(image_host, depth_encoding=depth_encoding)
+        depth_encoding = visual_encoding if isinstance(visual_encoding, DepthEncodingContract) else None
+        surface_normal_encoding = (
+            visual_encoding if isinstance(visual_encoding, SurfaceNormalEncodingContract) else None
+        )
+        camera = TeleimagerCamera(
+            image_host,
+            depth_encoding=depth_encoding,
+            surface_normal_encoding=surface_normal_encoding,
+        )
         head = camera.config["head_camera"]
         LOGGER.info(
             "TeleImager config: host=%s type=%s shape=%s binocular=%s fps=%s",
