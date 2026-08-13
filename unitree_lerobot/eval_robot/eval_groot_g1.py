@@ -1343,7 +1343,7 @@ def _run_active_goal_controlled(
             LOGGER.warning(
                 "AUTOMATIC REPLAN after scheduler discontinuity during goal %r: sequence=%s action=%s "
                 "lateness=%.3fs; discarded %s stale actions and refetching from a fresh observation "
-                "without entering operator HOLD",
+                "without entering operator HOLD; full timing ring retained for post-release dump",
                 task_name,
                 detail.get("sequence", sequence),
                 detail.get("action_index", "?"),
@@ -1461,7 +1461,8 @@ def _run_active_goal_rtc(
                 LOGGER.warning(
                     "AUTOMATIC RTC REPLAN after scheduler discontinuity during goal %r: sequence=%s action=%s "
                     "lateness=%.3fs; discarded %s stale actions and refetching a fresh plan "
-                    "without entering operator HOLD (remaining action budget=%d)",
+                    "without entering operator HOLD (remaining action budget=%d); full timing ring "
+                    "retained for post-release dump",
                     task_name,
                     detail.get("sequence", "?"),
                     detail.get("action_index", "?"),

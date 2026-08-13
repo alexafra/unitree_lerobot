@@ -762,7 +762,8 @@ class PublishedHandTarget:
 class HandTrackingWatchdog:
     """Time-align hand feedback to successful DDS targets and track warnings."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, emit_logs: bool = True) -> None:
+        self._emit_logs = bool(emit_logs)
         self._last_sample_at = np.full(2, -np.inf, dtype=np.float64)
         self._violation_since = np.full((2, HAND_DOF), np.nan, dtype=np.float64)
         self._warning_active = np.zeros((2, HAND_DOF), dtype=bool)
@@ -882,19 +883,20 @@ class HandTrackingWatchdog:
                         and not self._warning_active[hand_index, joint_index]
                     ):
                         self._warning_active[hand_index, joint_index] = True
-                        LOGGER.warning(
-                            "%s tracking error persisted for %.3fs at joint %d (%s): "
-                            "%+.3f rad measured-minus-aligned-target; warning threshold=%.3f rad; %s",
-                            hand_name.title(),
-                            sample_at - since,
-                            joint_index,
-                            joint_names[joint_index],
-                            float(errors[joint_index]),
-                            HAND_TRACKING_WARNING_RAD,
-                            context,
-                        )
+                        if self._emit_logs:
+                            LOGGER.warning(
+                                "%s tracking error persisted for %.3fs at joint %d (%s): "
+                                "%+.3f rad measured-minus-aligned-target; warning threshold=%.3f rad; %s",
+                                hand_name.title(),
+                                sample_at - since,
+                                joint_index,
+                                joint_names[joint_index],
+                                float(errors[joint_index]),
+                                HAND_TRACKING_WARNING_RAD,
+                                context,
+                            )
                 elif magnitude <= HAND_TRACKING_WARNING_CLEAR_RAD:
-                    if self._warning_active[hand_index, joint_index]:
+                    if self._warning_active[hand_index, joint_index] and self._emit_logs:
                         LOGGER.info(
                             "%s tracking warning recovered at joint %d (%s): %+.3f rad",
                             hand_name.title(),
@@ -2144,15 +2146,6 @@ def _observe_hand_freshness(
             "warning_age_s": ACTUATOR_HAND_STATE_WARNING_AGE_S,
             "hard_age_s": ACTUATOR_HAND_STATE_MAX_AGE_S,
         }
-        LOGGER.warning(
-            "Dex3 state pause in %s: %s age %.3fs exceeded soft %.3fs; "
-            "freezing commands (hard fault at %.3fs)",
-            context,
-            "/".join(result.stale_hands),
-            result.max_age_s,
-            ACTUATOR_HAND_STATE_WARNING_AGE_S,
-            ACTUATOR_HAND_STATE_MAX_AGE_S,
-        )
         _status_nonblocking(status_queue, "hand_state_pause", payload)
     elif result.recovered:
         payload = {
@@ -2160,12 +2153,6 @@ def _observe_hand_freshness(
             "pause_s": result.pause_s,
             "fresh_samples": ACTUATOR_HAND_RECOVERY_SAMPLES,
         }
-        LOGGER.info(
-            "Dex3 state recovered in %s after %.3fs and %d consecutive fresh samples",
-            context,
-            result.pause_s,
-            ACTUATOR_HAND_RECOVERY_SAMPLES,
-        )
         # Recovery gates future motion, so unlike the entry diagnostic this
         # acknowledgment is delivered through the bounded reliable path.
         _status(status_queue, "hand_state_recovered", payload)
@@ -2586,8 +2573,11 @@ def _validate_policy_target_input(
     validate_action_chunk_limits(chunk)
     try:
         validate_action_chunk(chunk, current_arm, current_left, current_right)
-    except DeploymentError as exc:
-        LOGGER.warning("%s raw target discontinuity will be conditioned before DDS: %s", context, exc)
+    except DeploymentError:
+        # The final-command conditioner owns the hard DDS slew bound. Avoid
+        # synchronous terminal/file logging inside the 100 Hz actuator loop;
+        # the parent preflight and active timing artifact retain diagnostics.
+        pass
 
 
 def _ramp_real_arm_authority(
@@ -2741,7 +2731,10 @@ def _actuator_main(
     last_sequence = 0
     tracking_checks_after = float("inf")
     conditioner: XrPolicyOutputConditioner | None = None
-    hand_watchdog = HandTrackingWatchdog()
+    # The spawned actuator process must never perform terminal/file I/O from
+    # its 100 Hz loop. Parent-owned statuses and the active timing ring retain
+    # the same diagnostics without blocking command publication.
+    hand_watchdog = HandTrackingWatchdog(emit_logs=False)
     hand_freshness_gate = HandStateFreshnessGate()
     dds_hold_timing: DdsHoldTimingAccumulator | None = None
     active_timing: ActiveTimingRing | None = None
@@ -2752,52 +2745,18 @@ def _actuator_main(
     active_fault_trigger: str | None = None
     timing_dump_errors: list[str] = []
     timing_dump_dropped = 0
-    timing_dump_requests: queue.Queue[
+    # A Python writer thread shares this process's GIL and can perturb the
+    # 100 Hz actuator loop while normalizing/encoding a full timing ring.
+    # Rotate rings in O(1), retain a bounded number, and persist them only
+    # after command authority has been released.
+    deferred_timing_dumps: list[
         tuple[
             ActiveTimingRing,
             str,
             str | None,
             tuple[np.ndarray, np.ndarray, np.ndarray],
         ]
-        | None
-    ] | None = None
-    timing_dump_thread: threading.Thread | None = None
-
-    if run_log_dir is not None:
-        timing_dump_requests = queue.Queue(maxsize=4)
-
-        def timing_dump_worker() -> None:
-            assert timing_dump_requests is not None
-            while True:
-                request = timing_dump_requests.get()
-                try:
-                    if request is None:
-                        return
-                    ring, trigger, error, targets = request
-                    payload = ring.snapshot(
-                        trigger=trigger,
-                        error=error,
-                        backend=None,
-                        command_conditioning=command_conditioning,
-                        target_snapshot=targets,
-                    )
-                    path = diagnostic_json_path(run_log_dir, trigger)
-                    write_json(path, payload)
-                    LOGGER.warning("ACTIVE_TIMING_DUMP=%s", path)
-                except BaseException as diagnostic_exc:
-                    timing_dump_errors.append(
-                        "Asynchronous active timing dump failed: "
-                        f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
-                    )
-                finally:
-                    timing_dump_requests.task_done()
-
-        timing_dump_thread = threading.Thread(
-            target=timing_dump_worker,
-            name="groot-active-timing-writer",
-            daemon=True,
-        )
-        timing_dump_thread.start()
+    ] = []
     try:
         backend = _G1Dex3CommandBackend(simulation, network_interface)
         backend._authority_ramp_timing_enabled = authority_ramp_diagnostics or dds_hold_diagnostics
@@ -2984,6 +2943,7 @@ def _actuator_main(
         rtc_action_budget = 0
         last_discontinued_sequence: int | None = None
         pending_replan_detail: dict[str, Any] | None = None
+        replan_freeze_active = False
         replan_last_loop_started: float | None = None
         replan_stable_samples = 0
         urgent_hold_active = False
@@ -3111,6 +3071,16 @@ def _actuator_main(
                         except queue.Empty:
                             break
                         if paused_command == ("urgent_hold_barrier",):
+                            # Operator STOP supersedes an automatic scheduler
+                            # replan even while Dex3 feedback is paused.  Do
+                            # not let the old replan surface after recovery or
+                            # leave the child logically outside HOLD.
+                            pending_replan_detail = None
+                            replan_freeze_active = False
+                            replan_last_loop_started = None
+                            replan_stable_samples = 0
+                            paused_sync_sequence = None
+                            holding = True
                             urgent_hold_event.clear()
                             urgent_hold_active = False
                             _status(status_queue, "urgent_holding", last_sequence)
@@ -3206,6 +3176,7 @@ def _actuator_main(
                     rtc_mode = False
                     tracking_checks_after = time.monotonic()
                     holding = True
+                    replan_freeze_active = False
                     urgent_hold_active = False
                     urgent_hold_event.clear()
                     _status(status_queue, "urgent_holding", last_sequence)
@@ -3237,6 +3208,7 @@ def _actuator_main(
                     rtc_mode = False
                     tracking_checks_after = time.monotonic()
                     holding = True
+                    replan_freeze_active = False
                     _status(status_queue, "holding", last_sequence)
                     continue
 
@@ -3385,9 +3357,9 @@ def _actuator_main(
                     state = backend.state()
                     _validate_policy_target_input(
                         proposed,
-                        state.arm,
-                        state.left_hand,
-                        state.right_hand,
+                        backend._arm_target if replan_freeze_active else state.arm,
+                        backend._left_target if replan_freeze_active else state.left_hand,
+                        backend._right_target if replan_freeze_active else state.right_hand,
                         conditioner,
                         context="Initial RTC plan",
                     )
@@ -3400,6 +3372,7 @@ def _actuator_main(
                     rtc_mode = True
                     rtc_total_actions = 0
                     rtc_action_budget = action_budget
+                    replan_freeze_active = False
                     _status(status_queue, "rtc_started", sequence)
 
                 elif kind == "rtc_replace":
@@ -3605,9 +3578,9 @@ def _actuator_main(
                     proposed = ActionChunk(arm=arm, left_hand=left, right_hand=right)
                     _validate_policy_target_input(
                         proposed,
-                        state.arm,
-                        state.left_hand,
-                        state.right_hand,
+                        backend._arm_target if replan_freeze_active else state.arm,
+                        backend._left_target if replan_freeze_active else state.left_hand,
+                        backend._right_target if replan_freeze_active else state.right_hand,
                         conditioner,
                         context="Synchronous plan",
                     )
@@ -3617,6 +3590,7 @@ def _actuator_main(
                     next_action_at = time.monotonic()
                     last_sequence = sequence
                     holding = False
+                    replan_freeze_active = False
 
                 active_timing.finish_command()
 
@@ -3642,6 +3616,7 @@ def _actuator_main(
                     rtc_mode = False
                     tracking_checks_after = time.monotonic()
                     holding = True
+                    replan_freeze_active = False
                     _status(status_queue, "holding", last_sequence)
                 urgent_hold_active = True
                 now = time.monotonic()
@@ -3714,19 +3689,13 @@ def _actuator_main(
                         # operator's measured-pose HOLD.  Continue publishing
                         # the exact last command until a fresh plan arrives.
                         holding = False
+                        replan_freeze_active = True
                         pending_replan_detail = replan_detail
                         replan_last_loop_started = loop_started
                         replan_stable_samples = 0
-                        if timing_dump_requests is None:
-                            LOGGER.warning(
-                                "ACTIVE_TIMING_DUMP unavailable because no run log directory was configured; "
-                                "trigger=action_scheduler_replan retained=%d total=%d",
-                                len(replan_timing._records),
-                                replan_timing._total,
-                            )
-                        else:
-                            try:
-                                timing_dump_requests.put_nowait(
+                        if run_log_dir is not None:
+                            if len(deferred_timing_dumps) < 4:
+                                deferred_timing_dumps.append(
                                     (
                                         replan_timing,
                                         "action_scheduler_replan",
@@ -3738,7 +3707,7 @@ def _actuator_main(
                                         ),
                                     )
                                 )
-                            except queue.Full:
+                            else:
                                 timing_dump_dropped += 1
                         active_timing = ActiveTimingRing()
                         publish_active()
@@ -3846,7 +3815,7 @@ def _actuator_main(
                 finally:
                     active_timing.update(tracking_ms=(time.monotonic_ns() - tracking_started) / 1e6)
 
-            if conditioner is not None and not holding:
+            if conditioner is not None and not holding and not replan_freeze_active:
                 conditioner_started = time.monotonic_ns()
                 previous_arm = backend._arm_target.copy()
                 previous_left = backend._left_target.copy()
@@ -3898,6 +3867,8 @@ def _actuator_main(
                 )
         dds_hold_completed_at = time.monotonic() if dds_hold_timing is not None else None
         cleanup_reporting_errors: list[str] = []
+        local_release_complete = backend is None
+        local_close_complete = backend is None
 
         def cleanup_status(kind: str, payload: Any = None) -> None:
             try:
@@ -3924,6 +3895,7 @@ def _actuator_main(
             except BaseException as exc:
                 cleanup_status("release_failed", f"{type(exc).__name__}: {exc}")
             else:
+                local_release_complete = True
                 cleanup_status("release_complete")
             cleanup_phase("backend_close_begin", {})
             try:
@@ -3931,23 +3903,35 @@ def _actuator_main(
             except BaseException as exc:
                 cleanup_status("close_failed", f"{type(exc).__name__}: {exc}")
             else:
+                local_close_complete = True
                 cleanup_phase("backend_close_complete", {})
         else:
             cleanup_status("release_complete", "no backend was constructed")
 
         # Everything below is post-release diagnostics. No logging or status
         # serialization above is allowed to bypass backend release/close.
-        if timing_dump_requests is not None and timing_dump_thread is not None:
-            try:
-                timing_dump_requests.put(None, timeout=5.0)
-                timing_dump_thread.join(timeout=5.0)
-                if timing_dump_thread.is_alive():
-                    timing_dump_errors.append("Active timing writer did not stop within 5 seconds")
-            except BaseException as diagnostic_exc:
-                timing_dump_errors.append(
-                    "Could not stop active timing writer: "
-                    f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
-                )
+        if run_log_dir is not None and local_release_complete and local_close_complete:
+            for ring, trigger, error, targets in deferred_timing_dumps:
+                try:
+                    payload = ring.snapshot(
+                        trigger=trigger,
+                        error=error,
+                        backend=None,
+                        command_conditioning=command_conditioning,
+                        target_snapshot=targets,
+                    )
+                    path = diagnostic_json_path(run_log_dir, trigger)
+                    write_json(path, payload)
+                    LOGGER.warning("ACTIVE_TIMING_DUMP=%s", path)
+                except BaseException as diagnostic_exc:
+                    timing_dump_errors.append(
+                        "Deferred active timing dump failed after release: "
+                        f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
+                    )
+        elif deferred_timing_dumps:
+            timing_dump_errors.append(
+                "Skipped deferred active timing dumps because local release/close was not confirmed"
+            )
         if timing_dump_dropped:
             timing_dump_errors.append(
                 f"Dropped {timing_dump_dropped} active timing dump request(s) because the writer queue was full"

@@ -124,11 +124,9 @@ class ActiveTimingRingTest(unittest.TestCase):
         def write_after_cleanup(path, payload):
             backend = _GatedRecordingBackend.instance
             assert backend is not None
-            if payload["trigger"] == "orderly_shutdown":
-                self.assertTrue(backend.released)
-                self.assertTrue(backend.closed)
-            else:
-                self.assertEqual(payload["trigger"], "action_scheduler_replan")
+            self.assertTrue(backend.released)
+            self.assertTrue(backend.closed)
+            self.assertIn(payload["trigger"], {"orderly_shutdown", "action_scheduler_replan"})
             return run_logging.write_json(path, payload)
 
         with tempfile.TemporaryDirectory() as temporary, (

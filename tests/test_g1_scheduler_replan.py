@@ -23,6 +23,7 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     CONTROL_HZ,
     SafeG1Dex3Actuator,
 )
+from unitree_lerobot.eval_robot.groot_contract import load_initialization_spec
 
 
 _EVAL_MODULE = "unitree_lerobot.eval_robot.eval_groot_g1"
@@ -52,6 +53,68 @@ class _StallAfterFirstActionBackend(_GatedRecordingBackend):
             self._stalled_once = True
             self.publish_paused.set()
             self.continue_publish.wait(timeout=1.0)
+
+
+class _OffsetLaggingStallBackend(_StallAfterFirstActionBackend):
+    """Report ordinary arm servo lag after the first nonzero command."""
+
+    instance: _OffsetLaggingStallBackend | None = None
+
+    def state(self):
+        state = super().state()
+        if np.any(np.abs(self._arm_target) > 1e-12):
+            return type(state)(
+                captured_at=state.captured_at,
+                mode_machine=state.mode_machine,
+                arm=self._arm_target.copy() - 0.10,
+                arm_dq=state.arm_dq,
+                left_hand=state.left_hand,
+                right_hand=state.right_hand,
+                arm_received_at=state.arm_received_at,
+                left_hand_received_at=state.left_hand_received_at,
+                right_hand_received_at=state.right_hand_received_at,
+            )
+        return state
+
+
+class _ZeroMeasuredStallBackend(_StallAfterFirstActionBackend):
+    """Keep feedback at zero so command-to-command checks are observable."""
+
+    instance: _ZeroMeasuredStallBackend | None = None
+    follow_commanded_target = False
+
+
+class _StaleAfterStallBackend(_StallAfterFirstActionBackend):
+    """Enter a soft Dex3 stale interval immediately after the injected stall."""
+
+    instance: _StaleAfterStallBackend | None = None
+
+    def __init__(self, simulation: bool, network_interface: str | None):
+        super().__init__(simulation, network_interface)
+        self.stale_hands = False
+
+    def publish(self) -> None:
+        was_stalled = self._stall_armed and not self._stalled_once and len(self.target_snapshot()) == 1
+        super().publish()
+        if was_stalled:
+            self.stale_hands = True
+
+    def state(self):
+        state = super().state()
+        if not self.stale_hands:
+            return state
+        stale_at = time.monotonic() - 0.10
+        return type(state)(
+            captured_at=stale_at,
+            mode_machine=state.mode_machine,
+            arm=state.arm,
+            arm_dq=state.arm_dq,
+            left_hand=state.left_hand,
+            right_hand=state.right_hand,
+            arm_received_at=time.monotonic(),
+            left_hand_received_at=stale_at,
+            right_hand_received_at=stale_at,
+        )
 
 
 def _replan_payload(*, rtc: bool, sequence: int = 1, action_index: int = 1, length: int = 8) -> dict:
@@ -173,6 +236,128 @@ class ChildSchedulerReplanTest(unittest.TestCase):
             self.assertEqual(child.assert_status("rtc_completed"), 1)
             self.assertTrue(child.thread is not None and child.thread.is_alive())
             self.assertFalse(child.backend.released)
+
+    def test_xr_replan_keeps_exact_frozen_target_until_fresh_plan_is_accepted(self) -> None:
+        with _ChildHarness(
+            _OffsetLaggingStallBackend,
+            command_conditioning="xr",
+        ) as child, mock.patch(
+            f"{_SAFE_MODULE}.MAX_ACTION_LATENESS_S",
+            1.0 / CONTROL_HZ,
+        ):
+            plan = _plan(8)
+            plan.arm[:, 0] = 0.50
+            child.commands.put(
+                (
+                    "chunk",
+                    1,
+                    time.monotonic(),
+                    plan.arm,
+                    plan.left_hand,
+                    plan.right_hand,
+                ),
+                timeout=0.2,
+            )
+            self._stall_one_publish_after_first_action(child)
+            child.assert_status("replan_required")
+
+            frozen_arm = child.backend._arm_target.copy()
+            frozen_left = child.backend._left_target.copy()
+            frozen_right = child.backend._right_target.copy()
+            target_count = len(child.backend.target_snapshot())
+            time.sleep(0.08)
+
+            # Feedback lags the frozen command by 0.1 rad. XR conditioning
+            # must remain fenced until a fresh plan is actually accepted.
+            self.assertEqual(len(child.backend.target_snapshot()), target_count)
+            np.testing.assert_array_equal(child.backend._arm_target, frozen_arm)
+            np.testing.assert_array_equal(child.backend._left_target, frozen_left)
+            np.testing.assert_array_equal(child.backend._right_target, frozen_right)
+            self.assertTrue(child.thread is not None and child.thread.is_alive())
+
+    def test_unconditioned_replan_validates_fresh_target_from_frozen_command(self) -> None:
+        with _ChildHarness(_ZeroMeasuredStallBackend) as child, mock.patch(
+            f"{_SAFE_MODULE}.MAX_ACTION_LATENESS_S",
+            1.0 / CONTROL_HZ,
+        ):
+            old_plan = _plan(8)
+            old_plan.arm[:, 0] = 0.09
+            child.commands.put(
+                (
+                    "chunk",
+                    1,
+                    time.monotonic(),
+                    old_plan.arm,
+                    old_plan.left_hand,
+                    old_plan.right_hand,
+                ),
+                timeout=0.2,
+            )
+            self._stall_one_publish_after_first_action(child)
+            child.assert_status("replan_required")
+            self.assertAlmostEqual(child.backend._arm_target[0], 0.09)
+
+            # -0.02 is safe relative to measured zero, but it is an unsafe
+            # 0.11-rad jump from the exact +0.09 command being held.
+            fresh_plan = _plan(1)
+            fresh_plan.arm[0, 0] = -0.02
+            child.commands.put(
+                (
+                    "chunk",
+                    2,
+                    time.monotonic(),
+                    fresh_plan.arm,
+                    fresh_plan.left_hand,
+                    fresh_plan.right_hand,
+                ),
+                timeout=0.2,
+            )
+            fault = child.assert_status("fault")
+            self.assertIn("target jump is too large", fault)
+            self.assertFalse(
+                any(np.array_equal(target[0], fresh_plan.arm[0]) for target in child.backend.target_snapshot())
+            )
+
+    def test_operator_stop_during_stale_replan_cancels_replan_and_recovers_in_hold(self) -> None:
+        with _ChildHarness(_StaleAfterStallBackend) as child, mock.patch(
+            f"{_SAFE_MODULE}.MAX_ACTION_LATENESS_S",
+            1.0 / CONTROL_HZ,
+        ):
+            plan = _plan(8)
+            child.commands.put(
+                (
+                    "chunk",
+                    1,
+                    time.monotonic(),
+                    plan.arm,
+                    plan.left_hand,
+                    plan.right_hand,
+                ),
+                timeout=0.2,
+            )
+            self._stall_one_publish_after_first_action(child)
+            child.assert_status("hand_state_pause")
+
+            child.urgent_hold.set()
+            child.commands.put(("urgent_hold_barrier",), timeout=0.2)
+            self.assertEqual(child.assert_status("urgent_holding"), 1)
+            child.backend.stale_hands = False
+            child.assert_status("hand_state_recovered")
+
+            # The superseded automatic replan must not reappear. A normal
+            # warm-start command proves the child is logically in HOLD.
+            child.commands.put(
+                (
+                    "warm_start",
+                    time.monotonic(),
+                    load_initialization_spec("measured", task_name="pick-red-cup"),
+                ),
+                timeout=0.2,
+            )
+            child.assert_status("warm_starting")
+            child.assert_status("warm_started")
+            with self.assertRaises(queue.Empty):
+                child.statuses.get(timeout=0.08)
 
 
 class ParentReplanTest(unittest.TestCase):
