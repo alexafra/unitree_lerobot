@@ -91,7 +91,10 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     CameraImages,
     G1Dex3StateReader,
     ImmediateControlEvent,
+    INITIALIZATION_ARM_TOLERANCE_RAD,
+    INITIALIZATION_HAND_TOLERANCE_RAD,
     INITIALIZATION_MAX_ARM_STEP_RAD,
+    INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S,
     INITIALIZATION_MAX_HAND_STEP_RAD,
     INITIALIZATION_MIN_MOVE_S,
     MAX_ARM_DQ_RAD_S,
@@ -4493,6 +4496,125 @@ class GrootG1DeploymentTests(unittest.TestCase):
                     self.assertFalse(thread.is_alive())
                     self.assertTrue(FakeBackend.instance.released)
                     self.assertTrue(FakeBackend.instance.closed)
+
+    def _initialization_timeout_message(
+        self,
+        *,
+        arm: np.ndarray | None = None,
+        arm_dq: np.ndarray | None = None,
+        left_hand: np.ndarray | None = None,
+        right_hand: np.ndarray | None = None,
+    ) -> str:
+        class Clock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+        class AdvancingEvent:
+            def is_set(self):
+                return False
+
+            def wait(self, timeout):
+                clock.now += timeout
+                heartbeat.value = clock.now
+
+        measured_arm = np.zeros(14) if arm is None else np.asarray(arm, dtype=np.float64)
+        measured_arm_dq = (
+            np.zeros(14) if arm_dq is None else np.asarray(arm_dq, dtype=np.float64)
+        )
+        measured_left = (
+            np.zeros(7) if left_hand is None else np.asarray(left_hand, dtype=np.float64)
+        )
+        measured_right = (
+            np.zeros(7) if right_hand is None else np.asarray(right_hand, dtype=np.float64)
+        )
+
+        class NonConvergingBackend(FakeBackend):
+            def state(self):
+                return RobotState(
+                    captured_at=clock.now,
+                    mode_machine=0,
+                    arm=measured_arm.copy(),
+                    arm_dq=measured_arm_dq.copy(),
+                    left_hand=measured_left.copy(),
+                    right_hand=measured_right.copy(),
+                )
+
+        clock = Clock()
+        heartbeat = FakeHeartbeat(clock.now)
+        backend = NonConvergingBackend(False, None)
+        chunk = ActionChunk(
+            arm=np.zeros((1, 14)),
+            left_hand=np.zeros((1, 7)),
+            right_hand=np.zeros((1, 7)),
+        )
+        module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+        with (
+            mock.patch(f"{module}.time.monotonic", clock.monotonic),
+            mock.patch(f"{module}.INITIALIZATION_CONVERGENCE_TIMEOUT_S", 0.015),
+            self.assertRaisesRegex(DeploymentError, "did not converge") as raised,
+        ):
+            _execute_initialization(
+                backend,
+                chunk,
+                AdvancingEvent(),
+                heartbeat,
+                float("inf"),
+            )
+        return str(raised.exception)
+
+    def test_initialization_timeout_names_only_failed_hand_tolerance_and_worst_joint(self):
+        right_hand = np.zeros(7)
+        right_hand[5] = -(INITIALIZATION_HAND_TOLERANCE_RAD + 0.003)
+
+        message = self._initialization_timeout_message(right_hand=right_hand)
+
+        self.assertIn(
+            f"failed gate(s): hand error={abs(right_hand[5]):.3f} rad",
+            message,
+        )
+        self.assertIn("right hand joint 5 (kRightHandMiddle0)", message)
+        self.assertIn(f"measured minus target={right_hand[5]:+.3f} rad", message)
+        self.assertIn(
+            f"INITIALIZATION_HAND_TOLERANCE_RAD={INITIALIZATION_HAND_TOLERANCE_RAD:.3f} rad",
+            message,
+        )
+        self.assertNotIn("INITIALIZATION_ARM_TOLERANCE_RAD", message)
+        self.assertNotIn("INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S", message)
+
+    def test_initialization_timeout_names_only_failed_arm_tolerance(self):
+        arm = np.zeros(14)
+        arm[10] = INITIALIZATION_ARM_TOLERANCE_RAD + 0.014
+
+        message = self._initialization_timeout_message(arm=arm)
+
+        self.assertIn(f"failed gate(s): arm error={arm[10]:.3f} rad", message)
+        self.assertIn("joint 10 (kRightElbow)", message)
+        self.assertIn(f"measured minus target={arm[10]:+.3f} rad", message)
+        self.assertIn(
+            f"INITIALIZATION_ARM_TOLERANCE_RAD={INITIALIZATION_ARM_TOLERANCE_RAD:.3f} rad",
+            message,
+        )
+        self.assertNotIn("INITIALIZATION_HAND_TOLERANCE_RAD", message)
+        self.assertNotIn("INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S", message)
+
+    def test_initialization_timeout_names_only_failed_arm_velocity_tolerance(self):
+        arm_dq = np.zeros(14)
+        arm_dq[8] = -(INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S + 0.038)
+
+        message = self._initialization_timeout_message(arm_dq=arm_dq)
+
+        self.assertIn(f"failed gate(s): max arm dq={abs(arm_dq[8]):.3f} rad/s", message)
+        self.assertIn("joint 8 (kRightShoulderRoll)", message)
+        self.assertIn(f"signed dq={arm_dq[8]:+.3f} rad/s", message)
+        self.assertIn(
+            "INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S="
+            f"{INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S:.3f} rad/s",
+            message,
+        )
+        self.assertNotIn("INITIALIZATION_ARM_TOLERANCE_RAD", message)
+        self.assertNotIn("INITIALIZATION_HAND_TOLERANCE_RAD", message)
 
     def test_initialization_does_not_report_convergence_while_arm_is_moving(self):
         class MovingBackend(FakeBackend):

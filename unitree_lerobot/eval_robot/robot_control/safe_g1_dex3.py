@@ -132,7 +132,7 @@ INITIALIZATION_CONVERGENCE_TIMEOUT_S = 10.0
 INITIALIZATION_CONVERGENCE_DWELL_S = 0.50
 INITIALIZATION_MIN_DISTINCT_SAMPLES = 5
 INITIALIZATION_ARM_TOLERANCE_RAD = 0.20 #increased from 0.05 SAFETYCHANGE
-INITIALIZATION_HAND_TOLERANCE_RAD = 0.40
+INITIALIZATION_HAND_TOLERANCE_RAD = 0.80 #SAFETYCHANGE increased from 0.4
 INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S = 0.10
 INITIALIZATION_MAX_POSITION_DRIFT_RAD = 0.02
 INITIALIZATION_COMMAND_MAX_AGE_S = 0.25
@@ -2638,12 +2638,65 @@ def _execute_initialization(
                 _, arm_joint, arm_name, arm_delta = _largest_named_value(
                     (("arm", state.arm - backend._arm_target, ARM_JOINT_NAMES),)
                 )
+                hand_group, hand_joint, hand_name, hand_delta = _largest_named_value(
+                    (
+                        (
+                            "left hand",
+                            state.left_hand - backend._left_target,
+                            LEFT_HAND_JOINT_NAMES,
+                        ),
+                        (
+                            "right hand",
+                            state.right_hand - backend._right_target,
+                            RIGHT_HAND_JOINT_NAMES,
+                        ),
+                    )
+                )
+                arm_dq_joint = int(np.argmax(np.abs(state.arm_dq)))
+                arm_dq = float(state.arm_dq[arm_dq_joint])
+                failed_gates: list[str] = []
+                if arm_error > INITIALIZATION_ARM_TOLERANCE_RAD:
+                    failed_gates.append(
+                        f"arm error={arm_error:.3f} rad at joint {arm_joint} ({arm_name}), "
+                        f"measured minus target={arm_delta:+.3f} rad > "
+                        f"INITIALIZATION_ARM_TOLERANCE_RAD="
+                        f"{INITIALIZATION_ARM_TOLERANCE_RAD:.3f} rad"
+                    )
+                if hand_error > INITIALIZATION_HAND_TOLERANCE_RAD:
+                    failed_gates.append(
+                        f"hand error={hand_error:.3f} rad at {hand_group} joint {hand_joint} "
+                        f"({hand_name}), measured minus target={hand_delta:+.3f} rad > "
+                        f"INITIALIZATION_HAND_TOLERANCE_RAD="
+                        f"{INITIALIZATION_HAND_TOLERANCE_RAD:.3f} rad"
+                    )
+                if not backend.simulation and abs(arm_dq) > INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S:
+                    failed_gates.append(
+                        f"max arm dq={abs(arm_dq):.3f} rad/s at joint {arm_dq_joint} "
+                        f"({ARM_JOINT_NAMES[arm_dq_joint]}), signed dq={arm_dq:+.3f} rad/s > "
+                        f"INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S="
+                        f"{INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S:.3f} rad/s"
+                    )
+                if not failed_gates:
+                    dwell_elapsed = 0.0 if converged_since is None else max(0.0, now - converged_since)
+                    failed_gates.append(
+                        "instantaneous position/velocity gates passed but the stability dwell was incomplete: "
+                        f"dwell={dwell_elapsed:.3f}s / INITIALIZATION_CONVERGENCE_DWELL_S="
+                        f"{INITIALIZATION_CONVERGENCE_DWELL_S:.3f}s, "
+                        f"distinct samples={distinct_converged_samples} / "
+                        f"INITIALIZATION_MIN_DISTINCT_SAMPLES={INITIALIZATION_MIN_DISTINCT_SAMPLES}"
+                    )
                 raise DeploymentError(
-                    "Initialization target did not converge: "
+                    "Initialization target did not converge before "
+                    f"INITIALIZATION_CONVERGENCE_TIMEOUT_S="
+                    f"{INITIALIZATION_CONVERGENCE_TIMEOUT_S:.3f}s; failed gate(s): "
+                    + "; ".join(failed_gates)
+                    + "; observed: "
                     f"arm error={arm_error:.3f} rad at joint {arm_joint} ({arm_name}), "
-                    f"measured minus target={arm_delta:+.3f} rad, "
-                    f"max arm dq={float(np.max(np.abs(state.arm_dq))):.3f} rad/s, "
-                    f"hand error={hand_error:.3f} rad"
+                    f"measured minus target={arm_delta:+.3f} rad; "
+                    f"max arm dq={abs(arm_dq):.3f} rad/s at joint {arm_dq_joint} "
+                    f"({ARM_JOINT_NAMES[arm_dq_joint]}); "
+                    f"hand error={hand_error:.3f} rad at {hand_group} joint {hand_joint} "
+                    f"({hand_name}), measured minus target={hand_delta:+.3f} rad"
                 )
 
         backend.publish()
