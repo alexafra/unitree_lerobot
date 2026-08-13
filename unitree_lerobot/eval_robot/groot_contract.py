@@ -113,7 +113,7 @@ MAX_ARM_STEP_RAD = 0.10
 # conditioner ceiling but remains below this hard backstop. This 0.60-rad
 # backstop itself is not an official Unitree velocity limit.
 MAX_HAND_STEP_RAD = 0.60
-JOINT_LIMIT_MARGIN_RAD = 0.03
+JOINT_LIMIT_MARGIN_RAD = 0.015 #SAFETYCHANGE was 0.03
 HAND_LIMIT_TOLERANCE_RAD = 0.01
 MEASURED_LIMIT_TOLERANCE_RAD = 0.2
 

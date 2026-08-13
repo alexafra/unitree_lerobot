@@ -85,6 +85,8 @@ class SplitReaderDeadlineTests(unittest.TestCase):
         reader._simulation = False
         reader._arm_max_age_s = ACTUATOR_ARM_STATE_MAX_AGE_S
         reader._hand_max_age_s = ACTUATOR_HAND_STATE_MAX_AGE_S
+        reader._arm_max_age_constant = "ACTUATOR_ARM_STATE_MAX_AGE_S"
+        reader._hand_max_age_constant = "ACTUATOR_HAND_STATE_MAX_AGE_S"
         reader._arm_indices = tuple(range(14))
         reader._left_indices = tuple(range(7))
         reader._right_indices = tuple(range(7))
@@ -118,7 +120,10 @@ class SplitReaderDeadlineTests(unittest.TestCase):
                 "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.time.monotonic",
                 return_value=now,
             ),
-            self.assertRaisesRegex(TimeoutError, r"arm .*0\.075s"),
+            self.assertRaisesRegex(
+                TimeoutError,
+                r"arm .*ACTUATOR_ARM_STATE_MAX_AGE_S=0\.075s",
+            ),
         ):
             reader.latest()
 
@@ -131,7 +136,25 @@ class SplitReaderDeadlineTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 TimeoutError,
-                rf"left .*{ACTUATOR_HAND_STATE_MAX_AGE_S:.3f}s",
+                rf"left .*ACTUATOR_HAND_STATE_MAX_AGE_S="
+                rf"{ACTUATOR_HAND_STATE_MAX_AGE_S:.3f}s",
+            ),
+        ):
+            reader.latest()
+
+    def test_missing_state_names_the_searchable_deadline_constant(self):
+        now = 100.0
+        reader = self._reader(now)
+        reader._messages["right"] = None
+        with (
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.time.monotonic",
+                return_value=now,
+            ),
+            self.assertRaisesRegex(
+                TimeoutError,
+                rf"right .*ACTUATOR_HAND_STATE_MAX_AGE_S="
+                rf"{ACTUATOR_HAND_STATE_MAX_AGE_S:.3f}s",
             ),
         ):
             reader.latest()

@@ -33,6 +33,7 @@ from unitree_lerobot.eval_robot.eval_groot_g1 import (
     _run_blocking_motion_with_immediate_release,
     _select_next_goal_while_holding,
     GOAL_MODE_TOGGLE,
+    RETURN_TO_START,
     OperatorRelease,
     build_parser,
     confirm_custom_goal,
@@ -230,6 +231,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertTrue(defaults.warmup1)
         self.assertTrue(defaults.policy_warm_start)
         self.assertTrue(defaults.future_goal_warmup2)
+        self.assertFalse(defaults.return_to_start)
         self.assertFalse(defaults.show_camera)
         validate_args(defaults)
 
@@ -255,6 +257,37 @@ class GrootG1DeploymentTests(unittest.TestCase):
         # making warmup2 the canonical user-facing name.
         self.assertFalse(parser.parse_args(["--no-policy-warm-start"]).policy_warm_start)
         self.assertTrue(parser.parse_args(["--show-camera"]).show_camera)
+
+    def test_return_to_start_requires_actuation_and_a_fixed_start_target(self):
+        parser = build_parser()
+
+        enabled = parser.parse_args(
+            [
+                "--return-to-start",
+                "--actuate",
+                "--sim",
+                "--confirm-sim-network-isolated",
+            ]
+        )
+        self.assertTrue(enabled.return_to_start)
+        validate_args(enabled)
+
+        with self.assertRaisesRegex(DeploymentError, "requires --actuate"):
+            validate_args(parser.parse_args(["--return-to-start"]))
+        with self.assertRaisesRegex(DeploymentError, "has no fixed target"):
+            validate_args(
+                parser.parse_args(
+                    [
+                        "--return-to-start",
+                        "--actuate",
+                        "--sim",
+                        "--confirm-sim-network-isolated",
+                        "--no-warmup1",
+                        "--initialization",
+                        "measured",
+                    ]
+                )
+            )
 
     def test_skipped_warmup2_still_resets_before_fresh_live_execution(self):
         resets = []
@@ -992,8 +1025,12 @@ class GrootG1DeploymentTests(unittest.TestCase):
             events.append(f"infer:{chunk.name}")
             return chunk, 0.01
 
-        def fake_select_next_goal(_actuator, *, custom_goal_mode, mode_state):
-            goal_mode_calls.append((custom_goal_mode, mode_state["custom_goal_mode"]))
+        def fake_select_next_goal(
+            _actuator, *, custom_goal_mode, mode_state, return_to_start=False
+        ):
+            goal_mode_calls.append(
+                (custom_goal_mode, mode_state["custom_goal_mode"], return_to_start)
+            )
             if len(goal_mode_calls) == 1:
                 # The operator enables custom entry but still chooses an exact
                 # trained task. The UI preference must survive that choice.
@@ -1069,7 +1106,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertNotIn("actuator.submit:discarded-preflight:1", events)
         self.assertNotIn("actuator.submit:pick-warm-start:1", events)
         self.assertNotIn("actuator.submit:put-warm-start:2", events)
-        self.assertEqual(goal_mode_calls, [(False, False), (True, True)])
+        self.assertEqual(goal_mode_calls, [(False, False, False), (True, True, False)])
 
     def test_live_runner_custom_goal_seeds_custom_next_goal_mode(self):
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
@@ -1116,8 +1153,12 @@ class GrootG1DeploymentTests(unittest.TestCase):
             requires_depth=False,
         )
 
-        def select_then_release(_actuator, *, custom_goal_mode, mode_state):
-            mode_calls.append((custom_goal_mode, mode_state["custom_goal_mode"]))
+        def select_then_release(
+            _actuator, *, custom_goal_mode, mode_state, return_to_start=False
+        ):
+            mode_calls.append(
+                (custom_goal_mode, mode_state["custom_goal_mode"], return_to_start)
+            )
             return None
 
         with (
@@ -1143,10 +1184,11 @@ class GrootG1DeploymentTests(unittest.TestCase):
         ):
             run_groot(args)
 
-        self.assertEqual(mode_calls, [(True, True)])
+        self.assertEqual(mode_calls, [(True, True, False)])
 
     def test_future_goal_warmup2_is_independent_and_startup_stages_run_once(self):
         events = []
+        warmup_specs = []
 
         class FakePolicy:
             def ping(self):
@@ -1191,63 +1233,64 @@ class GrootG1DeploymentTests(unittest.TestCase):
             def initialize(self, _spec):
                 events.append("actuator.initialize")
 
-            def warmup_pose(self, _spec):
+            def warmup_pose(self, spec):
+                warmup_specs.append(spec)
                 events.append("actuator.warmup1")
+
+            def hold(self):
+                events.append("actuator.hold")
 
             def close(self):
                 events.append("actuator.close")
 
-        args = argparse.Namespace(
-            task="pick-red-cup",
-            custom_goal=None,
-            policy_host="127.0.0.1",
-            policy_port=5555,
-            image_host="camera",
-            network_interface=None,
-            execution_horizon=1,
-            max_chunks=1,
-            initialization="measured",
-            initial_pose_file=None,
-            warmup1=True,
-            policy_warm_start=True,
-            future_goal_warmup2=False,
-            show_camera=False,
-            sim=True,
-            actuate=True,
-            allow_unqualified_real=False,
-            confirm_sim_network_isolated=True,
-        )
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
         contract = SimpleNamespace(action_horizon=16, video_keys=COLOUR_VIDEO_KEYS, requires_depth=False)
         preflight = SimpleNamespace(length=1, name="discarded-preflight")
-        with (
-            mock.patch(f"{module}.Gr00tClient", return_value=FakePolicy()),
-            mock.patch(f"{module}.validate_model_contract", return_value=contract),
-            mock.patch(f"{module}.validate_policy_metadata", return_value=None),
-            mock.patch(f"{module}.initialize_dds"),
-            mock.patch(f"{module}.G1Dex3StateReader", return_value=FakeReader()),
-            mock.patch(f"{module}.TeleimagerCamera", return_value=FakeCamera()),
-            mock.patch(f"{module}.SafeG1Dex3Actuator", return_value=FakeActuator()),
-            mock.patch(f"{module}.infer_chunk", return_value=(preflight, 0.01)),
-            mock.patch(f"{module}.chunk_delta_summary", return_value="bounded"),
-            mock.patch(f"{module}.confirm_actuation"),
-            mock.patch(f"{module}.confirm_initialization"),
-            mock.patch(f"{module}.confirm_policy_start"),
-            mock.patch(f"{module}._prepare_policy_goal", side_effect=("ready", "ready")) as prepare,
-            mock.patch(f"{module}._run_active_goal", side_effect=("hold", "complete")),
-            mock.patch(
-                f"{module}._select_next_goal_while_holding",
-                return_value=("down-red-cup", TASKS["down-red-cup"]),
-            ),
-        ):
-            run_groot(args)
+        for warmup1_enabled in (True, False):
+            with self.subTest(warmup1=warmup1_enabled):
+                events.clear()
+                warmup_specs.clear()
+                args = argparse.Namespace(
+                    task="pick-red-cup", custom_goal=None, policy_host="127.0.0.1",
+                    policy_port=5555, image_host="camera", network_interface=None,
+                    execution_horizon=1, max_chunks=1, initialization="xr-home",
+                    initial_pose_file=None, warmup1=warmup1_enabled, policy_warm_start=True,
+                    future_goal_warmup2=False, return_to_start=True, show_camera=False,
+                    sim=True, actuate=True, allow_unqualified_real=False,
+                    confirm_sim_network_isolated=True,
+                )
+                with (
+                    mock.patch(f"{module}.Gr00tClient", return_value=FakePolicy()),
+                    mock.patch(f"{module}.validate_model_contract", return_value=contract),
+                    mock.patch(f"{module}.validate_policy_metadata", return_value=None),
+                    mock.patch(f"{module}.initialize_dds"),
+                    mock.patch(f"{module}.G1Dex3StateReader", return_value=FakeReader()),
+                    mock.patch(f"{module}.TeleimagerCamera", return_value=FakeCamera()),
+                    mock.patch(f"{module}.SafeG1Dex3Actuator", return_value=FakeActuator()),
+                    mock.patch(f"{module}.infer_chunk", return_value=(preflight, 0.01)),
+                    mock.patch(f"{module}.chunk_delta_summary", return_value="bounded"),
+                    mock.patch(f"{module}.confirm_actuation"),
+                    mock.patch(f"{module}.confirm_initialization"),
+                    mock.patch(f"{module}.confirm_policy_start"),
+                    mock.patch(f"{module}._prepare_policy_goal", side_effect=("ready", "ready")) as prepare,
+                    mock.patch(f"{module}._run_active_goal", side_effect=("complete", "complete")),
+                    mock.patch(
+                        f"{module}._select_next_goal_while_holding",
+                        side_effect=(RETURN_TO_START, ("down-red-cup", TASKS["down-red-cup"]), None),
+                    ),
+                    mock.patch(f"{module}.confirm_return_to_start", return_value="continue"),
+                ):
+                    run_groot(args)
 
-        self.assertEqual(
-            [call.kwargs["warmup2_enabled"] for call in prepare.call_args_list],
-            [True, False],
-        )
-        self.assertEqual(events.count("actuator.initialize"), 1)
-        self.assertEqual(events.count("actuator.warmup1"), 1)
+                self.assertEqual(
+                    [call.kwargs["warmup2_enabled"] for call in prepare.call_args_list],
+                    [True, False],
+                )
+                self.assertEqual(events.count("actuator.initialize"), 1)
+                self.assertEqual(events.count("actuator.hold"), 2)
+                self.assertEqual(len(warmup_specs), 2 if warmup1_enabled else 1)
+                expected = TRAINING_START_JOINTS_RAD[:14] if warmup1_enabled else np.zeros(14)
+                np.testing.assert_array_equal(warmup_specs[-1].arm, expected)
 
     def test_shadow_skips_initial_step_validation_for_every_chunk_but_measured_live_keeps_it(self):
         class StopAfterPreflight(Exception):
@@ -2458,6 +2501,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                     "Trained task> ",
                     timeout_s=1.0,
                     goal_mode_toggle=True,
+                    return_to_start=True,
                 )
                 elapsed = time.monotonic() - started_at
 
@@ -2465,6 +2509,113 @@ class GrootG1DeploymentTests(unittest.TestCase):
             self.assertLess(elapsed, 0.25)
             actuator.request_immediate_hold.assert_not_called()
             actuator.request_immediate_release.assert_not_called()
+            self.assertEqual(termios.tcgetattr(slave_fd), original)
+        finally:
+            stdin.close()
+            os.close(master_fd)
+            os.close(slave_fd)
+
+    def test_held_goal_selector_shift_tab_returns_start_request(self):
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+        )
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        with (
+            mock.patch(
+                f"{module}._readline_while_armed",
+                return_value=RETURN_TO_START,
+            ) as read_prompt,
+            mock.patch("builtins.print"),
+        ):
+            selected = _select_next_goal_while_holding(
+                actuator,
+                return_to_start=True,
+            )
+
+        self.assertEqual(selected, RETURN_TO_START)
+        self.assertTrue(read_prompt.call_args.kwargs["goal_mode_toggle"])
+        self.assertTrue(read_prompt.call_args.kwargs["return_to_start"])
+
+    def test_shift_tab_is_immediate_and_preserves_a_following_q_release(self):
+        master_fd, slave_fd = pty.openpty()
+        stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+        original = termios.tcgetattr(slave_fd)
+        keys_sent = False
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+            request_immediate_hold=mock.Mock(),
+            request_immediate_release=mock.Mock(),
+        )
+
+        def write_shift_tab_then_q(*args, **_kwargs):
+            nonlocal keys_sent
+            if args and args[0] == "Trained task> " and not keys_sent:
+                keys_sent = True
+                os.write(master_fd, b"\x1b[Zq")
+
+        try:
+            with (
+                mock.patch.object(sys, "stdin", stdin),
+                mock.patch("builtins.print", side_effect=write_shift_tab_then_q),
+            ):
+                started_at = time.monotonic()
+                first = _readline_while_armed(
+                    actuator,
+                    "Trained task> ",
+                    timeout_s=1.0,
+                    goal_mode_toggle=True,
+                    return_to_start=True,
+                )
+                shift_tab_elapsed = time.monotonic() - started_at
+                second_started_at = time.monotonic()
+                second = _readline_while_armed(
+                    actuator,
+                    "Trained task> ",
+                    timeout_s=1.0,
+                    goal_mode_toggle=True,
+                    return_to_start=True,
+                )
+                q_elapsed = time.monotonic() - second_started_at
+
+            self.assertTrue(keys_sent)
+            self.assertEqual(first, RETURN_TO_START)
+            self.assertEqual(second, "q")
+            self.assertLess(shift_tab_elapsed, 0.25)
+            self.assertLess(q_elapsed, 0.25)
+            actuator.request_immediate_release.assert_called_once_with()
+            actuator.request_immediate_hold.assert_not_called()
+            self.assertEqual(termios.tcgetattr(slave_fd), original)
+        finally:
+            stdin.close()
+            os.close(master_fd)
+            os.close(slave_fd)
+
+    def test_malformed_shift_tab_prefix_cannot_suppress_q_release(self):
+        master_fd, slave_fd = pty.openpty()
+        stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+        original = termios.tcgetattr(slave_fd)
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+            request_immediate_hold=mock.Mock(),
+            request_immediate_release=mock.Mock(),
+        )
+        try:
+            with mock.patch.object(sys, "stdin", stdin), mock.patch("builtins.print"):
+                os.write(master_fd, b"\x1b[q")
+                response = _readline_while_armed(
+                    actuator,
+                    "Trained task> ",
+                    timeout_s=1.0,
+                    goal_mode_toggle=True,
+                    return_to_start=True,
+                )
+
+            self.assertEqual(response, "q")
+            actuator.request_immediate_release.assert_called_once_with()
+            actuator.request_immediate_hold.assert_not_called()
             self.assertEqual(termios.tcgetattr(slave_fd), original)
         finally:
             stdin.close()
@@ -3918,7 +4069,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertTrue(FakeBackend.instance.released)
         self.assertTrue(FakeBackend.instance.closed)
 
-    def test_child_hold_captures_measured_pose_and_gates_repeated_warm_start(self):
+    def test_child_hold_captures_measured_arm_preserves_grip_and_gates_repeated_warm_start(self):
         class MeasuredPoseBackend(FakeBackend):
             instance = None
 
@@ -3984,14 +4135,17 @@ class GrootG1DeploymentTests(unittest.TestCase):
             self.assertEqual(statuses.get(timeout=1.0), ("warm_started", "first goal target"))
 
             backend = MeasuredPoseBackend.instance
+            commanded_left = np.array([0.20, 0.15, 0.30, -0.20, -0.25, -0.20, -0.25])
+            commanded_right = np.array([-0.20, -0.15, -0.30, 0.20, 0.25, 0.20, 0.25])
+            backend.set_target(backend._arm_target, commanded_left, commanded_right)
             backend.measured_arm = np.full(14, 0.012)
             backend.measured_left = np.array([0.021, 0.021, 0.021, -0.021, -0.021, -0.021, -0.021])
             backend.measured_right = np.array([0.032, 0.032, -0.032, 0.032, 0.032, 0.032, 0.032])
             commands.put(("hold", time.monotonic()))
             self.assertEqual(statuses.get(timeout=1.0), ("holding", 0))
             np.testing.assert_array_equal(backend._arm_target, backend.measured_arm)
-            np.testing.assert_array_equal(backend._left_target, backend.measured_left)
-            np.testing.assert_array_equal(backend._right_target, backend.measured_right)
+            np.testing.assert_array_equal(backend._left_target, commanded_left)
+            np.testing.assert_array_equal(backend._right_target, commanded_right)
 
             second_target = InitializationSpec(
                 mode="pose-file",

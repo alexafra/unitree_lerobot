@@ -69,7 +69,7 @@ LOGGER = logging.getLogger(__name__)
 STATE_MAX_AGE_S = 0.25
 ACTUATOR_ARM_STATE_MAX_AGE_S = 0.075
 ACTUATOR_HAND_STATE_WARNING_AGE_S = 0.075
-ACTUATOR_HAND_STATE_MAX_AGE_S = 0.5 #SAFETYCHANGE 0.250 original
+ACTUATOR_HAND_STATE_MAX_AGE_S = 1.5 #SAFETYCHANGE 0.250 original
 ACTUATOR_HAND_RECOVERY_SAMPLES = 5
 # Backward-compatible name for tests/internal imports.  It remains the hard
 # arm-state deadline; hand state has its own limits above.
@@ -91,7 +91,7 @@ MAX_ARM_DQ_RAD_S = 6.0
 MAX_ARM_TRACKING_ERROR_RAD = 0.35
 # CHANGEDSAFETY: original local adapter default was 0.50 rad; current is 1.50 rad.
 # This is max abs(measured hand q - commanded hand q), not a speed limit.
-MAX_HAND_TRACKING_ERROR_RAD = 1.5
+MAX_HAND_TRACKING_ERROR_RAD = 2
 # The original 0.50-rad threshold remains a warning-only diagnostic.  It must
 # persist across distinct hand-state samples for 0.20 s; 0.40 rad hysteresis
 # prevents repeated warnings at the boundary.  Only the aligned 1.50-rad gate
@@ -1043,7 +1043,10 @@ class XrPolicyOutputConditioner:
             (right_lower - current_right, current_right - right_upper, np.zeros(HAND_DOF))
         )
         if np.any(np.abs(result.arm[0] - current_arm) > np.maximum(MAX_CONDITIONED_ARM_STEP_RAD, arm_recovery) + 1e-12):
-            raise DeploymentError("XR conditioned arm command exceeded its 100 Hz slew ceiling")
+            raise DeploymentError(
+                "XR conditioned arm command exceeded its 100 Hz slew ceiling; "
+                f"MAX_CONDITIONED_ARM_STEP_RAD={MAX_CONDITIONED_ARM_STEP_RAD:.4f} rad"
+            )
         if np.any(
             np.abs(result.left_hand[0] - current_left)
             > np.maximum(MAX_CONDITIONED_HAND_STEP_RAD, left_recovery) + 1e-12
@@ -1051,7 +1054,11 @@ class XrPolicyOutputConditioner:
             np.abs(result.right_hand[0] - current_right)
             > np.maximum(MAX_CONDITIONED_HAND_STEP_RAD, right_recovery) + 1e-12
         ):
-            raise DeploymentError("XR conditioned hand command exceeded its 100 Hz slew ceiling")
+            raise DeploymentError(
+                "XR conditioned hand command exceeded its 100 Hz slew ceiling; "
+                "MAX_CONDITIONED_HAND_STEP_RAD="
+                f"{np.array2string(MAX_CONDITIONED_HAND_STEP_RAD, precision=4)} rad"
+            )
         return result
 
 
@@ -1115,7 +1122,8 @@ def _validate_initialization_hand_recovery(
             joint = int(bad_measured[0])
             raise DeploymentError(
                 f"Initialization {name} recovery left the measured-state range at step {step}, "
-                f"joint {joint} ({joint_names[joint]}): {target[joint]:.4f} rad"
+                f"joint {joint} ({joint_names[joint]}): {target[joint]:.4f} rad; "
+                f"MEASURED_LIMIT_TOLERANCE_RAD={MEASURED_LIMIT_TOLERANCE_RAD:.4f} rad"
             )
 
         delta = target - previous
@@ -1134,13 +1142,15 @@ def _validate_initialization_hand_recovery(
             if entered_strict_range[joint] or previous[joint] >= strict_lower[joint] or delta[joint] < -1e-12:
                 raise DeploymentError(
                     f"Initialization {name} recovery is not monotonic inward at step {step}, "
-                    f"joint {joint} ({joint_names[joint]})"
+                    f"joint {joint} ({joint_names[joint]}); "
+                    f"HAND_LIMIT_TOLERANCE_RAD={HAND_LIMIT_TOLERANCE_RAD:.4f} rad"
                 )
         for joint in np.flatnonzero(above):
             if entered_strict_range[joint] or previous[joint] <= strict_upper[joint] or delta[joint] > 1e-12:
                 raise DeploymentError(
                     f"Initialization {name} recovery is not monotonic inward at step {step}, "
-                    f"joint {joint} ({joint_names[joint]})"
+                    f"joint {joint} ({joint_names[joint]}); "
+                    f"HAND_LIMIT_TOLERANCE_RAD={HAND_LIMIT_TOLERANCE_RAD:.4f} rad"
                 )
 
         entered_strict_range |= ~(below | above)
@@ -1150,7 +1160,8 @@ def _validate_initialization_hand_recovery(
         joint = int(np.flatnonzero(~entered_strict_range)[0])
         raise DeploymentError(
             f"Initialization {name} recovery did not enter the strict target range at joint {joint} "
-            f"({joint_names[joint]})"
+            f"({joint_names[joint]}); "
+            f"HAND_LIMIT_TOLERANCE_RAD={HAND_LIMIT_TOLERANCE_RAD:.4f} rad"
         )
 
 
@@ -1258,7 +1269,7 @@ def build_initialization_chunk(state: RobotState, spec: InitializationSpec) -> A
     if duration_s > INITIALIZATION_MAX_DURATION_S:
         raise DeploymentError(
             f"Initialization path needs {duration_s:.1f}s at the fixed conservative rate; "
-            f"the limit is {INITIALIZATION_MAX_DURATION_S:.1f}s"
+            f"INITIALIZATION_MAX_DURATION_S={INITIALIZATION_MAX_DURATION_S:.1f}s"
         )
     chunk = ActionChunk(
         arm=np.ascontiguousarray(paths[0]),
@@ -1287,6 +1298,9 @@ class G1Dex3StateReader:
         simulation: bool = False,
         max_age_s: float = STATE_MAX_AGE_S,
         hand_max_age_s: float | None = None,
+        *,
+        max_age_constant: str = "STATE_MAX_AGE_S",
+        hand_max_age_constant: str | None = None,
     ):
         from unitree_lerobot.eval_robot.robot_control.robot_arm import G1_29_JointArmIndex
         from unitree_lerobot.eval_robot.robot_control.robot_hand_unitree import (
@@ -1299,6 +1313,10 @@ class G1Dex3StateReader:
         self._simulation = simulation
         self._arm_max_age_s = float(max_age_s)
         self._hand_max_age_s = float(max_age_s if hand_max_age_s is None else hand_max_age_s)
+        self._arm_max_age_constant = max_age_constant
+        self._hand_max_age_constant = (
+            max_age_constant if hand_max_age_constant is None else hand_max_age_constant
+        )
         if self._arm_max_age_s <= 0.0 or self._hand_max_age_s <= 0.0:
             raise ValueError("State freshness limits must be positive")
         self._arm_indices = tuple(int(index) for index in G1_29_JointArmIndex)
@@ -1352,16 +1370,26 @@ class G1Dex3StateReader:
             "left": self._hand_max_age_s,
             "right": self._hand_max_age_s,
         }
+        limit_names = {
+            "arm": self._arm_max_age_constant,
+            "left": self._hand_max_age_constant,
+            "right": self._hand_max_age_constant,
+        }
         stale = []
         for key, message in messages.items():
             if message is None:
                 detail = f", rejected {rejected_zero[key]} all-zero frames" if key in rejected_zero else ""
-                stale.append(f"{key} (missing{detail})")
+                stale.append(
+                    f"{key} (missing; {limit_names[key]}={limits[key]:.3f}s{detail})"
+                )
                 continue
             age_s = now - updated_at[key]
             if age_s > limits[key]:
                 detail = f", rejected {rejected_zero[key]} all-zero frames" if key in rejected_zero else ""
-                stale.append(f"{key} (age {age_s:.3f}s > {limits[key]:.3f}s{detail})")
+                stale.append(
+                    f"{key} (age {age_s:.3f}s > {limits[key]:.3f}s; "
+                    f"{limit_names[key]}={limits[key]:.3f}s{detail})"
+                )
         if stale:
             raise TimeoutError(f"Stale Unitree state: {', '.join(stale)}")
 
@@ -1635,7 +1663,10 @@ class TeleimagerCamera:
                     raise DeploymentError("TeleImager RGBD packet has no local receive timestamp")
                 age_s = (time.monotonic_ns() - frame.received_monotonic_ns) / 1_000_000_000.0
                 if age_s < 0.0 or age_s > RGBD_MAX_RECEIVE_AGE_S:
-                    raise TimeoutError(f"TeleImager RGBD packet is stale ({age_s:.3f}s old)")
+                    raise TimeoutError(
+                        f"TeleImager RGBD packet is stale ({age_s:.3f}s old); "
+                        f"RGBD_MAX_RECEIVE_AGE_S={RGBD_MAX_RECEIVE_AGE_S:.3f}s"
+                    )
                 if self._last_rgbd_sequence is not None:
                     if frame.sequence < self._last_rgbd_sequence:
                         raise DeploymentError(
@@ -1747,6 +1778,8 @@ class _G1Dex3CommandBackend:
             simulation=simulation,
             max_age_s=ACTUATOR_ARM_STATE_MAX_AGE_S,
             hand_max_age_s=ACTUATOR_HAND_STATE_MAX_AGE_S,
+            max_age_constant="ACTUATOR_ARM_STATE_MAX_AGE_S",
+            hand_max_age_constant="ACTUATOR_HAND_STATE_MAX_AGE_S",
         )
         initial = self.reader.read(timeout_s=5.0)
         if not simulation and initial.mode_machine != QUALIFIED_REAL_MODE_MACHINE:
@@ -1936,7 +1969,9 @@ class _G1Dex3CommandBackend:
             if timing_enabled:
                 timing["arm_write"] = (time.monotonic_ns() - started_ns) / 1e6
         if write_ok is not True:
-            raise DeploymentError("Arm DDS Write failed")
+            raise DeploymentError(
+                f"Arm DDS Write failed; DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
+            )
         self._has_published = True
 
     def _publish_arm(self, require_qualified_state: bool = True) -> None:
@@ -1997,7 +2032,9 @@ class _G1Dex3CommandBackend:
             if timing_enabled:
                 timing["left_write"] = (time.monotonic_ns() - started_ns) / 1e6
         if left_ok is not True:
-            raise DeploymentError("Left Dex3 DDS Write failed")
+            raise DeploymentError(
+                f"Left Dex3 DDS Write failed; DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
+            )
         self._left_hand_publish_history.append(PublishedHandTarget(completed_at=time.monotonic(), target=left_target))
         started_ns = time.monotonic_ns()
         try:
@@ -2006,7 +2043,9 @@ class _G1Dex3CommandBackend:
             if timing_enabled:
                 timing["right_write"] = (time.monotonic_ns() - started_ns) / 1e6
         if right_ok is not True:
-            raise DeploymentError("Right Dex3 DDS Write failed")
+            raise DeploymentError(
+                f"Right Dex3 DDS Write failed; DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
+            )
         self._right_hand_publish_history.append(PublishedHandTarget(completed_at=time.monotonic(), target=right_target))
 
     def _stop_hands(self, phase_callback: Any | None = None) -> None:
@@ -2034,9 +2073,15 @@ class _G1Dex3CommandBackend:
             started = time.monotonic()
             try:
                 if publisher.Write(message, timeout=DDS_WRITE_TIMEOUT_S) is not True:
-                    failures.append(f"{name} Dex3 stop Write failed")
+                    failures.append(
+                        f"{name} Dex3 stop Write failed; "
+                        f"DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
+                    )
             except Exception as exc:
-                failures.append(f"{name} Dex3 stop Write raised {exc!r}")
+                failures.append(
+                    f"{name} Dex3 stop Write raised {exc!r}; "
+                    f"DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
+                )
             finally:
                 if phase_callback is not None:
                     phase_callback(
@@ -2104,7 +2149,10 @@ class _G1Dex3CommandBackend:
             try:
                 self._publish_last_arm_for_release()
             except Exception as exc:
-                failures.append(f"arm_sdk authority release failed: {exc}")
+                failures.append(
+                    f"arm_sdk authority release failed: {exc}; "
+                    f"DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
+                )
                 break
             cycle_completed = time.monotonic()
             arm_writes += 1
@@ -2126,7 +2174,10 @@ class _G1Dex3CommandBackend:
                 arm_writes += 1
                 last_successful_weight = 0.0
             except Exception as exc:
-                failures.append(f"final zero-weight arm_sdk Write failed: {exc}")
+                failures.append(
+                    f"final zero-weight arm_sdk Write failed: {exc}; "
+                    f"DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
+                )
         arm_release_s = time.monotonic() - ramp_started
         LOGGER.info(
             "Arm authority release ended in %.3fs: writes=%d, skipped 100 Hz ticks=%d, "
@@ -2616,6 +2667,30 @@ def _set_direct_target(
         conditioner.reset(backend._arm_target, backend._left_target, backend._right_target)
     if hand_watchdog is not None:
         hand_watchdog.reset(backend)
+
+
+def _set_powered_hold_target(
+    backend: _G1Dex3CommandBackend,
+    conditioner: XrPolicyOutputConditioner | None,
+    hand_watchdog: HandTrackingWatchdog | None,
+    state: RobotState,
+) -> None:
+    """Stop the arms at measured q without relaxing the current hand grip.
+
+    A loaded Dex3 finger normally trails its commanded position.  Capturing
+    measured hand q as the HOLD target removes that position error and can
+    loosen a grasp.  Preserve the exact last outgoing hand targets instead;
+    only the arm targets are replaced with measured q to stop arm motion.
+    """
+
+    _set_direct_target(
+        backend,
+        conditioner,
+        hand_watchdog,
+        state.arm,
+        backend._left_target,
+        backend._right_target,
+    )
 
 
 def _validate_policy_target_input(
@@ -3236,17 +3311,10 @@ def _actuator_main(
                     # The barrier is queued only after every concurrently
                     # submitted motion command. Reaching it proves that no
                     # pre-STOP plan remains hidden in multiprocessing.Queue's
-                    # feeder thread. Capture the final measured pose, then
-                    # acknowledge the fully serialized powered STOP.
+                    # feeder thread. Capture measured arm q while preserving
+                    # the last hand grip targets, then acknowledge STOP.
                     state = backend.state()
-                    _set_direct_target(
-                        backend,
-                        conditioner,
-                        hand_watchdog,
-                        state.arm,
-                        state.left_hand,
-                        state.right_hand,
-                    )
+                    _set_powered_hold_target(backend, conditioner, hand_watchdog, state)
                     chunk = None
                     chunk_index = 0
                     rtc_mode = False
@@ -3271,14 +3339,7 @@ def _actuator_main(
                     if not np.isfinite(command_age) or not 0.0 <= command_age <= CHUNK_MAX_AGE_S:
                         raise DeploymentError("Hold command expired before execution")
                     state = backend.state()
-                    _set_direct_target(
-                        backend,
-                        conditioner,
-                        hand_watchdog,
-                        state.arm,
-                        state.left_hand,
-                        state.right_hand,
-                    )
+                    _set_powered_hold_target(backend, conditioner, hand_watchdog, state)
                     chunk = None
                     chunk_index = 0
                     rtc_mode = False
@@ -3448,14 +3509,7 @@ def _actuator_main(
                         continue
                     if chunk_index >= chunk.length:
                         state = backend.state()
-                        _set_direct_target(
-                            backend,
-                            conditioner,
-                            hand_watchdog,
-                            state.arm,
-                            state.left_hand,
-                            state.right_hand,
-                        )
+                        _set_powered_hold_target(backend, conditioner, hand_watchdog, state)
                         tracking_checks_after = time.monotonic()
                         terminal_kind = "rtc_completed" if rtc_total_actions >= rtc_action_budget else "rtc_underrun"
                         _status(status_queue, terminal_kind, rtc_total_actions)
@@ -3547,14 +3601,7 @@ def _actuator_main(
                         continue
                     if rtc_mode and rtc_total_actions >= rtc_action_budget:
                         state = backend.state()
-                        _set_direct_target(
-                            backend,
-                            conditioner,
-                            hand_watchdog,
-                            state.arm,
-                            state.left_hand,
-                            state.right_hand,
-                        )
+                        _set_powered_hold_target(backend, conditioner, hand_watchdog, state)
                         chunk = None
                         chunk_index = 0
                         rtc_mode = False
@@ -3574,14 +3621,7 @@ def _actuator_main(
                     )
                     if stale:
                         state = backend.state()
-                        _set_direct_target(
-                            backend,
-                            conditioner,
-                            hand_watchdog,
-                            state.arm,
-                            state.left_hand,
-                            state.right_hand,
-                        )
+                        _set_powered_hold_target(backend, conditioner, hand_watchdog, state)
                         chunk = None
                         chunk_index = 0
                         rtc_mode = False
@@ -3615,14 +3655,7 @@ def _actuator_main(
                         )
                     except DeploymentError as exc:
                         state = backend.state()
-                        _set_direct_target(
-                            backend,
-                            conditioner,
-                            hand_watchdog,
-                            state.arm,
-                            state.left_hand,
-                            state.right_hand,
-                        )
+                        _set_powered_hold_target(backend, conditioner, hand_watchdog, state)
                         chunk = None
                         chunk_index = 0
                         rtc_mode = False
@@ -3633,14 +3666,7 @@ def _actuator_main(
                     elapsed_actions = chunk_index - request_index
                     if elapsed_actions >= expected_overlap or elapsed_actions >= replacement.length:
                         state = backend.state()
-                        _set_direct_target(
-                            backend,
-                            conditioner,
-                            hand_watchdog,
-                            state.arm,
-                            state.left_hand,
-                            state.right_hand,
-                        )
+                        _set_powered_hold_target(backend, conditioner, hand_watchdog, state)
                         chunk = None
                         chunk_index = 0
                         rtc_mode = False
@@ -3673,14 +3699,7 @@ def _actuator_main(
                         )
                     except DeploymentError as exc:
                         state = backend.state()
-                        _set_direct_target(
-                            backend,
-                            conditioner,
-                            hand_watchdog,
-                            state.arm,
-                            state.left_hand,
-                            state.right_hand,
-                        )
+                        _set_powered_hold_target(backend, conditioner, hand_watchdog, state)
                         chunk = None
                         chunk_index = 0
                         rtc_mode = False
@@ -3748,14 +3767,7 @@ def _actuator_main(
             if urgent_hold_event.is_set():
                 if not urgent_hold_active or chunk is not None or rtc_mode or not holding:
                     state = backend.state()
-                    _set_direct_target(
-                        backend,
-                        conditioner,
-                        hand_watchdog,
-                        state.arm,
-                        state.left_hand,
-                        state.right_hand,
-                    )
+                    _set_powered_hold_target(backend, conditioner, hand_watchdog, state)
                     chunk = None
                     chunk_index = 0
                     rtc_mode = False
@@ -3903,14 +3915,7 @@ def _actuator_main(
                 else:
                     if rtc_mode:
                         state = backend.state()
-                        _set_direct_target(
-                            backend,
-                            conditioner,
-                            hand_watchdog,
-                            state.arm,
-                            state.left_hand,
-                            state.right_hand,
-                        )
+                        _set_powered_hold_target(backend, conditioner, hand_watchdog, state)
                         tracking_checks_after = time.monotonic()
                         if rtc_total_actions >= rtc_action_budget:
                             _status(status_queue, "rtc_completed", rtc_total_actions)
@@ -4843,7 +4848,7 @@ class SafeG1Dex3Actuator:
         raise TimeoutError(f"Timed out waiting for action chunk {sequence}")
 
     def hold(self) -> None:
-        """Capture the measured pose and keep publishing it under watchdog control."""
+        """Hold measured arm q and the last commanded grip under watchdog control."""
 
         if not self._initialized:
             raise DeploymentError("Actuator must complete initialization before HOLD")

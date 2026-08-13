@@ -218,17 +218,28 @@ Replacement goals independently use `--future-goal-warmup2` by default. Use
 goal directly, without its WARMUP2/CONTINUE transition. Initialization and Warmup1
 always remain one-time startup stages and are never repeated for replacement goals.
 
+`--return-to-start` adds a manual startup-target option to the powered-HOLD menu.
+After a finite task completes, the actuator first enters powered HOLD
+instead of immediately releasing. Press `Shift+Tab` to request a guarded move back
+to the Warmup1 target when Warmup1 was enabled, or to the explicit `xr-home` or
+pose-file initialization target when Warmup1 was disabled. The movement has its own
+`r` confirmation and returns to the menu in HOLD; it does not rerun initialization,
+Warmup1, authority acquisition, or policy inference. The combination
+`--return-to-start --no-warmup1 --initialization measured` is rejected because
+measured initialization deliberately has no fixed target to revisit. This option is
+disabled by default.
+
 These transitions are available in both IsaacLab and the explicitly unqualified real path. Warmup1 runs once per authority session; Warmup2 runs according to the separate first-goal and future-goal flags. They are joint-space transitions, not collision-aware planning. WARMUP1, WARMUP2, and CONTINUE remain separate visual-inspection gates; each advances only when `r` is pressed.
 
 During either synchronous or RTC actuation, the terminal has immediate single-key
 operator controls; Enter is not required:
 
 - At each standard authority or motion gate, `r` or `R` performs the displayed action. It does not resume an old goal from the STOP next-goal prompt, where `r` remains ordinary goal text until Enter. Arbitrary custom goals still require exact `YES` plus Enter.
-- `s` or `S` immediately captures the current measured arm/hand pose and keeps publishing it at 100 Hz. The client stops making GR00T requests and displays a next-goal prompt. This is a powered position STOP, not a passive brake or collision-safe freeze; it can continue exerting force and requires the client/watchdog to remain alive.
-- At the STOP prompt, trained-task mode is the default and shows the numbered allowlist; unknown text remains in HOLD and is not silently treated as a custom goal. Press `Tab` (no Enter) to toggle custom-goal mode on or back to trained-task mode. A run launched with `--custom-goal` returns to the prompt in custom mode, while a trained start returns in trained mode. Custom text still requires exact `YES`. Either `q` or `Q` is the no-Enter release key; `Alt+q` inserts a literal `q`, `Alt+Shift+q` inserts `Q`, and uppercase `S` remains stopped. By default the new goal repeats GR00T reset, fresh inference, `WARMUP2`, discarded chunk, `CONTINUE`, reset, and fresh strict inference. `--no-future-goal-warmup2` instead resets once and begins fresh strict live inference directly. Initialization and Warmup1 are never repeated.
+- `s` or `S` immediately captures measured arm positions while preserving the exact last published Dex3 targets, then keeps publishing that powered HOLD at 100 Hz. Preserving the hand targets avoids relaxing a loaded grasp merely because measured finger positions trail their commanded targets. A finger may therefore continue moving toward its last target after STOP; no new policy target is consumed. The client stops making GR00T requests and displays a next-goal prompt. This is a powered position STOP, not a passive brake or collision-safe freeze; it can continue exerting force and requires the client/watchdog to remain alive.
+- At the STOP prompt, trained-task mode is the default and shows the numbered allowlist; unknown text remains in HOLD and is not silently treated as a custom goal. Press `Tab` (no Enter) to toggle custom-goal mode on or back to trained-task mode. A run launched with `--custom-goal` returns to the prompt in custom mode, while a trained start returns in trained mode. With `--return-to-start`, `Shift+Tab` offers the separately confirmed startup-target movement without changing trained/custom mode. Custom text still requires exact `YES`. Either `q` or `Q` is the no-Enter release key; `Alt+q` inserts a literal `q`, `Alt+Shift+q` inserts `Q`, and uppercase `S` remains stopped. By default the new goal repeats GR00T reset, fresh inference, `WARMUP2`, discarded chunk, `CONTINUE`, reset, and fresh strict inference. `--no-future-goal-warmup2` instead resets once and begins fresh strict live inference directly. Initialization and Warmup1 are never rerun as protocol stages.
 - `q` or `Q` during active motion or at an armed line prompt requests orderly release immediately. `Ctrl-C` remains the independent release path. On real hardware, cleanup retains the final arm target while ramping `arm_sdk` authority to zero over 1.5 seconds, then sends Dex3 `stopMotors`; final pose and grasp after Unitree retakes authority are not guaranteed.
 
-A key pressed while a synchronous inference request is already running cannot cancel the network request itself. The actuator nevertheless responds immediately: `s` enters powered STOP and `q` starts release; any later server result is discarded. RTC uses the same keys, cancels its active plan, and discards any in-flight reply before accepting a new goal. The next-goal menu is entered from powered STOP/HOLD. Reaching finite `--max-chunks` without a STOP command still exits through normal release; use a sufficiently large but finite bound for an interactive pick/put session.
+A key pressed while a synchronous inference request is already running cannot cancel the network request itself. The actuator nevertheless responds immediately: `s` enters powered STOP and `q` starts release; any later server result is discarded. RTC uses the same keys, cancels its active plan, and discards any in-flight reply before accepting a new goal. The next-goal menu is entered from powered STOP/HOLD. Reaching finite `--max-chunks` without a STOP command exits through normal release unless `--return-to-start` is enabled; with that flag it enters powered HOLD and offers the menu instead.
 
 The WARMUP1/INITIALIZE, RUN, WARMUP2, and CONTINUE gates time out after 180 seconds. The STOP goal prompt may wait indefinitely while continuing the heartbeat and safety checks. During the guarded Warmup1/Warmup2 interpolations, `q`/`Q` remains the immediate orderly-abort key; `s` is intentionally not a mid-interpolation pause command. During policy execution, `s` is immediate powered STOP. `Ctrl-C`, rejection, timeout or a watchdog fault enters the existing authority-release and Dex3 `stopMotors` cleanup path. These are terminal keystrokes, so the client terminal must retain keyboard focus; they do not replace the robot's physical emergency stop.
 
@@ -387,6 +398,7 @@ is stated explicitly.
 | `--warmup2`, `--no-warmup2` | enabled | Enable or skip the first goal's guarded move to target zero of a fresh inferred chunk before reset and live execution. |
 | `--policy-warm-start`, `--no-policy-warm-start` | enabled | Compatibility aliases for `--warmup2` and `--no-warmup2`; they control the same setting. |
 | `--future-goal-warmup2`, `--no-future-goal-warmup2` | enabled | Enable or skip Warmup2 for each accepted replacement goal; initialization and Warmup1 are never repeated. |
+| `--return-to-start`, `--no-return-to-start` | disabled | Offer a separately confirmed `Shift+Tab` move from powered HOLD to Warmup1, or to an explicit initialization target when Warmup1 is disabled. |
 | `--sim` | off | Use the IsaacLab DDS domain/topic path instead of real `rt/arm_sdk`. |
 | `--actuate` | off | Create command publishers after preflight and confirmation; when omitted, run publisher-free shadow evaluation. |
 | `--allow-unqualified-real` | off | Acknowledge the explicitly unqualified real-hardware path; required for real `--actuate` and ineffective with `--sim`. |

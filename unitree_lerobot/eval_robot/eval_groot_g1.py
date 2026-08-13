@@ -70,6 +70,7 @@ LOCAL_POLICY_HOSTS = {"127.0.0.1", "localhost"}
 OPERATOR_CONFIRMATION_TIMEOUT_S = 180.0
 ALT_ESCAPE_WINDOW_S = 0.1
 GOAL_MODE_TOGGLE = "\t"
+RETURN_TO_START = "\x1b[Z"
 PREVIEW_WINDOWS = (
     "GR00T input: ego_view",
     f"GR00T input: {DEPTH_OUTPUT_KEY}",
@@ -519,6 +520,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise DeploymentError("Moving initialization modes require --actuate")
     if getattr(args, "custom_goal", None) is not None and initialization == "pose-file":
         raise DeploymentError("--custom-goal cannot use a task-bound --initialization pose-file")
+    return_to_start = bool(getattr(args, "return_to_start", False))
+    warmup1_enabled = bool(getattr(args, "warmup1", False))
+    if return_to_start and not args.actuate:
+        raise DeploymentError("--return-to-start requires --actuate")
+    if return_to_start and not warmup1_enabled and initialization == "measured":
+        raise DeploymentError(
+            "--return-to-start has no fixed target with --no-warmup1 and "
+            "--initialization measured; enable Warmup1 or select xr-home/pose-file"
+        )
     inference_mode = getattr(args, "inference_mode", "synchronous")
     if inference_mode not in {"synchronous", "rtc"}:
         raise DeploymentError("--inference-mode must be synchronous or rtc")
@@ -571,6 +581,7 @@ def _readline_while_armed(
     timeout_s: float | None,
     confirmation_mode: bool = False,
     goal_mode_toggle: bool = False,
+    return_to_start: bool = False,
 ) -> str:
     """Read a terminal line while continuously servicing the actuator watchdog."""
 
@@ -582,6 +593,7 @@ def _readline_while_armed(
             deadline,
             confirmation_mode=confirmation_mode,
             goal_mode_toggle=goal_mode_toggle,
+            return_to_start=return_to_start,
         )
     LOGGER.warning("stdin is not a TTY; armed input is line-buffered and immediate keys are unavailable")
     print(prompt, end="", flush=True)
@@ -605,6 +617,8 @@ def _readline_while_armed(
             raise DeploymentError("stdin closed while command authority was active")
         if goal_mode_toggle and raw_response.rstrip("\r\n") == GOAL_MODE_TOGGLE:
             return GOAL_MODE_TOGGLE
+        if return_to_start and raw_response.rstrip("\r\n") == RETURN_TO_START:
+            return RETURN_TO_START
         response = raw_response.strip()
         if not confirmation_mode:
             return response
@@ -625,6 +639,7 @@ def _readline_with_immediate_prompt_controls(
     *,
     confirmation_mode: bool = False,
     goal_mode_toggle: bool = False,
+    return_to_start: bool = False,
 ) -> str:
     """Read an armed line while keeping the physical Q key fail-safe.
 
@@ -653,7 +668,8 @@ def _readline_with_immediate_prompt_controls(
     # and remain unavailable until Enter is pressed.
     print(prompt, end="", flush=True)
     entered = bytearray()
-    alt_prefix_at: float | None = None
+    escape_prefix: bytes | None = None
+    escape_prefix_at: float | None = None
     try:
         while True:
             actuator.heartbeat()
@@ -678,16 +694,37 @@ def _readline_with_immediate_prompt_controls(
                 # Most POSIX terminals encode an Alt chord as ESC followed by
                 # the modified character. Keep the escape window deliberately
                 # short so a standalone Escape cannot suppress a later q.
-                alt_prefix_at = now
+                escape_prefix = value
+                escape_prefix_at = now
                 continue
-            is_alt_q = (
-                value in {b"q", b"Q"} and alt_prefix_at is not None and now - alt_prefix_at <= ALT_ESCAPE_WINDOW_S
-            )
-            alt_prefix_at = None
-            if is_alt_q:
-                entered.extend(value)
-                print(value.decode("ascii"), end="", flush=True)
-                continue
+            if escape_prefix is not None:
+                prefix_is_fresh = (
+                    escape_prefix_at is not None
+                    and now - escape_prefix_at <= ALT_ESCAPE_WINDOW_S
+                )
+                if prefix_is_fresh and escape_prefix == b"\x1b" and value in {b"q", b"Q"}:
+                    escape_prefix = None
+                    escape_prefix_at = None
+                    entered.extend(value)
+                    print(value.decode("ascii"), end="", flush=True)
+                    continue
+                if prefix_is_fresh and return_to_start and escape_prefix == b"\x1b" and value == b"[":
+                    escape_prefix = b"\x1b["
+                    continue
+                is_return_to_start = (
+                    prefix_is_fresh
+                    and return_to_start
+                    and escape_prefix == b"\x1b["
+                    and value == b"Z"
+                )
+                escape_prefix = None
+                escape_prefix_at = None
+                if is_return_to_start:
+                    # Shift+Tab is the conventional POSIX terminal sequence
+                    # ESC [ Z. Return after its final byte so a following q is
+                    # left buffered for the next armed prompt.
+                    print()
+                    return RETURN_TO_START
             if value in {b"q", b"Q", b"\x11"}:
                 actuator.request_immediate_release()
                 print()
@@ -760,7 +797,10 @@ def _confirm_while_armed(
             )
         except DeploymentError as exc:
             if str(exc).startswith("Timed out waiting for armed operator input"):
-                raise DeploymentError(f"Timed out waiting for {required}; releasing command authority") from exc
+                raise DeploymentError(
+                    f"Timed out waiting for {required}; releasing command authority; "
+                    f"OPERATOR_CONFIRMATION_TIMEOUT_S={OPERATOR_CONFIRMATION_TIMEOUT_S}"
+                ) from exc
             raise
         if response == "continue":
             return
@@ -809,7 +849,8 @@ def _select_next_goal_while_holding(
     *,
     custom_goal_mode: bool = False,
     mode_state: dict[str, bool] | None = None,
-) -> tuple[str, str] | None:
+    return_to_start: bool = False,
+) -> tuple[str, str] | str | None:
     """Wait in powered hold, with an explicit trained/custom goal-mode toggle."""
 
     print(
@@ -819,6 +860,8 @@ def _select_next_goal_while_holding(
     )
 
     def show_mode() -> None:
+        if return_to_start:
+            print("Press Shift+Tab to move back to the configured startup target.")
         if custom_goal_mode:
             print(
                 "\nCUSTOM GOAL MODE (outside the exact trained-task allowlist).\n"
@@ -838,7 +881,10 @@ def _select_next_goal_while_holding(
             prompt,
             timeout_s=None,
             goal_mode_toggle=True,
+            return_to_start=return_to_start,
         )
+        if response == RETURN_TO_START:
+            return RETURN_TO_START
         if response == GOAL_MODE_TOGGLE:
             custom_goal_mode = not custom_goal_mode
             if mode_state is not None:
@@ -878,12 +924,21 @@ def _select_next_goal_while_holding(
             f"\nCUSTOM GOAL IS NOT AN EXACT TRAINING INSTRUCTION:\n  {instruction}\n"
             "Behavior may be outside the fine-tuning distribution. All normal motion checks remain active."
         )
-        confirmation = _readline_while_armed(
-            actuator,
-            "Type YES to send this custom goal, or press Tab for trained tasks: ",
-            timeout_s=OPERATOR_CONFIRMATION_TIMEOUT_S,
-            goal_mode_toggle=True,
-        )
+        try:
+            confirmation = _readline_while_armed(
+                actuator,
+                "Type YES to send this custom goal, or press Tab for trained tasks: ",
+                timeout_s=OPERATOR_CONFIRMATION_TIMEOUT_S,
+                goal_mode_toggle=True,
+                return_to_start=return_to_start,
+            )
+        except DeploymentError as exc:
+            if str(exc).startswith("Timed out waiting for armed operator input"):
+                raise DeploymentError(
+                    "Timed out waiting for custom-goal confirmation; releasing command authority; "
+                    f"OPERATOR_CONFIRMATION_TIMEOUT_S={OPERATOR_CONFIRMATION_TIMEOUT_S}"
+                ) from exc
+            raise
         if confirmation == "YES":
             return task_name, instruction
         if confirmation == GOAL_MODE_TOGGLE:
@@ -892,6 +947,8 @@ def _select_next_goal_while_holding(
                 mode_state["custom_goal_mode"] = False
             show_mode()
             continue
+        if confirmation == RETURN_TO_START:
+            return RETURN_TO_START
         if confirmation.lower() in EXIT_COMMANDS:
             return None
         if confirmation.lower() in STOP_COMMANDS:
@@ -899,6 +956,24 @@ def _select_next_goal_while_holding(
             LOGGER.info("Custom goal was not sent; remaining STOPPED")
             continue
         LOGGER.warning("Custom goal rejected; remaining in powered hold")
+
+
+def confirm_return_to_start(
+    actuator: SafeG1Dex3Actuator,
+    spec: InitializationSpec,
+) -> str:
+    """Confirm one repeatable guarded move back to the selected startup target."""
+
+    warning = (
+        f"\nRETURN TO START WILL MOVE THE ROBOT toward {spec.label!r}. "
+        "This is a slow bounded joint-space path, not collision-aware planning. "
+        "It reuses the startup target without rerunning authority acquisition or the "
+        "one-time initialization/Warmup1 protocol stages. Keep the workspace clear and "
+        "remain on the emergency stop."
+    )
+    if spec.moves_hands:
+        warning += " This target explicitly moves both Dex3 hands; verify their contents."
+    return _confirm_goal_transition(actuator, warning, "RETURN TO START")
 
 
 def confirm_initialization(
@@ -949,12 +1024,20 @@ def _confirm_goal_transition(
     """Confirm a goal transition while honoring global HOLD/release controls."""
 
     print(message)
-    response = _readline_while_armed(
-        actuator,
-        f"Press r to {required} (no Enter); s STOP; q release: ",
-        timeout_s=OPERATOR_CONFIRMATION_TIMEOUT_S,
-        confirmation_mode=True,
-    )
+    try:
+        response = _readline_while_armed(
+            actuator,
+            f"Press r to {required} (no Enter); s STOP; q release: ",
+            timeout_s=OPERATOR_CONFIRMATION_TIMEOUT_S,
+            confirmation_mode=True,
+        )
+    except DeploymentError as exc:
+        if str(exc).startswith("Timed out waiting for armed operator input"):
+            raise DeploymentError(
+                f"Timed out waiting for {required}; releasing command authority; "
+                f"OPERATOR_CONFIRMATION_TIMEOUT_S={OPERATOR_CONFIRMATION_TIMEOUT_S}"
+            ) from exc
+        raise
     if response == "continue":
         return "continue"
     lowered = response.lower()
@@ -2005,6 +2088,8 @@ def run(args: argparse.Namespace) -> None:
     )
     warmup1_enabled = bool(getattr(args, "warmup1", False))
     warmup1 = training_start_spec() if warmup1_enabled else None
+    return_to_start_enabled = bool(getattr(args, "return_to_start", False))
+    return_to_start_spec = warmup1 if warmup1 is not None else configured_initialization
     image_host = args.image_host or ("127.0.0.1" if args.sim else "192.168.123.164")
 
     policy: Gr00tClient | None = None
@@ -2041,7 +2126,8 @@ def run(args: argparse.Namespace) -> None:
         inference_mode = getattr(args, "inference_mode", "synchronous")
         if inference_mode == "rtc" and contract.action_horizon < RTC_MIN_MODEL_HORIZON:
             raise DeploymentError(
-                f"RTC requires a checkpoint trained for at least {RTC_MIN_MODEL_HORIZON} actions; "
+                f"RTC requires a checkpoint trained for at least {RTC_MIN_MODEL_HORIZON} actions "
+                f"(RTC_MIN_MODEL_HORIZON={RTC_MIN_MODEL_HORIZON}); "
                 f"this checkpoint exposes {contract.action_horizon}. Use synchronous mode."
             )
         rtc_frozen_steps = getattr(args, "rtc_frozen_steps", None)
@@ -2296,18 +2382,49 @@ def run(args: argparse.Namespace) -> None:
                     args,
                     allow_custom_instruction=allow_custom_instruction,
                 )
-            if outcome != "hold":
+            if outcome == "release":
                 break
+            if outcome == "complete":
+                if not return_to_start_enabled:
+                    break
+                _run_blocking_motion_with_immediate_release(actuator, actuator.hold)
+                LOGGER.warning(
+                    "Goal %r completed; entered powered HOLD with Return-to-Start available",
+                    task_name,
+                )
+            elif outcome != "hold":
+                raise DeploymentError(f"Unexpected active-goal outcome {outcome!r}")
 
             mode_state = {"custom_goal_mode": custom_goal_mode}
-            next_goal = _select_next_goal_while_holding(
-                actuator,
-                # A run launched with --custom-goal returns to custom mode;
-                # otherwise the operator's last Tab-selected mode persists.
-                custom_goal_mode=custom_goal_mode,
-                mode_state=mode_state,
-            )
-            custom_goal_mode = mode_state["custom_goal_mode"]
+            while True:
+                selector_kwargs = {
+                    # A run launched with --custom-goal returns to custom mode;
+                    # otherwise the operator's last Tab-selected mode persists.
+                    "custom_goal_mode": custom_goal_mode,
+                    "mode_state": mode_state,
+                }
+                # Preserve compatibility for direct callers/test doubles that
+                # implement the pre-feature selector signature.
+                if return_to_start_enabled:
+                    selector_kwargs["return_to_start"] = True
+                next_goal = _select_next_goal_while_holding(actuator, **selector_kwargs)
+                custom_goal_mode = mode_state["custom_goal_mode"]
+                if next_goal != RETURN_TO_START:
+                    break
+                decision = confirm_return_to_start(actuator, return_to_start_spec)
+                if decision == "release":
+                    next_goal = None
+                    break
+                if decision == "hold":
+                    continue
+                _run_blocking_motion_with_immediate_release(
+                    actuator,
+                    lambda: actuator.warmup_pose(return_to_start_spec),
+                )
+                LOGGER.warning(
+                    "Returned to startup target %r; remaining in powered HOLD",
+                    return_to_start_spec.label,
+                )
             if next_goal is None:
                 LOGGER.warning("Operator requested orderly authority release from HOLD")
                 break
@@ -2449,6 +2566,16 @@ def build_parser() -> argparse.ArgumentParser:
             "For each accepted replacement goal after the first, perform the guarded Warmup2 "
             "first-target transition before live execution (default: enabled). Initialization "
             "and Warmup1 are never repeated"
+        ),
+    )
+    parser.add_argument(
+        "--return-to-start",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Offer Shift+Tab in powered HOLD to repeat Warmup1 when enabled, otherwise the "
+            "explicit xr-home/pose-file initialization target (default: disabled); it is "
+            "invalid with --no-warmup1 --initialization measured"
         ),
     )
     parser.add_argument(

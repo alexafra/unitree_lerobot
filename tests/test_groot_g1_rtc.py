@@ -291,6 +291,16 @@ def _plan(horizon: int, *, arm_step: float = 0.01) -> ActionChunk:
     )
 
 
+def _gripping_plan(horizon: int) -> ActionChunk:
+    """Return a plan whose hand targets deliberately differ from feedback."""
+
+    plan = _plan(horizon)
+    plan.arm[:, 0] += 0.02
+    plan.left_hand[:] = np.array([0.20, 0.15, 0.30, -0.20, -0.25, -0.20, -0.25])
+    plan.right_hand[:] = np.array([-0.20, -0.15, -0.30, 0.20, 0.25, 0.20, 0.25])
+    return plan
+
+
 def _rtc_start_command(sequence: int, plan: ActionChunk, action_budget: int) -> tuple:
     return (
         "rtc_start",
@@ -840,6 +850,24 @@ class GrootG1RtcTests(unittest.TestCase):
             self.assertTrue(child.thread.is_alive())
             self.assertFalse(child.backend.released)
 
+    def test_rtc_completion_holds_measured_arm_without_relaxing_commanded_grip(self):
+        with _ChildHarness(_LaggingRecordingBackend) as child:
+            plan = _gripping_plan(8)
+            child.commands.put(_rtc_start_command(1, plan, action_budget=1), timeout=0.2)
+            self.assertEqual(child.assert_status("rtc_started"), 1)
+            self.assertEqual(child.assert_status("rtc_completed"), 1)
+
+            targets = child.backend.target_snapshot()
+            self.assertGreaterEqual(len(targets), 2)
+            np.testing.assert_array_equal(targets[-2][0], plan.arm[0])
+            np.testing.assert_array_equal(targets[-2][1], plan.left_hand[0])
+            np.testing.assert_array_equal(targets[-2][2], plan.right_hand[0])
+            np.testing.assert_array_equal(targets[-1][0], np.zeros(14))
+            np.testing.assert_array_equal(targets[-1][1], targets[-2][1])
+            np.testing.assert_array_equal(targets[-1][2], targets[-2][2])
+            self.assertTrue(child.thread.is_alive())
+            self.assertFalse(child.backend.released)
+
     def test_urgent_stop_preempts_synchronous_chunk_before_its_next_action(self):
         with _ChildHarness() as child:
             plan = _plan(16)
@@ -884,6 +912,41 @@ class GrootG1RtcTests(unittest.TestCase):
                 timeout=0.2,
             )
             self.assertEqual(child.assert_status("completed"), 2)
+
+    def test_urgent_stop_and_barrier_hold_measured_arm_without_relaxing_commanded_grip(self):
+        with _ChildHarness(_LaggingRecordingBackend) as child:
+            plan = _gripping_plan(16)
+            child.commands.put(
+                (
+                    "chunk",
+                    1,
+                    time.monotonic(),
+                    plan.arm,
+                    plan.left_hand,
+                    plan.right_hand,
+                ),
+                timeout=0.2,
+            )
+            child.wait_for_target_count(2)
+            commanded_left = child.backend._left_target.copy()
+            commanded_right = child.backend._right_target.copy()
+
+            child.urgent_hold.set()
+            self.assertEqual(child.assert_status("holding"), 1)
+            immediate_hold = child.backend.target_snapshot()[-1]
+            np.testing.assert_array_equal(immediate_hold[0], np.zeros(14))
+            np.testing.assert_array_equal(immediate_hold[1], commanded_left)
+            np.testing.assert_array_equal(immediate_hold[2], commanded_right)
+
+            child.commands.put(("urgent_hold_barrier",), timeout=0.2)
+            self.assertEqual(child.assert_status("urgent_holding"), 1)
+            barrier_hold = child.backend.target_snapshot()[-1]
+            np.testing.assert_array_equal(barrier_hold[0], np.zeros(14))
+            np.testing.assert_array_equal(barrier_hold[1], commanded_left)
+            np.testing.assert_array_equal(barrier_hold[2], commanded_right)
+            self.assertFalse(child.urgent_hold.is_set())
+            self.assertTrue(child.thread.is_alive())
+            self.assertFalse(child.backend.released)
 
     def test_urgent_stop_latch_keeps_publishing_without_advancing_policy_targets(self):
         with _ChildHarness() as child:
