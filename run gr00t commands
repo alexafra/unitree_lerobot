@@ -1,0 +1,75 @@
+ssh -N \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=10 \
+  -o ServerAliveCountMax=3 \
+  -L 127.0.0.1:5555:127.0.0.1:5555 \
+  alex@192.168.0.159
+
+
+python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+  --actuate \
+  --allow-unqualified-real \
+  --task pick-toothpaste \
+  --policy-host 127.0.0.1 \
+  --policy-port 5555 \
+  --image-host 192.168.123.164 \
+  --network-interface enp0s1 \
+  --initialization xr-home \
+  --policy-warm-start \
+  --inference-mode synchronous \
+  --execution-horizon 8 \
+  --max-chunks 2 \
+  --command-conditioning xr
+
+After that succeeds, increase --max-chunks gradually.
+RTC starter — H32 checkpoint
+Plain Text
+python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+  --actuate \
+  --allow-unqualified-real \
+  --task pick-red-cup \
+  --policy-host 127.0.0.1 \
+  --policy-port 5555 \
+  --image-host 192.168.123.164 \
+  --network-interface enp0s1 \
+  --initialization measured \
+  --policy-warm-start \
+  --inference-mode rtc \
+  --execution-horizon 8 \
+  --max-chunks 4 \
+  --command-conditioning xr
+Leave RTC frozen steps and ramp rate unspecified: adaptive frozen-step estimation and checkpoint ramp rate 6.0 will be used. RTC max-chunks=4 provides a 32-action budget and should exercise actual handoffs.
+
+Synchronous shadow
+Plain Text
+python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+  --task pick-red-cup \
+  --policy-host 127.0.0.1 \
+  --policy-port 5555 \
+  --image-host 192.168.123.164 \
+  --network-interface enp0s1 \
+  --initialization measured \
+  --inference-mode synchronous \
+  --execution-horizon 8 \
+  --max-chunks 5 \
+  --command-conditioning xr
+
+
+RTC shadow — H32 checkpoint
+Plain Text
+python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+  --task pick-red-cup \
+  --policy-host 127.0.0.1 \
+  --policy-port 5555 \
+  --image-host 192.168.123.164 \
+  --network-interface enp0s1 \
+  --initialization measured \
+  --inference-mode rtc \
+  --execution-horizon 8 \
+  --max-chunks 4 \
+  --command-conditioning xr
+Correctly omitted in shadow:
+--actuate
+--allow-unqualified-real
+--policy-warm-start
+Shadow creates no command publishers. It validates the policy/RTC path, but it does not physically execute the 100 Hz conditioner.

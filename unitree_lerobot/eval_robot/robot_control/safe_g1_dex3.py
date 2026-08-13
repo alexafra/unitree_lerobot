@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import logging
 import multiprocessing as mp
 from multiprocessing.queues import Queue as MpQueue
+from pathlib import Path
 import queue
 import signal
 import threading
@@ -24,6 +25,11 @@ import numpy as np
 import zmq
 
 from unitree_lerobot.eval_robot.groot_client import DeploymentError
+from unitree_lerobot.eval_robot.run_logging import (
+    configure_process_logging,
+    diagnostic_json_path,
+    write_json,
+)
 from unitree_lerobot.eval_robot.image_server.rgbd_protocol import RGBD_PROTOCOL
 from unitree_lerobot.eval_robot.groot_contract import (
     ActionChunk,
@@ -92,7 +98,14 @@ HAND_TRACKING_WARNING_CLEAR_RAD = 0.40
 HAND_TRACKING_WARNING_DWELL_S = 0.20
 HAND_COMMAND_HISTORY_SIZE = 128
 TRACKING_GRACE_S = 0.50
-MAX_ACTION_LATENESS_S = 0.1 #SAFETYCHANGE was 0.02
+MAX_ACTION_LATENESS_S = 0.05 #SAFETYCHANGE was 0.02
+# Missing one complete 30 Hz target-residency window invalidates the remaining
+# time-indexed plan even when the broader local lateness ceiling was relaxed.
+# The child freezes the last command and asks the parent for a fresh observation
+# rather than replaying overdue targets at the 100 Hz publisher rate.
+ACTION_REPLAN_LATENESS_S = 1.0 / CONTROL_HZ
+ACTION_REPLAN_RECOVERY_SAMPLES = 5
+ACTION_REPLAN_RECOVERY_MAX_LOOP_GAP_S = 2.0 / PUBLISH_HZ
 
 # OFFICIAL: Unitree G1 asset mapping identifies mode_machine 6 as
 # g1_29dof_lock_waist_with_hand_rev_1_0: waist yaw remains active while
@@ -154,6 +167,8 @@ SIM_RIGHT_HAND_PERMUTATION = np.array([0, 1, 2, 5, 6, 3, 4], dtype=np.int64)
 TELEIMAGER_CONFIG_PORT = 60000
 TELEIMAGER_CONFIG_TIMEOUT_S = 1.0
 RGBD_MAX_RECEIVE_AGE_S = 0.15
+ACTIVE_TIMING_RING_CAPACITY = 3_000
+ACTIVE_TIMING_SLOW_LATENESS_MS = (20.0, 50.0, 100.0)
 
 
 class RtcTerminalEvent(DeploymentError):
@@ -270,6 +285,451 @@ class HandStateFreshnessGate:
             pause_s=pause_s,
             max_age_s=max_age_s,
         )
+
+
+class DdsHoldTimingAccumulator:
+    """Collect low-overhead timing samples for the measured-HOLD diagnostic."""
+
+    _FIELDS = (
+        "cycle_ms",
+        "lateness_ms",
+        "work_ms",
+        "state_lookup_ms",
+        "arm_age_ms",
+        "left_age_ms",
+        "right_age_ms",
+        "arm_state_check_ms",
+        "arm_crc_ms",
+        "arm_write_ms",
+        "left_write_ms",
+        "right_write_ms",
+        "publish_total_ms",
+    )
+    _THRESHOLDS_MS = (20.0, 50.0, 75.0, 100.0)
+    _SLOWEST_LIMIT = 20
+
+    def __init__(self, *, period_s: float) -> None:
+        self._period_ms = float(period_s) * 1e3
+        self._started_at = time.monotonic()
+        self._previous_loop_started: float | None = None
+        self._values: dict[str, list[float]] = {name: [] for name in self._FIELDS}
+        self._slowest: list[dict[str, Any]] = []
+        self._samples = 0
+        self._pause_count = 0
+        self._recovery_count = 0
+        self._max_pause_s = 0.0
+
+    def note_freshness(self, result: HandFreshnessResult) -> None:
+        if result.entered:
+            self._pause_count += 1
+        if result.recovered:
+            self._recovery_count += 1
+            self._max_pause_s = max(self._max_pause_s, float(result.pause_s))
+
+    def record(
+        self,
+        *,
+        loop_started: float,
+        state_lookup_ms: float,
+        state: RobotState,
+        publish_timing_ms: dict[str, float],
+        completed_at: float,
+    ) -> None:
+        now = float(completed_at)
+        cycle_ms = (
+            float("nan")
+            if self._previous_loop_started is None
+            else (float(loop_started) - self._previous_loop_started) * 1e3
+        )
+        self._previous_loop_started = float(loop_started)
+        arm_at = state.captured_at if state.arm_received_at is None else state.arm_received_at
+        left_at = state.captured_at if state.left_hand_received_at is None else state.left_hand_received_at
+        right_at = state.captured_at if state.right_hand_received_at is None else state.right_hand_received_at
+        record = {
+            "sample": self._samples + 1,
+            "at_s": now - self._started_at,
+            "cycle_ms": cycle_ms,
+            "lateness_ms": max(0.0, cycle_ms - self._period_ms) if np.isfinite(cycle_ms) else float("nan"),
+            "work_ms": (now - float(loop_started)) * 1e3,
+            "state_lookup_ms": float(state_lookup_ms),
+            "arm_age_ms": max(0.0, now - float(arm_at)) * 1e3,
+            "left_age_ms": max(0.0, now - float(left_at)) * 1e3,
+            "right_age_ms": max(0.0, now - float(right_at)) * 1e3,
+            "arm_state_check_ms": float(publish_timing_ms.get("arm_state_check", float("nan"))),
+            "arm_crc_ms": float(publish_timing_ms.get("arm_crc", float("nan"))),
+            "arm_write_ms": float(publish_timing_ms.get("arm_write", float("nan"))),
+            "left_write_ms": float(publish_timing_ms.get("left_write", float("nan"))),
+            "right_write_ms": float(publish_timing_ms.get("right_write", float("nan"))),
+            "publish_total_ms": float(publish_timing_ms.get("publish_total", float("nan"))),
+        }
+        self._samples += 1
+        for name in self._FIELDS:
+            value = float(record[name])
+            if np.isfinite(value):
+                self._values[name].append(value)
+
+        stage_names = (
+            "state_lookup_ms",
+            "arm_state_check_ms",
+            "arm_crc_ms",
+            "arm_write_ms",
+            "left_write_ms",
+            "right_write_ms",
+        )
+        finite_stages = [(name, float(record[name])) for name in stage_names if np.isfinite(record[name])]
+        worst_stage, worst_ms = max(finite_stages, key=lambda item: item[1], default=("none", 0.0))
+
+        def finite_or_none(value: float) -> float | None:
+            return float(value) if np.isfinite(value) else None
+
+        slow_record = {
+            "sample": record["sample"],
+            "at_s": record["at_s"],
+            "cycle_ms": finite_or_none(record["cycle_ms"]),
+            "work_ms": finite_or_none(record["work_ms"]),
+            "arm_age_ms": finite_or_none(record["arm_age_ms"]),
+            "left_age_ms": finite_or_none(record["left_age_ms"]),
+            "right_age_ms": finite_or_none(record["right_age_ms"]),
+            "worst_stage": worst_stage,
+            "worst_stage_ms": worst_ms,
+            "arm_write_ms": finite_or_none(record["arm_write_ms"]),
+            "left_write_ms": finite_or_none(record["left_write_ms"]),
+            "right_write_ms": finite_or_none(record["right_write_ms"]),
+        }
+        score = max(
+            value
+            for value in (record["cycle_ms"], record["work_ms"], worst_ms)
+            if np.isfinite(value)
+        )
+        slow_record["score_ms"] = float(score)
+        self._slowest.append(slow_record)
+        self._slowest.sort(key=lambda item: float(item["score_ms"]), reverse=True)
+        del self._slowest[self._SLOWEST_LIMIT :]
+
+    @staticmethod
+    def _stats(values: list[float]) -> dict[str, float | int]:
+        if not values:
+            return {"count": 0}
+        array = np.asarray(values, dtype=np.float64)
+        return {
+            "count": int(array.size),
+            "mean": float(np.mean(array)),
+            "p50": float(np.percentile(array, 50)),
+            "p95": float(np.percentile(array, 95)),
+            "p99": float(np.percentile(array, 99)),
+            "max": float(np.max(array)),
+        }
+
+    def summary(self, *, completed_at: float | None = None) -> dict[str, Any]:
+        ended_at = time.monotonic() if completed_at is None else float(completed_at)
+        elapsed_s = max(0.0, ended_at - self._started_at)
+        metrics = {name: self._stats(values) for name, values in self._values.items()}
+        cycle_values = self._values["cycle_ms"]
+        work_values = self._values["work_ms"]
+        overruns = {}
+        for threshold in self._THRESHOLDS_MS:
+            label = str(int(threshold))
+            overruns[f"cycle_over_{label}ms"] = sum(value > threshold for value in cycle_values)
+            overruns[f"work_over_{label}ms"] = sum(value > threshold for value in work_values)
+        return {
+            "samples": self._samples,
+            "elapsed_s": elapsed_s,
+            "achieved_hz": self._samples / elapsed_s if elapsed_s > 0.0 else 0.0,
+            "period_ms": self._period_ms,
+            "hand_pause_count": self._pause_count,
+            "hand_recovery_count": self._recovery_count,
+            "max_hand_pause_s": self._max_pause_s,
+            "metrics": metrics,
+            "overruns": overruns,
+            "slowest": list(self._slowest),
+        }
+
+
+class ActiveTimingRing:
+    """Bounded, allocation-light timing history for the live actuator loop."""
+
+    def __init__(self, *, capacity: int = ACTIVE_TIMING_RING_CAPACITY) -> None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise ValueError("Active timing capacity must be a positive integer")
+        self._records: deque[dict[str, Any]] = deque(maxlen=capacity)
+        self._capacity = capacity
+        self._total = 0
+        self._started_at = time.monotonic()
+        self._previous_loop_started: float | None = None
+        self._current: dict[str, Any] | None = None
+        self._last_state: RobotState | None = None
+
+    def begin(
+        self,
+        *,
+        loop_started: float,
+        heartbeat_age_s: float | None,
+        sequence: int,
+        action_index: int,
+        chunk_length: int | None,
+        rtc: bool,
+        rtc_total_actions: int,
+        rtc_action_budget: int,
+        holding: bool,
+    ) -> None:
+        self.finish(completed_at=loop_started)
+        cycle_ms = (
+            None
+            if self._previous_loop_started is None
+            else (float(loop_started) - self._previous_loop_started) * 1e3
+        )
+        self._previous_loop_started = float(loop_started)
+        self._total += 1
+        record: dict[str, Any] = {
+            "sample": self._total,
+            "at_s": float(loop_started) - self._started_at,
+            "cycle_ms": cycle_ms,
+            "heartbeat_age_ms": (
+                None if heartbeat_age_s is None else max(0.0, float(heartbeat_age_s)) * 1e3
+            ),
+            "heartbeat_lookup_ms": None,
+            "sequence": int(sequence),
+            "next_action_index": int(action_index),
+            "chunk_length": None if chunk_length is None else int(chunk_length),
+            "rtc": bool(rtc),
+            "rtc_total_actions": int(rtc_total_actions),
+            "rtc_action_budget": int(rtc_action_budget),
+            "holding": bool(holding),
+            "event": "loop",
+            "command_kind": None,
+            "command_queue_get_ms": None,
+            "command_processing_ms": None,
+            "state_lookup_ms": None,
+            "arm_age_ms": None,
+            "left_age_ms": None,
+            "right_age_ms": None,
+            "max_arm_dq_rad_s": None,
+            "freshness_ready": None,
+            "freshness_entered": False,
+            "freshness_recovered": False,
+            "freshness_pause_ms": None,
+            "freshness_max_age_ms": None,
+            "freshness_stale_hands": [],
+            "scheduler_due": False,
+            "scheduler_lateness_ms": None,
+            "raw_arm_step_rad": None,
+            "raw_left_step_rad": None,
+            "raw_right_step_rad": None,
+            "conditioned_arm_step_rad": None,
+            "conditioned_left_step_rad": None,
+            "conditioned_right_step_rad": None,
+            "tracking_ms": None,
+            "tracking_arm_error_rad": None,
+            "tracking_left_error_rad": None,
+            "tracking_right_error_rad": None,
+            "conditioner_ms": None,
+            "publish_called": False,
+            "arm_state_check_ms": None,
+            "arm_crc_ms": None,
+            "arm_write_ms": None,
+            "left_write_ms": None,
+            "right_write_ms": None,
+            "publish_total_ms": None,
+            "work_ms": None,
+            "requested_wait_ms": None,
+            "actual_wait_ms": None,
+            "wait_overshoot_ms": None,
+            "thread_cpu_ms": None,
+            "exception": None,
+            "_loop_started": float(loop_started),
+            "_thread_cpu_started_ns": time.thread_time_ns(),
+            "_command_processing_started_ns": None,
+            "_finished": False,
+        }
+        self._records.append(record)
+        self._current = record
+
+    def update(self, **values: Any) -> None:
+        if self._current is not None:
+            self._current.update(values)
+
+    def note_state(self, state: RobotState, *, completed_at: float, lookup_ms: float) -> None:
+        self._last_state = state
+        arm_at = state.captured_at if state.arm_received_at is None else state.arm_received_at
+        left_at = state.captured_at if state.left_hand_received_at is None else state.left_hand_received_at
+        right_at = state.captured_at if state.right_hand_received_at is None else state.right_hand_received_at
+        self.update(
+            state_lookup_ms=float(lookup_ms),
+            arm_age_ms=max(0.0, completed_at - float(arm_at)) * 1e3,
+            left_age_ms=max(0.0, completed_at - float(left_at)) * 1e3,
+            right_age_ms=max(0.0, completed_at - float(right_at)) * 1e3,
+            max_arm_dq_rad_s=float(np.max(np.abs(state.arm_dq))),
+        )
+
+    def note_freshness(self, result: HandFreshnessResult) -> None:
+        self.update(
+            freshness_ready=bool(result.ready),
+            freshness_entered=bool(result.entered),
+            freshness_recovered=bool(result.recovered),
+            freshness_pause_ms=float(result.pause_s) * 1e3 if result.recovered else None,
+            freshness_max_age_ms=float(result.max_age_s) * 1e3,
+            freshness_stale_hands=list(result.stale_hands),
+        )
+
+    def start_command(self, kind: Any) -> None:
+        if self._current is None:
+            return
+        self._current["command_kind"] = repr(kind)
+        self._current["_command_processing_started_ns"] = time.monotonic_ns()
+
+    def finish_command(self) -> None:
+        if self._current is None:
+            return
+        started_ns = self._current.get("_command_processing_started_ns")
+        if started_ns is not None and self._current.get("command_processing_ms") is None:
+            self._current["command_processing_ms"] = (time.monotonic_ns() - int(started_ns)) / 1e6
+        self._current["_command_processing_started_ns"] = None
+
+    def note_publish(self, timing_ms: dict[str, float]) -> None:
+        self.update(
+            publish_called=True,
+            arm_state_check_ms=_finite_float_or_none(timing_ms.get("arm_state_check")),
+            arm_crc_ms=_finite_float_or_none(timing_ms.get("arm_crc")),
+            arm_write_ms=_finite_float_or_none(timing_ms.get("arm_write")),
+            left_write_ms=_finite_float_or_none(timing_ms.get("left_write")),
+            right_write_ms=_finite_float_or_none(timing_ms.get("right_write")),
+            publish_total_ms=_finite_float_or_none(timing_ms.get("publish_total")),
+        )
+
+    def wait(self, stop_event: Any, *, requested_s: float) -> None:
+        requested = max(0.0, float(requested_s))
+        wait_started = time.monotonic()
+        self.update(
+            work_ms=(wait_started - self._current["_loop_started"]) * 1e3 if self._current else None,
+            requested_wait_ms=requested * 1e3,
+        )
+        stop_event.wait(requested)
+        completed_at = time.monotonic()
+        actual = completed_at - wait_started
+        self.update(
+            actual_wait_ms=actual * 1e3,
+            wait_overshoot_ms=(actual - requested) * 1e3,
+        )
+        self.finish(completed_at=completed_at)
+
+    def fault(self, exc: BaseException, *, event: str | None = None, **values: Any) -> None:
+        if event is not None:
+            values["event"] = event
+        values["exception"] = f"{type(exc).__name__}: {exc}"
+        self.update(**values)
+        self.finish(completed_at=time.monotonic())
+
+    def finish(self, *, completed_at: float) -> None:
+        record = self._current
+        if record is None or record.get("_finished"):
+            return
+        if record.get("work_ms") is None:
+            record["work_ms"] = (float(completed_at) - float(record["_loop_started"])) * 1e3
+        command_started_ns = record.get("_command_processing_started_ns")
+        if command_started_ns is not None and record.get("command_processing_ms") is None:
+            record["command_processing_ms"] = (time.monotonic_ns() - int(command_started_ns)) / 1e6
+        record["thread_cpu_ms"] = (time.thread_time_ns() - int(record["_thread_cpu_started_ns"])) / 1e6
+        record["_finished"] = True
+        self._current = None
+
+    def snapshot(
+        self,
+        *,
+        trigger: str,
+        error: str | None,
+        backend: Any,
+        command_conditioning: str,
+        target_snapshot: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    ) -> dict[str, Any]:
+        self.finish(completed_at=time.monotonic())
+        records = []
+        lateness_counts = {f"over_{int(threshold)}ms": 0 for threshold in ACTIVE_TIMING_SLOW_LATENESS_MS}
+        for source in self._records:
+            record = {key: value for key, value in source.items() if not key.startswith("_")}
+            lateness = record.get("scheduler_lateness_ms")
+            if isinstance(lateness, (int, float)) and np.isfinite(lateness):
+                for threshold in ACTIVE_TIMING_SLOW_LATENESS_MS:
+                    if lateness > threshold:
+                        lateness_counts[f"over_{int(threshold)}ms"] += 1
+            records.append(record)
+        state = self._last_state
+        state_payload = None
+        if state is not None:
+            state_payload = {
+                "captured_at": float(state.captured_at),
+                "mode_machine": int(state.mode_machine),
+                "arm": np.asarray(state.arm, dtype=np.float64).tolist(),
+                "arm_dq": np.asarray(state.arm_dq, dtype=np.float64).tolist(),
+                "left_hand": np.asarray(state.left_hand, dtype=np.float64).tolist(),
+                "right_hand": np.asarray(state.right_hand, dtype=np.float64).tolist(),
+                "arm_received_at": state.arm_received_at,
+                "left_hand_received_at": state.left_hand_received_at,
+                "right_hand_received_at": state.right_hand_received_at,
+            }
+        targets = None
+        if target_snapshot is not None:
+            arm_target, left_target, right_target = target_snapshot
+            targets = {
+                "arm": np.asarray(arm_target, dtype=np.float64).tolist(),
+                "left_hand": np.asarray(left_target, dtype=np.float64).tolist(),
+                "right_hand": np.asarray(right_target, dtype=np.float64).tolist(),
+            }
+        elif backend is not None:
+            targets = {
+                "arm": np.asarray(getattr(backend, "_arm_target", []), dtype=np.float64).tolist(),
+                "left_hand": np.asarray(getattr(backend, "_left_target", []), dtype=np.float64).tolist(),
+                "right_hand": np.asarray(getattr(backend, "_right_target", []), dtype=np.float64).tolist(),
+            }
+        payload = {
+            "schema_version": 1,
+            "trigger": trigger,
+            "error": error,
+            "command_conditioning": command_conditioning,
+            "publish_hz": PUBLISH_HZ,
+            "control_hz": CONTROL_HZ,
+            "max_action_lateness_s": MAX_ACTION_LATENESS_S,
+            "action_replan_lateness_s": min(
+                MAX_ACTION_LATENESS_S,
+                ACTION_REPLAN_LATENESS_S,
+            ),
+            "capacity": self._capacity,
+            "total_records": self._total,
+            "retained_records": len(records),
+            "dropped_records": max(0, self._total - len(records)),
+            "scheduler_lateness_counts": lateness_counts,
+            "last_state": state_payload,
+            "last_targets": targets,
+            "records": records,
+        }
+        normalized = _json_safe(payload)
+        assert isinstance(normalized, dict)
+        return normalized
+
+
+def _finite_float_or_none(value: Any) -> float | None:
+    try:
+        converted = float(value)
+    except (TypeError, ValueError):
+        return None
+    return converted if np.isfinite(converted) else None
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert a diagnostic payload to strict, portable JSON primitives."""
+
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return repr(value)
 
 
 @dataclass(frozen=True)
@@ -1379,8 +1839,8 @@ class _G1Dex3CommandBackend:
         self._right_hand_publish_history.clear()
 
     def _publish_arm(self, require_qualified_state: bool = True) -> None:
-        timing_enabled = self._authority_ramp_timing_enabled
-        timing = self._last_publish_timing_ms
+        timing_enabled = getattr(self, "_authority_ramp_timing_enabled", False)
+        timing = getattr(self, "_last_publish_timing_ms", {})
         for offset, index in enumerate(self._arm_indices):
             self._arm_message.motor_cmd[index].q = float(self._arm_target[offset])
         if not self.simulation:
@@ -1392,18 +1852,24 @@ class _G1Dex3CommandBackend:
             self._arm_message.mode_machine = QUALIFIED_REAL_MODE_MACHINE
             if require_qualified_state:
                 started_ns = time.monotonic_ns()
-                self._validate_runtime_state(self.reader.latest())
-                if timing_enabled:
-                    timing["arm_state_check"] = (time.monotonic_ns() - started_ns) / 1e6
+                try:
+                    self._validate_runtime_state(self.reader.latest())
+                finally:
+                    if timing_enabled:
+                        timing["arm_state_check"] = (time.monotonic_ns() - started_ns) / 1e6
             self._arm_message.motor_cmd[29].q = float(self._weight)
         started_ns = time.monotonic_ns()
-        self._arm_message.crc = self._crc.Crc(self._arm_message)
-        if timing_enabled:
-            timing["arm_crc"] = (time.monotonic_ns() - started_ns) / 1e6
+        try:
+            self._arm_message.crc = self._crc.Crc(self._arm_message)
+        finally:
+            if timing_enabled:
+                timing["arm_crc"] = (time.monotonic_ns() - started_ns) / 1e6
         started_ns = time.monotonic_ns()
-        write_ok = self._arm_publisher.Write(self._arm_message, timeout=DDS_WRITE_TIMEOUT_S)
-        if timing_enabled:
-            timing["arm_write"] = (time.monotonic_ns() - started_ns) / 1e6
+        try:
+            write_ok = self._arm_publisher.Write(self._arm_message, timeout=DDS_WRITE_TIMEOUT_S)
+        finally:
+            if timing_enabled:
+                timing["arm_write"] = (time.monotonic_ns() - started_ns) / 1e6
         if write_ok is not True:
             raise DeploymentError("Arm DDS Write failed")
         self._has_published = True
@@ -1422,19 +1888,23 @@ class _G1Dex3CommandBackend:
         for offset, index in enumerate(self._right_indices):
             self._right_message.motor_cmd[index].q = float(right_command[offset])
 
-        timing_enabled = self._authority_ramp_timing_enabled
-        timing = self._last_publish_timing_ms
+        timing_enabled = getattr(self, "_authority_ramp_timing_enabled", False)
+        timing = getattr(self, "_last_publish_timing_ms", {})
         started_ns = time.monotonic_ns()
-        left_ok = self._left_publisher.Write(self._left_message, timeout=DDS_WRITE_TIMEOUT_S)
-        if timing_enabled:
-            timing["left_write"] = (time.monotonic_ns() - started_ns) / 1e6
+        try:
+            left_ok = self._left_publisher.Write(self._left_message, timeout=DDS_WRITE_TIMEOUT_S)
+        finally:
+            if timing_enabled:
+                timing["left_write"] = (time.monotonic_ns() - started_ns) / 1e6
         if left_ok is not True:
             raise DeploymentError("Left Dex3 DDS Write failed")
         self._left_hand_publish_history.append(PublishedHandTarget(completed_at=time.monotonic(), target=left_target))
         started_ns = time.monotonic_ns()
-        right_ok = self._right_publisher.Write(self._right_message, timeout=DDS_WRITE_TIMEOUT_S)
-        if timing_enabled:
-            timing["right_write"] = (time.monotonic_ns() - started_ns) / 1e6
+        try:
+            right_ok = self._right_publisher.Write(self._right_message, timeout=DDS_WRITE_TIMEOUT_S)
+        finally:
+            if timing_enabled:
+                timing["right_write"] = (time.monotonic_ns() - started_ns) / 1e6
         if right_ok is not True:
             raise DeploymentError("Right Dex3 DDS Write failed")
         self._right_hand_publish_history.append(PublishedHandTarget(completed_at=time.monotonic(), target=right_target))
@@ -1477,7 +1947,7 @@ class _G1Dex3CommandBackend:
             raise DeploymentError("; ".join(failures))
 
     def publish(self) -> None:
-        timing_enabled = self._authority_ramp_timing_enabled
+        timing_enabled = getattr(self, "_authority_ramp_timing_enabled", False)
         if timing_enabled:
             self._last_publish_timing_ms = {}
         started_ns = time.monotonic_ns()
@@ -1612,13 +2082,14 @@ def _status(status_queue: MpQueue, kind: str, payload: Any = None) -> None:
         pass
 
 
-def _status_nonblocking(status_queue: MpQueue, kind: str, payload: Any = None) -> None:
+def _status_nonblocking(status_queue: MpQueue, kind: str, payload: Any = None) -> bool:
     """Best-effort diagnostic status that must never delay the control loop."""
 
     try:
         status_queue.put_nowait((kind, payload))
     except queue.Full:
-        pass
+        return False
+    return True
 
 
 def _observe_hand_freshness(
@@ -2206,8 +2677,13 @@ def _actuator_main(
     urgent_hold_event: Any | None = None,
     command_conditioning: str = "none",
     authority_ramp_diagnostics: bool = False,
+    dds_hold_diagnostics: bool = False,
+    run_log_dir: str | None = None,
 ) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if run_log_dir is not None:
+        configure_process_logging(Path(run_log_dir) / "actuator.log")
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if threading.current_thread() is threading.main_thread():
 
         def stop_on_signal(_signum: int, _frame: object) -> None:
@@ -2231,9 +2707,64 @@ def _actuator_main(
     conditioner: XrPolicyOutputConditioner | None = None
     hand_watchdog = HandTrackingWatchdog()
     hand_freshness_gate = HandStateFreshnessGate()
+    dds_hold_timing: DdsHoldTimingAccumulator | None = None
+    active_timing: ActiveTimingRing | None = None
+    active_timing_snapshot: dict[str, Any] | None = None
+    active_timing_capture_error: str | None = None
+    active_timing_trigger: str | None = None
+    active_timing_error: str | None = None
+    active_fault_trigger: str | None = None
+    timing_dump_errors: list[str] = []
+    timing_dump_dropped = 0
+    timing_dump_requests: queue.Queue[
+        tuple[
+            ActiveTimingRing,
+            str,
+            str | None,
+            tuple[np.ndarray, np.ndarray, np.ndarray],
+        ]
+        | None
+    ] | None = None
+    timing_dump_thread: threading.Thread | None = None
+
+    if run_log_dir is not None:
+        timing_dump_requests = queue.Queue(maxsize=4)
+
+        def timing_dump_worker() -> None:
+            assert timing_dump_requests is not None
+            while True:
+                request = timing_dump_requests.get()
+                try:
+                    if request is None:
+                        return
+                    ring, trigger, error, targets = request
+                    payload = ring.snapshot(
+                        trigger=trigger,
+                        error=error,
+                        backend=None,
+                        command_conditioning=command_conditioning,
+                        target_snapshot=targets,
+                    )
+                    path = diagnostic_json_path(run_log_dir, trigger)
+                    write_json(path, payload)
+                    LOGGER.warning("ACTIVE_TIMING_DUMP=%s", path)
+                except BaseException as diagnostic_exc:
+                    timing_dump_errors.append(
+                        "Asynchronous active timing dump failed: "
+                        f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
+                    )
+                finally:
+                    timing_dump_requests.task_done()
+
+        timing_dump_thread = threading.Thread(
+            target=timing_dump_worker,
+            name="groot-active-timing-writer",
+            daemon=True,
+        )
+        timing_dump_thread.start()
     try:
         backend = _G1Dex3CommandBackend(simulation, network_interface)
-        backend._authority_ramp_timing_enabled = authority_ramp_diagnostics
+        backend._authority_ramp_timing_enabled = authority_ramp_diagnostics or dds_hold_diagnostics
         if command_conditioning == "xr":
             conditioner = XrPolicyOutputConditioner()
         _status(status_queue, "ready")
@@ -2279,6 +2810,9 @@ def _actuator_main(
 
         period = 1.0 / PUBLISH_HZ
         action_period = 1.0 / CONTROL_HZ
+        if dds_hold_diagnostics:
+            dds_hold_timing = DdsHoldTimingAccumulator(period_s=period)
+            _status(status_queue, "dds_hold_timing_started")
 
         # Initialization is a mandatory state transition.  Until the parent
         # requests it, hold the measured target while keeping every watchdog
@@ -2358,7 +2892,9 @@ def _actuator_main(
                 _status(status_queue, "initialized", initialization.mode)
                 break
 
+            state_lookup_started = time.monotonic_ns()
             state = backend.state()
+            state_lookup_ms = (time.monotonic_ns() - state_lookup_started) / 1e6
             now = time.monotonic()
             freshness = _observe_hand_freshness(
                 hand_freshness_gate,
@@ -2366,29 +2902,37 @@ def _actuator_main(
                 status_queue,
                 context="pre-initialization hold",
             )
-            if not freshness.ready:
+            if dds_hold_timing is not None:
+                dds_hold_timing.note_freshness(freshness)
+            if freshness.ready:
+                if freshness.recovered:
+                    _set_direct_target(
+                        backend,
+                        conditioner,
+                        hand_watchdog,
+                        state.arm,
+                        backend._left_target,
+                        backend._right_target,
+                    )
+                    tracking_checks_after = now
+                if now >= tracking_checks_after:
+                    _enforce_tracking(
+                        backend,
+                        state,
+                        hand_watchdog,
+                        context="pre-initialization hold",
+                    )
+            try:
                 backend.publish()
-                elapsed = time.monotonic() - loop_started
-                stop_event.wait(max(0.0, period - elapsed))
-                continue
-            if freshness.recovered:
-                _set_direct_target(
-                    backend,
-                    conditioner,
-                    hand_watchdog,
-                    state.arm,
-                    backend._left_target,
-                    backend._right_target,
-                )
-                tracking_checks_after = now
-            if now >= tracking_checks_after:
-                _enforce_tracking(
-                    backend,
-                    state,
-                    hand_watchdog,
-                    context="pre-initialization hold",
-                )
-            backend.publish()
+            finally:
+                if dds_hold_timing is not None:
+                    dds_hold_timing.record(
+                        loop_started=loop_started,
+                        state_lookup_ms=state_lookup_ms,
+                        state=state,
+                        publish_timing_ms=backend._last_publish_timing_ms,
+                        completed_at=time.monotonic(),
+                    )
             elapsed = time.monotonic() - loop_started
             stop_event.wait(max(0.0, period - elapsed))
         else:
@@ -2402,18 +2946,76 @@ def _actuator_main(
         rtc_mode = False
         rtc_total_actions = 0
         rtc_action_budget = 0
+        last_discontinued_sequence: int | None = None
+        pending_replan_detail: dict[str, Any] | None = None
+        replan_last_loop_started: float | None = None
+        replan_stable_samples = 0
         urgent_hold_active = False
         paused_sync_sequence: int | None = None
+        active_timing = ActiveTimingRing()
+        # Per-DDS-stage monotonic timers are enabled only after initialization,
+        # where the active policy loop needs them. They add no file I/O to the
+        # 100 Hz path; records remain in the bounded in-memory ring.
+        backend._authority_ramp_timing_enabled = True
+
+        def publish_active() -> None:
+            publish_started_ns = time.monotonic_ns()
+            try:
+                backend.publish()
+            finally:
+                assert active_timing is not None
+                timing_ms = dict(getattr(backend, "_last_publish_timing_ms", {}))
+                timing_ms["publish_total"] = (time.monotonic_ns() - publish_started_ns) / 1e6
+                active_timing.note_publish(timing_ms)
+
+        def wait_active(loop_started: float) -> None:
+            assert active_timing is not None
+            elapsed = time.monotonic() - loop_started
+            active_timing.wait(stop_event, requested_s=max(0.0, period - elapsed))
 
         while not stop_event.is_set():
             loop_started = time.monotonic()
-            if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
+            replan_loop_gap_s = (
+                None
+                if replan_last_loop_started is None
+                else loop_started - replan_last_loop_started
+            )
+            if pending_replan_detail is not None:
+                replan_last_loop_started = loop_started
+            active_timing.begin(
+                loop_started=loop_started,
+                heartbeat_age_s=None,
+                sequence=chunk_sequence,
+                action_index=chunk_index,
+                chunk_length=None if chunk is None else chunk.length,
+                rtc=rtc_mode,
+                rtc_total_actions=rtc_total_actions,
+                rtc_action_budget=rtc_action_budget,
+                holding=holding,
+            )
+            heartbeat_started_ns = time.monotonic_ns()
+            heartbeat_age_s = _heartbeat_age(heartbeat)
+            active_timing.update(
+                heartbeat_age_ms=max(0.0, heartbeat_age_s) * 1e3,
+                heartbeat_lookup_ms=(time.monotonic_ns() - heartbeat_started_ns) / 1e6,
+            )
+            if heartbeat_age_s > HEARTBEAT_TIMEOUT_S:
                 raise DeploymentError("Parent heartbeat expired")
 
             # Sample freshness before reading a queued plan or advancing the
             # 30 Hz scheduler.  A short Dex3 gap therefore cannot consume an
             # action that was never written.
-            state = backend.state()
+            state_lookup_started = time.monotonic_ns()
+            try:
+                state = backend.state()
+            finally:
+                state_lookup_ms = (time.monotonic_ns() - state_lookup_started) / 1e6
+                active_timing.update(state_lookup_ms=state_lookup_ms)
+            active_timing.note_state(
+                state,
+                completed_at=time.monotonic(),
+                lookup_ms=state_lookup_ms,
+            )
             freshness = _observe_hand_freshness(
                 hand_freshness_gate,
                 state,
@@ -2423,6 +3025,7 @@ def _actuator_main(
                     f"rtc={rtc_mode} holding={holding}"
                 ),
             )
+            active_timing.note_freshness(freshness)
             if freshness.entered:
                 had_sync_motion = chunk is not None and not rtc_mode
                 had_rtc_motion = chunk is not None and rtc_mode
@@ -2476,9 +3079,8 @@ def _actuator_main(
                             urgent_hold_active = False
                             _status(status_queue, "urgent_holding", last_sequence)
                             break
-                backend.publish()
-                elapsed = time.monotonic() - loop_started
-                stop_event.wait(max(0.0, period - elapsed))
+                publish_active()
+                wait_active(loop_started)
                 continue
 
             if freshness.recovered:
@@ -2504,17 +3106,48 @@ def _actuator_main(
                 if paused_sync_sequence is not None:
                     _status(status_queue, "holding", paused_sync_sequence)
                     paused_sync_sequence = None
-                backend.publish()
-                elapsed = time.monotonic() - loop_started
-                stop_event.wait(max(0.0, period - elapsed))
+                publish_active()
+                wait_active(loop_started)
                 continue
 
+            if pending_replan_detail is not None:
+                if (
+                    replan_loop_gap_s is not None
+                    and replan_loop_gap_s <= ACTION_REPLAN_RECOVERY_MAX_LOOP_GAP_S
+                ):
+                    replan_stable_samples += 1
+                else:
+                    replan_stable_samples = 0
+                if replan_stable_samples >= ACTION_REPLAN_RECOVERY_SAMPLES:
+                    pending_replan_detail["recovery_samples"] = replan_stable_samples
+                    if _status_nonblocking(
+                        status_queue,
+                        "replan_required",
+                        pending_replan_detail,
+                    ):
+                        pending_replan_detail = None
+                        replan_last_loop_started = None
+                        replan_stable_samples = 0
+                if pending_replan_detail is not None:
+                    # Do not accept or advance any policy work until the
+                    # publisher loop has demonstrated stable timing and the
+                    # parent has been notified that a fresh request is valid.
+                    publish_active()
+                    wait_active(loop_started)
+                    continue
+
+            queue_get_started_ns = time.monotonic_ns()
             try:
                 command = command_queue.get_nowait()
             except queue.Empty:
                 command = None
+            finally:
+                active_timing.update(
+                    command_queue_get_ms=(time.monotonic_ns() - queue_get_started_ns) / 1e6,
+                )
             if command is not None:
                 kind = command[0] if isinstance(command, tuple) and command else None
+                active_timing.start_command(kind)
                 if kind == "urgent_hold_barrier":
                     if command != ("urgent_hold_barrier",):
                         raise DeploymentError("Malformed urgent STOP barrier")
@@ -2648,6 +3281,16 @@ def _actuator_main(
                         or not isinstance(expected_sequence, int)
                         or expected_sequence != chunk_sequence
                     ):
+                        if expected_sequence == last_discontinued_sequence:
+                            _status_nonblocking(
+                                status_queue,
+                                "rtc_obsolete",
+                                {
+                                    "operation": "snapshot",
+                                    "sequence": expected_sequence,
+                                },
+                            )
+                            continue
                         _status(status_queue, "rtc_rejected", "snapshot has no matching active plan")
                         continue
                     if chunk_index >= chunk.length:
@@ -2738,6 +3381,16 @@ def _actuator_main(
                         right,
                         expected_horizon,
                     ) = command
+                    if not rtc_mode and expected_sequence == last_discontinued_sequence:
+                        _status_nonblocking(
+                            status_queue,
+                            "rtc_obsolete",
+                            {
+                                "operation": "replace",
+                                "sequence": expected_sequence,
+                            },
+                        )
+                        continue
                     if rtc_mode and rtc_total_actions >= rtc_action_budget:
                         state = backend.state()
                         _set_direct_target(
@@ -2929,6 +3582,8 @@ def _actuator_main(
                     last_sequence = sequence
                     holding = False
 
+                active_timing.finish_command()
+
             # This is deliberately checked after accepting any queued plan, but
             # before advancing its next 30 Hz target.  An operator stop can
             # therefore cancel synchronous and RTC motion without racing an
@@ -2963,27 +3618,125 @@ def _actuator_main(
                         now=now,
                         context=f"powered STOP sequence={last_sequence}",
                     )
-                backend.publish()
-                elapsed = time.monotonic() - loop_started
-                stop_event.wait(max(0.0, period - elapsed))
+                publish_active()
+                wait_active(loop_started)
                 continue
 
             now = time.monotonic()
             if chunk is not None and now >= next_action_at:
+                scheduler_lateness_s = now - next_action_at
+                scheduler_replan_threshold_s = min(
+                    MAX_ACTION_LATENESS_S,
+                    ACTION_REPLAN_LATENESS_S,
+                )
+                active_timing.update(
+                    scheduler_due=True,
+                    scheduler_lateness_ms=scheduler_lateness_s * 1e3,
+                    sequence=chunk_sequence,
+                    next_action_index=chunk_index,
+                    chunk_length=chunk.length,
+                    rtc=rtc_mode,
+                    rtc_total_actions=rtc_total_actions,
+                    rtc_action_budget=rtc_action_budget,
+                    holding=holding,
+                )
                 if chunk_index < chunk.length:
-                    if now - next_action_at > MAX_ACTION_LATENESS_S:
-                        raise DeploymentError(f"Action scheduler is {now - next_action_at:.3f}s late")
+                    if scheduler_lateness_s >= scheduler_replan_threshold_s:
+                        replan_detail = {
+                            "sequence": int(chunk_sequence),
+                            "action_index": int(chunk_index),
+                            "chunk_length": int(chunk.length),
+                            "discarded_actions": int(chunk.length - chunk_index),
+                            "lateness_s": float(scheduler_lateness_s),
+                            "threshold_s": float(scheduler_replan_threshold_s),
+                            "rtc": bool(rtc_mode),
+                            "rtc_total_actions": int(rtc_total_actions),
+                            "rtc_action_budget": int(rtc_action_budget),
+                        }
+                        active_timing.update(event="action_scheduler_replan")
+                        active_timing.finish(completed_at=time.monotonic())
+                        replan_timing = active_timing
+                        frozen_arm = backend._arm_target.copy()
+                        frozen_left = backend._left_target.copy()
+                        frozen_right = backend._right_target.copy()
+                        _set_direct_target(
+                            backend,
+                            conditioner,
+                            hand_watchdog,
+                            frozen_arm,
+                            frozen_left,
+                            frozen_right,
+                        )
+                        last_discontinued_sequence = int(chunk_sequence)
+                        chunk = None
+                        chunk_index = 0
+                        next_action_at = 0.0
+                        rtc_mode = False
+                        rtc_total_actions = 0
+                        rtc_action_budget = 0
+                        # This is a transparent replan-idle state, not the
+                        # operator's measured-pose HOLD.  Continue publishing
+                        # the exact last command until a fresh plan arrives.
+                        holding = False
+                        pending_replan_detail = replan_detail
+                        replan_last_loop_started = loop_started
+                        replan_stable_samples = 0
+                        if timing_dump_requests is None:
+                            LOGGER.warning(
+                                "ACTIVE_TIMING_DUMP unavailable because no run log directory was configured; "
+                                "trigger=action_scheduler_replan retained=%d total=%d",
+                                len(replan_timing._records),
+                                replan_timing._total,
+                            )
+                        else:
+                            try:
+                                timing_dump_requests.put_nowait(
+                                    (
+                                        replan_timing,
+                                        "action_scheduler_replan",
+                                        None,
+                                        (
+                                            frozen_arm.copy(),
+                                            frozen_left.copy(),
+                                            frozen_right.copy(),
+                                        ),
+                                    )
+                                )
+                            except queue.Full:
+                                timing_dump_dropped += 1
+                        active_timing = ActiveTimingRing()
+                        publish_active()
+                        wait_active(loop_started)
+                        continue
+                    if scheduler_lateness_s * 1e3 > ACTIVE_TIMING_SLOW_LATENESS_MS[0]:
+                        active_timing.update(event="action_scheduler_slow")
+                    raw_arm = chunk.arm[chunk_index]
+                    raw_left = chunk.left_hand[chunk_index]
+                    raw_right = chunk.right_hand[chunk_index]
+                    raw_arm_step_rad = float(np.max(np.abs(raw_arm - backend._arm_target)))
+                    raw_left_step_rad = float(np.max(np.abs(raw_left - backend._left_target)))
+                    raw_right_step_rad = float(np.max(np.abs(raw_right - backend._right_target)))
+                    active_timing.update(
+                        raw_arm_step_rad=raw_arm_step_rad,
+                        raw_left_step_rad=raw_left_step_rad,
+                        raw_right_step_rad=raw_right_step_rad,
+                    )
                     if conditioner is None:
                         backend.set_target(
-                            chunk.arm[chunk_index],
-                            chunk.left_hand[chunk_index],
-                            chunk.right_hand[chunk_index],
+                            raw_arm,
+                            raw_left,
+                            raw_right,
+                        )
+                        active_timing.update(
+                            conditioned_arm_step_rad=raw_arm_step_rad,
+                            conditioned_left_step_rad=raw_left_step_rad,
+                            conditioned_right_step_rad=raw_right_step_rad,
                         )
                     else:
                         conditioner.set_desired(
-                            chunk.arm[chunk_index],
-                            chunk.left_hand[chunk_index],
-                            chunk.right_hand[chunk_index],
+                            raw_arm,
+                            raw_left,
+                            raw_right,
                             now=now,
                         )
                     chunk_index += 1
@@ -3035,47 +3788,92 @@ def _actuator_main(
                 # only below, so a fresh policy step is not misreported as servo lag.
                 desired_left = None if conditioner is None else conditioner._desired_left
                 desired_right = None if conditioner is None else conditioner._desired_right
-                _enforce_tracking(
-                    backend,
-                    state,
-                    hand_watchdog,
-                    now=now,
-                    context=(
-                        f"active sequence={chunk_sequence} next_action_index={chunk_index} "
-                        f"rtc={rtc_mode} holding={holding}"
-                    ),
-                    desired_left=desired_left,
-                    desired_right=desired_right,
-                )
+                tracking_started = time.monotonic_ns()
+                try:
+                    active_timing.update(
+                        tracking_arm_error_rad=float(np.max(np.abs(state.arm - backend._arm_target))),
+                        tracking_left_error_rad=float(np.max(np.abs(state.left_hand - backend._left_target))),
+                        tracking_right_error_rad=float(np.max(np.abs(state.right_hand - backend._right_target))),
+                    )
+                    _enforce_tracking(
+                        backend,
+                        state,
+                        hand_watchdog,
+                        now=now,
+                        context=(
+                            f"active sequence={chunk_sequence} next_action_index={chunk_index} "
+                            f"rtc={rtc_mode} holding={holding}"
+                        ),
+                        desired_left=desired_left,
+                        desired_right=desired_right,
+                    )
+                finally:
+                    active_timing.update(tracking_ms=(time.monotonic_ns() - tracking_started) / 1e6)
 
             if conditioner is not None and not holding:
-                conditioned = conditioner.next_command(
-                    state.arm,
-                    backend._arm_target,
-                    backend._left_target,
-                    backend._right_target,
-                    now=now,
-                )
+                conditioner_started = time.monotonic_ns()
+                previous_arm = backend._arm_target.copy()
+                previous_left = backend._left_target.copy()
+                previous_right = backend._right_target.copy()
+                try:
+                    conditioned = conditioner.next_command(
+                        state.arm,
+                        backend._arm_target,
+                        backend._left_target,
+                        backend._right_target,
+                        now=now,
+                    )
+                finally:
+                    active_timing.update(conditioner_ms=(time.monotonic_ns() - conditioner_started) / 1e6)
                 backend.set_target(
                     conditioned.arm[0],
                     conditioned.left_hand[0],
                     conditioned.right_hand[0],
                 )
+                active_timing.update(
+                    conditioned_arm_step_rad=float(np.max(np.abs(conditioned.arm[0] - previous_arm))),
+                    conditioned_left_step_rad=float(np.max(np.abs(conditioned.left_hand[0] - previous_left))),
+                    conditioned_right_step_rad=float(np.max(np.abs(conditioned.right_hand[0] - previous_right))),
+                )
 
-            backend.publish()
-            elapsed = time.monotonic() - loop_started
-            stop_event.wait(max(0.0, period - elapsed))
+            publish_active()
+            wait_active(loop_started)
     except BaseException as exc:
+        if active_timing is not None:
+            active_timing_trigger = active_fault_trigger or "active_fault"
+            active_timing_error = f"{type(exc).__name__}: {exc}"
+            try:
+                active_timing.fault(exc, event=active_timing_trigger)
+            except BaseException as diagnostic_exc:
+                active_timing_capture_error = (
+                    "Could not freeze active timing after actuator fault: "
+                    f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
+                )
         _status(status_queue, "fault", f"{type(exc).__name__}: {exc}")
     finally:
-        release_ok = backend is None
+        if active_timing is not None and active_timing_trigger is None:
+            active_timing_trigger = "orderly_shutdown"
+            try:
+                active_timing.finish(completed_at=time.monotonic())
+            except BaseException as diagnostic_exc:
+                active_timing_capture_error = (
+                    "Could not freeze active timing during orderly shutdown: "
+                    f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
+                )
+        dds_hold_completed_at = time.monotonic() if dds_hold_timing is not None else None
+        cleanup_reporting_errors: list[str] = []
+
+        def cleanup_status(kind: str, payload: Any = None) -> None:
+            try:
+                _status(status_queue, kind, payload)
+            except BaseException as status_exc:
+                cleanup_reporting_errors.append(
+                    f"status {kind!r} failed: {type(status_exc).__name__}: {status_exc}"
+                )
+
         if backend is not None:
             def cleanup_phase(event: str, payload: dict[str, Any]) -> None:
-                _status(
-                    status_queue,
-                    "cleanup_phase",
-                    {"event": event, **payload},
-                )
+                cleanup_status("cleanup_phase", {"event": event, **payload})
 
             cleanup_phase(
                 "cleanup_begin",
@@ -3087,20 +3885,93 @@ def _actuator_main(
                 else:
                     # Focused fake backends predate structured cleanup phases.
                     backend.release()
-                release_ok = True
-                _status(status_queue, "release_complete")
             except BaseException as exc:
-                _status(status_queue, "release_failed", f"{type(exc).__name__}: {exc}")
+                cleanup_status("release_failed", f"{type(exc).__name__}: {exc}")
+            else:
+                cleanup_status("release_complete")
             cleanup_phase("backend_close_begin", {})
             try:
                 backend.close()
             except BaseException as exc:
-                _status(status_queue, "close_failed", f"{type(exc).__name__}: {exc}")
+                cleanup_status("close_failed", f"{type(exc).__name__}: {exc}")
             else:
                 cleanup_phase("backend_close_complete", {})
-        elif release_ok:
-            _status(status_queue, "release_complete", "no backend was constructed")
-        _status(status_queue, "stopped")
+        else:
+            cleanup_status("release_complete", "no backend was constructed")
+
+        # Everything below is post-release diagnostics. No logging or status
+        # serialization above is allowed to bypass backend release/close.
+        if timing_dump_requests is not None and timing_dump_thread is not None:
+            try:
+                timing_dump_requests.put(None, timeout=5.0)
+                timing_dump_thread.join(timeout=5.0)
+                if timing_dump_thread.is_alive():
+                    timing_dump_errors.append("Active timing writer did not stop within 5 seconds")
+            except BaseException as diagnostic_exc:
+                timing_dump_errors.append(
+                    "Could not stop active timing writer: "
+                    f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
+                )
+        if timing_dump_dropped:
+            timing_dump_errors.append(
+                f"Dropped {timing_dump_dropped} active timing dump request(s) because the writer queue was full"
+            )
+        dds_hold_timing_summary: dict[str, Any] | None = None
+        if dds_hold_timing is not None:
+            try:
+                dds_hold_timing_summary = dds_hold_timing.summary(completed_at=dds_hold_completed_at)
+            except BaseException as diagnostic_exc:
+                message = (
+                    "Could not summarize DDS HOLD timing: "
+                    f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
+                )
+                active_timing_capture_error = (
+                    message
+                    if active_timing_capture_error is None
+                    else f"{active_timing_capture_error}; {message}"
+                )
+        if dds_hold_timing_summary is not None:
+            cleanup_status("dds_hold_timing", dds_hold_timing_summary)
+        try:
+            if active_timing is not None and active_timing_trigger is not None:
+                active_timing_snapshot = active_timing.snapshot(
+                    trigger=active_timing_trigger,
+                    error=active_timing_error,
+                    backend=backend,
+                    command_conditioning=command_conditioning,
+                )
+            if active_timing_snapshot is not None:
+                if run_log_dir is None:
+                    LOGGER.warning(
+                        "ACTIVE_TIMING_DUMP unavailable because no run log directory was configured; "
+                        "trigger=%s retained=%s total=%s",
+                        active_timing_snapshot["trigger"],
+                        active_timing_snapshot["retained_records"],
+                        active_timing_snapshot["total_records"],
+                    )
+                else:
+                    timing_path = diagnostic_json_path(run_log_dir, str(active_timing_snapshot["trigger"]))
+                    write_json(timing_path, active_timing_snapshot)
+                    LOGGER.warning("ACTIVE_TIMING_DUMP=%s", timing_path)
+            if active_timing_capture_error is not None:
+                LOGGER.error("%s", active_timing_capture_error)
+            for timing_error in timing_dump_errors:
+                LOGGER.error("%s", timing_error)
+            for reporting_error in cleanup_reporting_errors:
+                LOGGER.error("Cleanup reporting error after release: %s", reporting_error)
+        except BaseException as diagnostic_exc:
+            # Release/close has already completed. Diagnostic persistence must
+            # never suppress the terminal stopped acknowledgment.
+            try:
+                LOGGER.error(
+                    "Post-release diagnostic persistence failed: %s: %s",
+                    type(diagnostic_exc).__name__,
+                    diagnostic_exc,
+                )
+            except BaseException:
+                pass
+        finally:
+            _status(status_queue, "stopped")
 
 
 class SafeG1Dex3Actuator:
@@ -3112,6 +3983,8 @@ class SafeG1Dex3Actuator:
         network_interface: str | None,
         command_conditioning: str = "none",
         authority_ramp_diagnostics: bool = False,
+        dds_hold_diagnostics: bool = False,
+        run_log_dir: str | None = None,
     ):
         if command_conditioning not in COMMAND_CONDITIONING_MODES:
             raise DeploymentError(f"Unknown command conditioning mode {command_conditioning!r}")
@@ -3131,8 +4004,8 @@ class SafeG1Dex3Actuator:
             self._urgent_hold_event,
             command_conditioning,
         )
-        if authority_ramp_diagnostics:
-            process_args += (True,)
+        if authority_ramp_diagnostics or dds_hold_diagnostics or run_log_dir is not None:
+            process_args += (authority_ramp_diagnostics, dds_hold_diagnostics, run_log_dir)
         self._process = context.Process(
             target=_actuator_main,
             args=process_args,
@@ -3148,9 +4021,12 @@ class SafeG1Dex3Actuator:
         self._pending_sequence: int | None = None
         self._rtc_active = False
         self._rtc_terminal: tuple[str, Any] | None = None
+        self._last_replan_detail: dict[str, Any] | None = None
         self._command_conditioning = command_conditioning
         self._authority_ramp_diagnostics = authority_ramp_diagnostics
         self._last_authority_ramp_timing: dict[str, Any] | None = None
+        self._dds_hold_diagnostics = dds_hold_diagnostics
+        self._last_dds_hold_timing: dict[str, Any] | None = None
         self._control_lock = threading.Lock()
         self._immediate_hold_requested = threading.Event()
         self._immediate_release_requested = threading.Event()
@@ -3182,7 +4058,62 @@ class SafeG1Dex3Actuator:
         if kind == "release_complete":
             self._release_completed = True
             return True
+        if kind == "dds_hold_timing":
+            self._last_dds_hold_timing = value
+            return True
+        if kind == "dds_hold_timing_started":
+            return True
+        if kind == "rtc_obsolete":
+            LOGGER.info("Discarded obsolete RTC control message after scheduler replan: %s", value)
+            return True
         return False
+
+    def _accept_replan_status(
+        self,
+        value: Any,
+        *,
+        expected_sequence: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Accept one sequence-qualified scheduler replan terminal event."""
+
+        if not isinstance(value, dict):
+            raise DeploymentError("Actuator returned malformed scheduler replan detail")
+        sequence = value.get("sequence")
+        if isinstance(sequence, bool) or not isinstance(sequence, int):
+            raise DeploymentError("Actuator scheduler replan has no valid sequence")
+        target_sequence = self._pending_sequence if expected_sequence is None else expected_sequence
+        if target_sequence is None:
+            if sequence <= self._sequence:
+                # A duplicated terminal status from an already fenced plan may
+                # arrive after its replacement started.  Never clear the newer
+                # generation.
+                return None
+            raise DeploymentError(
+                f"Unexpected scheduler replan sequence {sequence}; no plan is pending"
+            )
+        if sequence != target_sequence:
+            if sequence < target_sequence:
+                return None
+            raise DeploymentError(
+                f"Scheduler replan sequence {sequence} does not match pending {target_sequence}"
+            )
+        self._last_replan_detail = dict(value)
+        self._chunk_in_flight = False
+        self._pending_sequence = None
+        self._rtc_active = False
+        self._rtc_terminal = None
+        # The child is publishing the last successfully commanded target, but
+        # this is not the operator's measured-pose HOLD state.
+        self._holding = False
+        return self._last_replan_detail
+
+    @property
+    def last_replan_detail(self) -> dict[str, Any] | None:
+        return None if self._last_replan_detail is None else dict(self._last_replan_detail)
+
+    @property
+    def last_dds_hold_timing(self) -> dict[str, Any] | None:
+        return self._last_dds_hold_timing
 
     def _wait_for_hand_feedback(self) -> None:
         """Do not enqueue new motion while the child is in a soft hand pause."""
@@ -3212,6 +4143,11 @@ class SafeG1Dex3Actuator:
                 continue
             if kind == "fault":
                 raise DeploymentError(f"Actuator fault: {value}")
+            if kind == "replan_required":
+                detail = self._accept_replan_status(value)
+                if detail is not None:
+                    raise RtcTerminalEvent("replan", detail)
+                continue
             if kind in {"hand_state_pause", "hand_state_recovered"}:
                 self._record_auxiliary_status(kind, value)
                 if kind == expected and (payload is None or value == payload):
@@ -3329,6 +4265,10 @@ class SafeG1Dex3Actuator:
                     self._rtc_terminal = ("complete", value)
                 elif kind in {"rtc_underrun", "rtc_rejected"}:
                     self._rtc_terminal = ("hold", value)
+                elif kind == "replan_required":
+                    detail = self._accept_replan_status(value)
+                    if detail is not None:
+                        self._rtc_terminal = ("replan", detail)
         except queue.Empty:
             pass
         if issue is not None:
@@ -3545,6 +4485,11 @@ class SafeG1Dex3Actuator:
                     continue
                 if kind == "fault":
                     raise DeploymentError(f"Actuator fault: {value}")
+                if kind == "replan_required":
+                    detail = self._accept_replan_status(value)
+                    if detail is not None:
+                        event = ("replan", detail)
+                    continue
                 if kind == "release_failed":
                     raise DeploymentError(f"Actuator release failed: {value}")
                 if kind == "close_failed":
@@ -3564,7 +4509,7 @@ class SafeG1Dex3Actuator:
             self._chunk_in_flight = False
             self._pending_sequence = None
             self._rtc_active = False
-            self._holding = True
+            self._holding = event[0] != "replan"
         if not self._process.is_alive():
             if self._immediate_release_requested.is_set():
                 raise ImmediateControlEvent("release")
@@ -3655,6 +4600,11 @@ class SafeG1Dex3Actuator:
                 continue
             if kind == "fault":
                 raise DeploymentError(f"Actuator fault: {value}")
+            if kind == "replan_required":
+                detail = self._accept_replan_status(value, expected_sequence=sequence)
+                if detail is not None:
+                    return "replan"
+                continue
             if kind == "release_failed":
                 raise DeploymentError(f"Actuator release failed: {value}")
             if kind == "close_failed":

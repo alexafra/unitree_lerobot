@@ -42,6 +42,11 @@ from unitree_lerobot.eval_robot.groot_contract import (
     validate_model_contract,
     validate_policy_metadata,
 )
+from unitree_lerobot.eval_robot.run_logging import (
+    configure_process_logging,
+    create_run_directory,
+    write_json,
+)
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     G1Dex3StateReader,
     ImmediateControlEvent,
@@ -1263,7 +1268,9 @@ def _run_active_goal_controlled(
 ) -> str:
     """Run one finite goal; return ``hold``, ``release``, or ``complete``."""
 
-    for chunk_number in range(1, args.max_chunks + 1):
+    completed_chunks = 0
+    remaining_action_budget = args.execution_horizon * args.max_chunks
+    while remaining_action_budget > 0:
         action = _active_command_action(_poll_active_command(terminal))
         if action == "hold":
             _finish_operator_stop(actuator)
@@ -1273,13 +1280,14 @@ def _run_active_goal_controlled(
             LOGGER.warning("Operator requested orderly authority release")
             return "release"
 
+        request_horizon = min(args.execution_horizon, remaining_action_budget)
         chunk, inference_s = infer_chunk(
             policy,
             state_reader,
             camera,
             instruction,
             contract,
-            args.execution_horizon,
+            request_horizon,
             actuator,
             command_conditioning=getattr(args, "command_conditioning", "xr"),
             show_camera=getattr(args, "show_camera", False),
@@ -1309,9 +1317,32 @@ def _run_active_goal_controlled(
         if completion == "release":
             LOGGER.warning("Operator requested immediate orderly authority release")
             return "release"
+        if completion == "replan":
+            detail = getattr(actuator, "last_replan_detail", None)
+            if not isinstance(detail, dict):
+                detail = {}
+            LOGGER.warning(
+                "AUTOMATIC REPLAN after scheduler discontinuity during goal %r: sequence=%s action=%s "
+                "lateness=%.3fs; discarded %s stale actions and refetching from a fresh observation "
+                "without entering operator HOLD",
+                task_name,
+                detail.get("sequence", sequence),
+                detail.get("action_index", "?"),
+                float(detail.get("lateness_s", 0.0)),
+                detail.get("discarded_actions", "?"),
+                extra={"terminal_yellow": True},
+            )
+            executed_before_gap = max(0, int(detail.get("action_index", 0)))
+            remaining_action_budget = max(0, remaining_action_budget - executed_before_gap)
+            if remaining_action_budget == 0:
+                return "complete"
+            policy.reset()
+            continue
+        completed_chunks += 1
+        remaining_action_budget = max(0, remaining_action_budget - chunk.length)
         LOGGER.info(
             "Completed live chunk %d/%d for %r (%d actions, inference %.3fs)",
-            chunk_number,
+            completed_chunks,
             args.max_chunks,
             task_name,
             chunk.length,
@@ -1386,18 +1417,44 @@ def _run_active_goal_rtc(
 ) -> str:
     with _OperatorTerminal(actuator) as terminal:
         try:
-            outcome = _run_active_goal_rtc_controlled(
-                policy,
-                state_reader,
-                camera,
-                actuator,
-                task_name,
-                instruction,
-                contract,
-                args,
-                terminal,
-                allow_custom_instruction=allow_custom_instruction,
-            )
+            remaining_action_budget = args.execution_horizon * args.max_chunks
+            while True:
+                outcome = _run_active_goal_rtc_controlled(
+                    policy,
+                    state_reader,
+                    camera,
+                    actuator,
+                    task_name,
+                    instruction,
+                    contract,
+                    args,
+                    terminal,
+                    allow_custom_instruction=allow_custom_instruction,
+                    action_budget_override=remaining_action_budget,
+                )
+                if outcome != "replan":
+                    break
+                detail = getattr(actuator, "last_replan_detail", None)
+                if not isinstance(detail, dict):
+                    detail = {}
+                consumed = int(detail.get("rtc_total_actions", detail.get("action_index", 0)))
+                remaining_action_budget = max(0, remaining_action_budget - max(0, consumed))
+                LOGGER.warning(
+                    "AUTOMATIC RTC REPLAN after scheduler discontinuity during goal %r: sequence=%s action=%s "
+                    "lateness=%.3fs; discarded %s stale actions and refetching a fresh plan "
+                    "without entering operator HOLD (remaining action budget=%d)",
+                    task_name,
+                    detail.get("sequence", "?"),
+                    detail.get("action_index", "?"),
+                    float(detail.get("lateness_s", 0.0)),
+                    detail.get("discarded_actions", "?"),
+                    remaining_action_budget,
+                    extra={"terminal_yellow": True},
+                )
+                if remaining_action_budget == 0:
+                    outcome = "complete"
+                    break
+                policy.reset()
         except OperatorStop:
             _finish_operator_stop(actuator)
             LOGGER.warning("Goal %r STOPPED; pending RTC result will be discarded", task_name)
@@ -1433,6 +1490,7 @@ def _run_active_goal_rtc_controlled(
     terminal: _OperatorTerminal,
     *,
     allow_custom_instruction: bool,
+    action_budget_override: int | None = None,
 ) -> str:
     """Run child-timed asynchronous RTC while the main thread services safety."""
 
@@ -1455,7 +1513,11 @@ def _run_active_goal_rtc_controlled(
     if initial_command == "release":
         LOGGER.warning("Operator requested immediate orderly authority release during RTC")
         return "release"
-    action_budget = args.execution_horizon * args.max_chunks
+    action_budget = (
+        args.execution_horizon * args.max_chunks
+        if action_budget_override is None
+        else int(action_budget_override)
+    )
     current_sequence = actuator.start_rtc(plan, action_budget=action_budget)
     current_plan = plan
     # Store the post-capture part of recent delays. Each request adds its own
@@ -1504,6 +1566,9 @@ def _run_active_goal_rtc_controlled(
                         handoff_count,
                     )
                     return "complete"
+                if outcome == "replan":
+                    _drain_rtc_worker(worker, actuator)
+                    return "replan"
                 LOGGER.error("RTC plan underrun/rejection; child entered powered HOLD: %s", detail)
                 _drain_rtc_worker(worker, actuator)
                 return "hold"
@@ -1544,6 +1609,9 @@ def _run_active_goal_rtc_controlled(
                     if exc.outcome == "hold":
                         _drain_rtc_worker(worker, actuator)
                         return "hold"
+                    if exc.outcome == "replan":
+                        _drain_rtc_worker(worker, actuator)
+                        return "replan"
                     return "complete"
                 except ImmediateControlEvent:
                     raise
@@ -1576,6 +1644,9 @@ def _run_active_goal_rtc_controlled(
                     if exc.outcome == "hold":
                         _drain_rtc_worker(worker, actuator)
                         return "hold"
+                    if exc.outcome == "replan":
+                        _drain_rtc_worker(worker, actuator)
+                        return "replan"
                     return "complete"
                 if snapshot.sequence != current_sequence:
                     actuator.hold()
@@ -1602,6 +1673,9 @@ def _run_active_goal_rtc_controlled(
                         if exc.outcome == "hold":
                             _drain_rtc_worker(worker, actuator)
                             return "hold"
+                        if exc.outcome == "replan":
+                            _drain_rtc_worker(worker, actuator)
+                            return "replan"
                         return "complete"
                     if (
                         post_capture_snapshot.sequence != current_sequence
@@ -2006,11 +2080,17 @@ def run(args: argparse.Namespace) -> None:
             return
 
         confirm_actuation(args.sim, task_name, instruction)
-        actuator = SafeG1Dex3Actuator(
+        actuator_args = (
             args.sim,
             args.network_interface,
             getattr(args, "command_conditioning", "xr"),
         )
+        run_log_dir = getattr(args, "_run_log_dir", None)
+        if run_log_dir is None:
+            # Keep direct library callers and existing test doubles compatible.
+            actuator = SafeG1Dex3Actuator(*actuator_args)
+        else:
+            actuator = SafeG1Dex3Actuator(*actuator_args, run_log_dir=run_log_dir)
         _run_blocking_motion_with_immediate_release(actuator, actuator.start)
         _run_blocking_motion_with_immediate_release(actuator, actuator.arm)
         LOGGER.warning("%s COMMAND MODE ARMED", "SIMULATION" if args.sim else "REAL ROBOT")
@@ -2195,14 +2275,48 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Assert that no physical robot network is reachable during IsaacLab actuation",
     )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=Path("logs"),
+        metavar="DIR",
+        help=(
+            "Root directory for a new per-run log folder (default: ./logs). "
+            "Each run records parent.log, run.json, actuator.log when actuation starts, "
+            "and bounded active-loop timing JSON diagnostics."
+        ),
+    )
     return parser
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    args = build_parser().parse_args()
+    try:
+        run_log_dir = create_run_directory(args.log_dir)
+        configure_process_logging(run_log_dir / "parent.log")
+        args._run_log_dir = str(run_log_dir)
+        manifest_args = {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+            if not key.startswith("_")
+        }
+        write_json(
+            run_log_dir / "run.json",
+            {
+                "schema_version": 1,
+                "argv": list(sys.argv),
+                "arguments": manifest_args,
+                "launch_cwd": str(Path.cwd()),
+                "pid": os.getpid(),
+                "python": sys.version,
+                "run_log_dir": str(run_log_dir),
+            },
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        print(f"Could not create the run log directory: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+    LOGGER.info("RUN_LOG_DIR=%s", run_log_dir)
+    LOGGER.info("RUN_START cwd=%s argv=%r arguments=%r", Path.cwd(), sys.argv, manifest_args)
 
     def stop_on_signal(_signum: int, _frame: object) -> None:
         raise KeyboardInterrupt
@@ -2212,7 +2326,7 @@ def main() -> None:
         if signum is not None:
             signal.signal(signum, stop_on_signal)
     try:
-        run(build_parser().parse_args())
+        run(args)
     except OperatorRelease:
         LOGGER.warning("Operator requested orderly command-authority release")
     except KeyboardInterrupt:
