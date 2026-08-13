@@ -101,7 +101,7 @@ class SplitReaderDeadlineTests(unittest.TestCase):
         reader._rejected_zero_hand_frames = {"left": 0, "right": 0}
         return reader
 
-    def test_arm_remains_hard_at_75ms_while_hand_is_soft_to_250ms(self):
+    def test_arm_remains_hard_at_75ms_while_hand_uses_configured_deadline(self):
         now = 100.0
         reader = self._reader(now)
         reader._updated_at["left"] = now - 0.10
@@ -123,13 +123,16 @@ class SplitReaderDeadlineTests(unittest.TestCase):
             reader.latest()
 
         reader._updated_at["arm"] = now
-        reader._updated_at["left"] = now - 0.251
+        reader._updated_at["left"] = now - (ACTUATOR_HAND_STATE_MAX_AGE_S + 0.001)
         with (
             mock.patch(
                 "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.time.monotonic",
                 return_value=now,
             ),
-            self.assertRaisesRegex(TimeoutError, r"left .*0\.250s"),
+            self.assertRaisesRegex(
+                TimeoutError,
+                rf"left .*{ACTUATOR_HAND_STATE_MAX_AGE_S:.3f}s",
+            ),
         ):
             reader.latest()
 
@@ -143,7 +146,10 @@ class ReleaseSchedulerTests(unittest.TestCase):
         backend._weight = 0.0
         arm_weights: list[float] = []
         phases: list[str] = []
-        backend._publish_arm = lambda require_qualified_state=False: arm_weights.append(backend._weight)
+        # Release deliberately bypasses live gravity computation and reuses the
+        # last successfully published q/tau pair.  This scheduler test stubs
+        # that release-only write rather than the normal gravity-aware writer.
+        backend._publish_last_arm_for_release = lambda: arm_weights.append(backend._weight)
         backend._stop_hands = lambda callback=None: (
             callback("left_hand_stop_begin", {}) if callback is not None else None,
             callback("left_hand_stop_end", {}) if callback is not None else None,

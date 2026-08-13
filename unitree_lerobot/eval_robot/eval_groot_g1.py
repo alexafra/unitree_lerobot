@@ -57,14 +57,19 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     TeleimagerCamera,
     initialize_dds,
 )
+from unitree_lerobot.eval_robot.training_start_pose import (
+    TRAINING_START_SOURCE,
+    training_start_spec,
+)
 from unitree_lerobot.utils.depth_encoding import DEPTH_OUTPUT_KEY
 from unitree_lerobot.utils.surface_normal_encoding import SURFACE_NORMAL_OUTPUT_KEY
 
 
 LOGGER = logging.getLogger("eval_groot_g1")
 LOCAL_POLICY_HOSTS = {"127.0.0.1", "localhost"}
-OPERATOR_CONFIRMATION_TIMEOUT_S = 60.0
+OPERATOR_CONFIRMATION_TIMEOUT_S = 180.0
 ALT_ESCAPE_WINDOW_S = 0.1
+GOAL_MODE_TOGGLE = "\t"
 PREVIEW_WINDOWS = (
     "GR00T input: ego_view",
     f"GR00T input: {DEPTH_OUTPUT_KEY}",
@@ -456,8 +461,8 @@ def confirm_custom_goal(instruction: str) -> None:
         raise DeploymentError("Custom goal was not confirmed")
 
 
-def resolve_runtime_goal(response: str) -> tuple[str, str]:
-    """Resolve a held-session goal without weakening custom-language confirmation."""
+def resolve_runtime_goal(response: str) -> tuple[str, str] | None:
+    """Resolve only an allowlisted goal from the powered-HOLD task menu."""
 
     value = response.strip()
     if value in TASKS:
@@ -471,7 +476,7 @@ def resolve_runtime_goal(response: str) -> tuple[str, str]:
     for task_name, instruction in TASKS.items():
         if value == instruction:
             return task_name, instruction
-    return select_instruction(None, value)
+    return None
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -565,6 +570,7 @@ def _readline_while_armed(
     *,
     timeout_s: float | None,
     confirmation_mode: bool = False,
+    goal_mode_toggle: bool = False,
 ) -> str:
     """Read a terminal line while continuously servicing the actuator watchdog."""
 
@@ -575,6 +581,7 @@ def _readline_while_armed(
             prompt,
             deadline,
             confirmation_mode=confirmation_mode,
+            goal_mode_toggle=goal_mode_toggle,
         )
     LOGGER.warning("stdin is not a TTY; armed input is line-buffered and immediate keys are unavailable")
     print(prompt, end="", flush=True)
@@ -593,10 +600,12 @@ def _readline_while_armed(
             raise DeploymentError("Armed input requires an interactive stdin terminal") from exc
         if not readable:
             continue
-        response = sys.stdin.readline()
-        if response == "":
+        raw_response = sys.stdin.readline()
+        if raw_response == "":
             raise DeploymentError("stdin closed while command authority was active")
-        response = response.strip()
+        if goal_mode_toggle and raw_response.rstrip("\r\n") == GOAL_MODE_TOGGLE:
+            return GOAL_MODE_TOGGLE
+        response = raw_response.strip()
         if not confirmation_mode:
             return response
         lowered = response.lower()
@@ -615,6 +624,7 @@ def _readline_with_immediate_prompt_controls(
     deadline: float | None,
     *,
     confirmation_mode: bool = False,
+    goal_mode_toggle: bool = False,
 ) -> str:
     """Read an armed line while keeping the physical Q key fail-safe.
 
@@ -682,6 +692,11 @@ def _readline_with_immediate_prompt_controls(
                 actuator.request_immediate_release()
                 print()
                 return "q"
+            if goal_mode_toggle and value == b"\t":
+                # Tab cannot occur in a validated custom goal. Treat it as an
+                # immediate mode switch and discard any partially typed line.
+                print()
+                return GOAL_MODE_TOGGLE
             if confirmation_mode and value in {b"r", b"R"}:
                 print()
                 return "continue"
@@ -791,19 +806,45 @@ def _poll_active_command(terminal: _OperatorTerminal | None = None) -> str | Non
 
 def _select_next_goal_while_holding(
     actuator: SafeG1Dex3Actuator,
+    *,
+    custom_goal_mode: bool = False,
+    mode_state: dict[str, bool] | None = None,
 ) -> tuple[str, str] | None:
-    """Wait in powered hold until a new goal or an orderly release request."""
+    """Wait in powered hold, with an explicit trained/custom goal-mode toggle."""
 
     print(
         "\nSTOPPED IN A POWERED POSITION HOLD. GR00T requests are stopped.\n"
-        "Enter a trained task ID/number/exact instruction, or arbitrary custom goal text.\n"
         "Press q or Q to release immediately (no Enter); Alt-q types q and "
         "Alt-Shift-q types Q. Press uppercase S to remain stopped. Ctrl-C also releases."
     )
-    for index, (task_name, instruction) in enumerate(TASKS.items(), start=1):
-        print(f"  {index}. {task_name:16s}  {instruction}")
+
+    def show_mode() -> None:
+        if custom_goal_mode:
+            print(
+                "\nCUSTOM GOAL MODE (outside the exact trained-task allowlist).\n"
+                "Enter custom goal text, then explicitly confirm it. "
+                "Press Tab to return to trained-task options."
+            )
+            return
+        print("\nTRAINED TASK MODE. Press Tab to enable custom-goal entry.")
+        for index, (task_name, instruction) in enumerate(TASKS.items(), start=1):
+            print(f"  {index}. {task_name:16s}  {instruction}")
+
+    show_mode()
     while True:
-        response = _readline_while_armed(actuator, "Next goal> ", timeout_s=None)
+        prompt = "Custom goal> " if custom_goal_mode else "Trained task> "
+        response = _readline_while_armed(
+            actuator,
+            prompt,
+            timeout_s=None,
+            goal_mode_toggle=True,
+        )
+        if response == GOAL_MODE_TOGGLE:
+            custom_goal_mode = not custom_goal_mode
+            if mode_state is not None:
+                mode_state["custom_goal_mode"] = custom_goal_mode
+            show_mode()
+            continue
         lowered = response.lower()
         if lowered in EXIT_COMMANDS:
             return None
@@ -812,9 +853,22 @@ def _select_next_goal_while_holding(
                 _finish_operator_stop(actuator)
             LOGGER.info("Already stopped; no GR00T request was sent")
             continue
-        task_name, instruction = resolve_runtime_goal(response)
-        if task_name != "custom-goal":
-            return task_name, instruction
+
+        if not custom_goal_mode:
+            resolved = resolve_runtime_goal(response)
+            if resolved is not None:
+                return resolved
+            LOGGER.warning(
+                "Input %r is not a trained task; remaining in HOLD. Press Tab to enable custom goals.",
+                response,
+            )
+            continue
+
+        try:
+            task_name, instruction = select_instruction(None, response)
+        except DeploymentError as exc:
+            LOGGER.warning("Invalid custom goal; remaining in powered HOLD: %s", exc)
+            continue
 
         LOGGER.warning(
             "Proposed next goal is not an exact trained instruction: %r",
@@ -826,11 +880,18 @@ def _select_next_goal_while_holding(
         )
         confirmation = _readline_while_armed(
             actuator,
-            "Type YES to send this custom goal to GR00T (anything else keeps HOLD): ",
+            "Type YES to send this custom goal, or press Tab for trained tasks: ",
             timeout_s=OPERATOR_CONFIRMATION_TIMEOUT_S,
+            goal_mode_toggle=True,
         )
         if confirmation == "YES":
             return task_name, instruction
+        if confirmation == GOAL_MODE_TOGGLE:
+            custom_goal_mode = False
+            if mode_state is not None:
+                mode_state["custom_goal_mode"] = False
+            show_mode()
+            continue
         if confirmation.lower() in EXIT_COMMANDS:
             return None
         if confirmation.lower() in STOP_COMMANDS:
@@ -840,22 +901,33 @@ def _select_next_goal_while_holding(
         LOGGER.warning("Custom goal rejected; remaining in powered hold")
 
 
-def confirm_initialization(actuator: SafeG1Dex3Actuator, spec: InitializationSpec) -> None:
+def confirm_initialization(
+    actuator: SafeG1Dex3Actuator,
+    spec: InitializationSpec,
+    *,
+    stage: str = "INITIALIZE",
+) -> None:
     if not spec.moves:
         return
     warning = (
-        f"\nINITIALIZATION WILL MOVE THE ROBOT using {spec.label!r}. "
+        f"\n{stage} WILL MOVE THE ROBOT using {spec.label!r}. "
         "The path is a slow bounded joint-space interpolation, not collision-aware planning. "
         "Keep the workspace clear and remain on the emergency stop."
     )
     if spec.mode == "xr-home":
         warning += " XR-home targets all 14 arm joints and both 7-joint Dex3 hands to zero; both hands must be empty."
+    elif stage == "WARMUP1":
+        warning += (
+            " Warmup1 commands all 14 arms and both 7-joint hands from one recorded "
+            "cereal-box-pick frame. Both hands must be empty. It does not reproduce the "
+            "recorded legs, waist, pelvis height, or world pose."
+        )
     elif spec.moves_hands:
         warning += " This pose explicitly moves one or both hands; verify their contents."
     _confirm_while_armed(
         actuator,
         warning,
-        "INITIALIZE",
+        stage,
         stop_is_already_held=True,
     )
 
@@ -863,7 +935,7 @@ def confirm_initialization(actuator: SafeG1Dex3Actuator, spec: InitializationSpe
 def confirm_policy_start(actuator: SafeG1Dex3Actuator, spec: InitializationSpec) -> None:
     _confirm_while_armed(
         actuator,
-        f"\nInitialization {spec.label!r} converged. Visually verify robot and scene state. "
+        f"\nStartup pose {spec.label!r} converged. Visually verify robot and scene state. "
         "The discarded preflight will not be reused; RUN starts with policy reset and a fresh observation.",
         "RUN",
     )
@@ -898,17 +970,17 @@ def _confirm_goal_transition(
 def confirm_policy_warm_start(actuator: SafeG1Dex3Actuator, delta_summary: str) -> str:
     return _confirm_goal_transition(
         actuator,
-        "\nPOLICY WARM-START WILL MOVE THE ROBOT to the first target from a fresh policy "
+        "\nWARMUP2 WILL MOVE THE ROBOT to the first target from a fresh policy "
         f"inference ({delta_summary}). The transition is rate-bounded but is joint-space only "
         "and not collision-aware. The inferred chunk will be discarded afterward.",
-        "WARMUP",
+        "WARMUP2",
     )
 
 
 def confirm_policy_continue(actuator: SafeG1Dex3Actuator) -> str:
     return _confirm_goal_transition(
         actuator,
-        "\nPolicy warm-start converged. Visually verify the robot and scene. CONTINUE resets "
+        "\nWarmup2 converged. Visually verify the robot and scene. CONTINUE resets "
         "GR00T, captures a fresh observation, and restores normal action-step limits.",
         "CONTINUE",
     )
@@ -1112,12 +1184,15 @@ def _prepare_policy_goal(
     args: argparse.Namespace,
     *,
     allow_custom_instruction: bool,
+    warmup2_enabled: bool | None = None,
 ) -> str:
     """Reset a goal session and optionally perform its guarded warm-start."""
 
     try:
         _run_with_immediate_operator_keys(actuator, policy.reset)
-        if not getattr(args, "policy_warm_start", False):
+        if warmup2_enabled is None:
+            warmup2_enabled = bool(getattr(args, "policy_warm_start", True))
+        if not warmup2_enabled:
             return "ready"
 
         warm_start_chunk, inference_s = _run_with_immediate_operator_keys(
@@ -1145,7 +1220,7 @@ def _prepare_policy_goal(
     except OperatorRelease:
         return "release"
     LOGGER.warning(
-        "Fresh policy warm-start target inferred in %.3fs: %s",
+        "Warmup2 first target inferred in %.3fs: %s",
         inference_s,
         delta_summary,
     )
@@ -1156,7 +1231,7 @@ def _prepare_policy_goal(
         actuator,
         lambda: actuator.warm_start(warm_start_chunk),
     )
-    LOGGER.warning("Policy warm-start reached the first target; inferred chunk discarded")
+    LOGGER.warning("Warmup2 reached target 0; the inferred chunk was discarded")
     decision = confirm_policy_continue(actuator)
     if decision in {"hold", "release"}:
         return decision
@@ -1923,11 +1998,13 @@ def run(args: argparse.Namespace) -> None:
             instruction,
         )
         confirm_custom_goal(instruction)
-    initialization = load_initialization_spec(
+    configured_initialization = load_initialization_spec(
         getattr(args, "initialization", "measured"),
         task_name=task_name,
         pose_file=getattr(args, "initial_pose_file", None),
     )
+    warmup1_enabled = bool(getattr(args, "warmup1", False))
+    warmup1 = training_start_spec() if warmup1_enabled else None
     image_host = args.image_host or ("127.0.0.1" if args.sim else "192.168.123.164")
 
     policy: Gr00tClient | None = None
@@ -2027,7 +2104,11 @@ def run(args: argparse.Namespace) -> None:
         # Complete one observation -> server -> validated action pass while no
         # command publisher exists.  This output is deliberately discarded.
         policy.reset()
-        preflight_validation = args.actuate and not (initialization.moves or getattr(args, "policy_warm_start", False))
+        preflight_validation = args.actuate and not (
+            configured_initialization.moves
+            or warmup1 is not None
+            or getattr(args, "policy_warm_start", True)
+        )
         if inference_mode == "rtc":
             preflight, inference_s = infer_plan(
                 policy,
@@ -2124,34 +2205,68 @@ def run(args: argparse.Namespace) -> None:
             args.network_interface,
             getattr(args, "command_conditioning", "xr"),
         )
+        # Parsed CLI namespaces always carry this value.  Direct library
+        # callers with older hand-built Namespaces retain the actuator's
+        # default-on behavior without changing their constructor call shape.
+        actuator_kwargs = {}
+        if hasattr(args, "gravity_feedforward"):
+            actuator_kwargs["gravity_feedforward"] = args.gravity_feedforward
         run_log_dir = getattr(args, "_run_log_dir", None)
         if run_log_dir is None:
             # Keep direct library callers and existing test doubles compatible.
-            actuator = SafeG1Dex3Actuator(*actuator_args)
+            actuator = SafeG1Dex3Actuator(*actuator_args, **actuator_kwargs)
         else:
-            actuator = SafeG1Dex3Actuator(*actuator_args, run_log_dir=run_log_dir)
+            actuator = SafeG1Dex3Actuator(
+                *actuator_args,
+                run_log_dir=run_log_dir,
+                **actuator_kwargs,
+            )
         _run_blocking_motion_with_immediate_release(actuator, actuator.start)
         _run_blocking_motion_with_immediate_release(actuator, actuator.arm)
         LOGGER.warning("%s COMMAND MODE ARMED", "SIMULATION" if args.sim else "REAL ROBOT")
 
-        confirm_initialization(actuator, initialization)
+        confirm_initialization(actuator, configured_initialization)
         _run_blocking_motion_with_immediate_release(
             actuator,
-            lambda: actuator.initialize(initialization),
+            lambda: actuator.initialize(configured_initialization),
         )
-        LOGGER.warning("Initialization completed: %s", initialization.label)
-        confirm_policy_start(actuator, initialization)
+        LOGGER.warning("Initialization completed: %s", configured_initialization.label)
+        if warmup1_enabled:
+            assert warmup1 is not None
+            confirm_initialization(actuator, warmup1, stage="WARMUP1")
+            _run_blocking_motion_with_immediate_release(
+                actuator,
+                lambda: actuator.warmup_pose(warmup1),
+            )
+            LOGGER.warning(
+                "Warmup1 completed: %s (source episode=%d frame=%d)",
+                warmup1.label,
+                TRAINING_START_SOURCE["episode_index"],
+                TRAINING_START_SOURCE["frame_index"],
+            )
+        confirm_policy_start(
+            actuator,
+            warmup1 if warmup1 is not None else configured_initialization,
+        )
 
         # The publisher-free result predates initialization and is deliberately
-        # discarded. Every initial or replacement goal resets, re-observes,
-        # warm-starts from the held pose, discards that chunk, then resets again.
+        # discarded. Every initial or replacement goal resets and re-observes.
+        # The first and replacement-goal Warmup2 transitions are independently
+        # configurable; neither replacement path repeats initialization/Warmup1.
         if sys.stdin.isatty():
             print(
                 "\nACTIVE GOAL CONTROLS (NO ENTER): press s to STOP in a powered position hold; "
                 "press q to release authority and exit. Ctrl-C also releases from any state."
             )
 
+        first_goal = True
+        custom_goal_mode = allow_custom_instruction
         while True:
+            warmup2_enabled = (
+                bool(getattr(args, "policy_warm_start", True))
+                if first_goal
+                else bool(getattr(args, "future_goal_warmup2", True))
+            )
             preparation = _prepare_policy_goal(
                 policy,
                 state_reader,
@@ -2161,6 +2276,7 @@ def run(args: argparse.Namespace) -> None:
                 contract,
                 args,
                 allow_custom_instruction=allow_custom_instruction,
+                warmup2_enabled=warmup2_enabled,
             )
             if preparation == "release":
                 LOGGER.warning("Operator requested orderly authority release during goal transition")
@@ -2183,12 +2299,21 @@ def run(args: argparse.Namespace) -> None:
             if outcome != "hold":
                 break
 
-            next_goal = _select_next_goal_while_holding(actuator)
+            mode_state = {"custom_goal_mode": custom_goal_mode}
+            next_goal = _select_next_goal_while_holding(
+                actuator,
+                # A run launched with --custom-goal returns to custom mode;
+                # otherwise the operator's last Tab-selected mode persists.
+                custom_goal_mode=custom_goal_mode,
+                mode_state=mode_state,
+            )
+            custom_goal_mode = mode_state["custom_goal_mode"]
             if next_goal is None:
                 LOGGER.warning("Operator requested orderly authority release from HOLD")
                 break
             task_name, instruction = next_goal
             allow_custom_instruction = task_name == "custom-goal"
+            first_goal = False
             LOGGER.warning("Next goal accepted while holding: %r — %s", task_name, instruction)
     finally:
         active_exception = sys.exc_info()[1]
@@ -2260,6 +2385,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--gravity-feedforward",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Publish XR-compatible pose-dependent arm gravity feed-forward torque (default: "
+            "enabled); --no-gravity-feedforward restores zero outgoing arm tau"
+        ),
+    )
+    parser.add_argument(
         "--rtc-frozen-steps",
         type=int,
         help=(
@@ -2278,7 +2412,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="measured",
         help=(
             "Pose before policy execution: preserve measured q (default), target XR's arm+hand "
-            "joint-zero home with guarded motion, or load an experimental reviewed task-bound JSON pose"
+            "joint-zero home with guarded motion, or load an experimental reviewed task-bound JSON pose. "
+            "This stage runs before Warmup1"
         ),
     )
     parser.add_argument(
@@ -2286,12 +2421,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reviewed initialization JSON; required only with --initialization pose-file",
     )
     parser.add_argument(
-        "--policy-warm-start",
+        "--warmup1",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "For actuated runs, smoothly reach one fresh first policy target after RUN, "
-            "discard that chunk, reset/re-observe, then enforce normal limits (default: enabled)"
+            "After initialization, slowly move once to the frozen measured pose from training "
+            "episode 0 frame 0 before policy inference (default: enabled)"
+        ),
+    )
+    parser.add_argument(
+        "--warmup2",
+        "--policy-warm-start",
+        dest="policy_warm_start",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For actuated runs, smoothly reach the first target of one fresh inferred chunk, "
+            "discard that chunk, reset/re-observe, then begin live execution (default: enabled; "
+            "--[no-]policy-warm-start remains a compatibility alias)"
+        ),
+    )
+    parser.add_argument(
+        "--future-goal-warmup2",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For each accepted replacement goal after the first, perform the guarded Warmup2 "
+            "first-target transition before live execution (default: enabled). Initialization "
+            "and Warmup1 are never repeated"
         ),
     )
     parser.add_argument(

@@ -27,10 +27,12 @@ from unitree_lerobot.eval_robot.eval_groot_g1 import (
     _confirm_while_armed,
     _confirm_goal_transition,
     _OperatorTerminal,
+    _prepare_policy_goal,
     _readline_before_authority,
     _readline_while_armed,
     _run_blocking_motion_with_immediate_release,
     _select_next_goal_while_holding,
+    GOAL_MODE_TOGGLE,
     OperatorRelease,
     build_parser,
     confirm_custom_goal,
@@ -111,6 +113,11 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     build_initialization_chunk,
     decode_color_0_rgb,
     request_live_camera_config,
+)
+from unitree_lerobot.eval_robot.training_start_pose import (
+    TRAINING_START_JOINTS_RAD,
+    TRAINING_START_SOURCE,
+    training_start_spec,
 )
 from unitree_lerobot.utils.depth_encoding import encode_depth_gray_rgb
 from unitree_lerobot.utils.surface_normal_encoding import (
@@ -217,14 +224,116 @@ class FakeBackend:
 
 
 class GrootG1DeploymentTests(unittest.TestCase):
-    def test_policy_warm_start_is_default_with_explicit_opt_out(self):
+    def test_both_warmup_stages_are_default_with_independent_explicit_opt_outs(self):
         parser = build_parser()
         defaults = parser.parse_args([])
+        self.assertTrue(defaults.warmup1)
         self.assertTrue(defaults.policy_warm_start)
+        self.assertTrue(defaults.future_goal_warmup2)
         self.assertFalse(defaults.show_camera)
         validate_args(defaults)
+
+        without_warmup1 = parser.parse_args(["--no-warmup1"])
+        self.assertFalse(without_warmup1.warmup1)
+        self.assertTrue(without_warmup1.policy_warm_start)
+
+        without_warmup2 = parser.parse_args(["--no-warmup2"])
+        self.assertTrue(without_warmup2.warmup1)
+        self.assertFalse(without_warmup2.policy_warm_start)
+        self.assertTrue(without_warmup2.future_goal_warmup2)
+
+        without_future_warmup2 = parser.parse_args(["--no-future-goal-warmup2"])
+        self.assertTrue(without_future_warmup2.warmup1)
+        self.assertTrue(without_future_warmup2.policy_warm_start)
+        self.assertFalse(without_future_warmup2.future_goal_warmup2)
+
+        without_either = parser.parse_args(["--no-warmup1", "--no-warmup2"])
+        self.assertFalse(without_either.warmup1)
+        self.assertFalse(without_either.policy_warm_start)
+
+        # Preserve scripts written against the old policy-stage spelling while
+        # making warmup2 the canonical user-facing name.
         self.assertFalse(parser.parse_args(["--no-policy-warm-start"]).policy_warm_start)
         self.assertTrue(parser.parse_args(["--show-camera"]).show_camera)
+
+    def test_skipped_warmup2_still_resets_before_fresh_live_execution(self):
+        resets = []
+        policy = SimpleNamespace(reset=lambda: resets.append("reset"))
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        with (
+            mock.patch(
+                f"{module}._run_with_immediate_operator_keys",
+                side_effect=lambda _actuator, operation: operation(),
+            ),
+            mock.patch(f"{module}.infer_chunk") as infer_chunk_mock,
+        ):
+            result = _prepare_policy_goal(
+                policy,
+                None,
+                None,
+                object(),
+                TASKS["pick-red-cup"],
+                SimpleNamespace(),
+                argparse.Namespace(execution_horizon=8, policy_warm_start=True),
+                allow_custom_instruction=False,
+                warmup2_enabled=False,
+            )
+
+        self.assertEqual(result, "ready")
+        self.assertEqual(resets, ["reset"])
+        infer_chunk_mock.assert_not_called()
+
+    def test_warmup1_can_follow_each_explicit_initialization_mode(self):
+        parser = build_parser()
+        common = ["--actuate", "--sim", "--confirm-sim-network-isolated"]
+
+        xr_home = parser.parse_args([*common, "--initialization", "xr-home"])
+        validate_args(xr_home)
+        self.assertTrue(xr_home.warmup1)
+
+        pose_file_then_warmup1 = parser.parse_args(
+            [
+                *common,
+                "--initialization",
+                "pose-file",
+                "--initial-pose-file",
+                "/tmp/reviewed-pose.json",
+            ]
+        )
+        validate_args(pose_file_then_warmup1)
+        self.assertTrue(pose_file_then_warmup1.warmup1)
+
+        xr_home_without_warmup1 = parser.parse_args(
+            [*common, "--initialization", "xr-home", "--no-warmup1"]
+        )
+        validate_args(xr_home_without_warmup1)
+        self.assertFalse(xr_home_without_warmup1.warmup1)
+
+    def test_warmup1_pose_is_exact_frozen_episode_zero_frame_zero_state(self):
+        self.assertEqual(TRAINING_START_JOINTS_RAD.shape, (28,))
+        self.assertEqual(TRAINING_START_JOINTS_RAD.dtype, np.float64)
+        self.assertFalse(TRAINING_START_JOINTS_RAD.flags.writeable)
+        self.assertEqual(TRAINING_START_SOURCE["episode_index"], 0)
+        self.assertEqual(TRAINING_START_SOURCE["frame_index"], 0)
+        self.assertEqual(TRAINING_START_SOURCE["timestamp_s"], 0.0)
+        self.assertEqual(TRAINING_START_SOURCE["task"], "pick up the cereal box.")
+        self.assertTrue(
+            TRAINING_START_SOURCE["dataset_path"].endswith(
+                "atomic_combined_09_08_And_10_08/train"
+            )
+        )
+
+        spec = training_start_spec()
+        self.assertEqual(spec.mode, "pose-file")
+        self.assertIn("episode 0 frame 0", spec.label)
+        np.testing.assert_array_equal(spec.arm, TRAINING_START_JOINTS_RAD[:14])
+        np.testing.assert_array_equal(spec.left_hand, TRAINING_START_JOINTS_RAD[14:21])
+        np.testing.assert_array_equal(spec.right_hand, TRAINING_START_JOINTS_RAD[21:])
+
+        # Each call returns copies; a caller cannot poison the next physical run.
+        assert spec.arm is not None
+        spec.arm[0] = 0.0
+        self.assertEqual(training_start_spec().arm[0], TRAINING_START_JOINTS_RAD[0])
 
     def test_custom_goal_is_validated_and_mutually_exclusive_with_trained_task(self):
         parser = build_parser()
@@ -306,8 +415,8 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertEqual(MAX_ARM_STEP_RAD, 0.10)
         self.assertEqual(MAX_HAND_STEP_RAD, 0.60)
         self.assertEqual(JOINT_LIMIT_MARGIN_RAD, 0.03)
-        self.assertEqual(HAND_LIMIT_TOLERANCE_RAD, 0.002)
-        self.assertEqual(MEASURED_LIMIT_TOLERANCE_RAD, 0.01)
+        self.assertEqual(HAND_LIMIT_TOLERANCE_RAD, 0.01)
+        self.assertEqual(MEASURED_LIMIT_TOLERANCE_RAD, 0.20)
         self.assertEqual(ARM_RELEASE_RAMP_S, 1.5)
         self.assertEqual(MAX_ARM_DQ_RAD_S, 6.0)
         self.assertEqual(MAX_ARM_TRACKING_ERROR_RAD, 0.35)
@@ -576,10 +685,15 @@ class GrootG1DeploymentTests(unittest.TestCase):
             network_interface=None,
             execution_horizon=1,
             max_chunks=1,
-            initialization="xr-home",
+            initialization="measured",
             initial_pose_file=None,
+            # This test proves --no-warmup1 preserves the measured
+            # initialization path and --no-warmup2 goes directly to live.
+            warmup1=False,
+            policy_warm_start=False,
             sim=True,
             actuate=True,
+            gravity_feedforward=False,
             allow_unqualified_real=False,
             confirm_sim_network_isolated=True,
         )
@@ -592,21 +706,24 @@ class GrootG1DeploymentTests(unittest.TestCase):
             mock.patch(f"{module}.initialize_dds", side_effect=lambda *_args: events.append("dds.init")),
             mock.patch(f"{module}.G1Dex3StateReader", return_value=FakeReader()),
             mock.patch(f"{module}.TeleimagerCamera", return_value=FakeCamera()),
-            mock.patch(f"{module}.SafeG1Dex3Actuator", return_value=FakeActuator()),
+            mock.patch(
+                f"{module}.SafeG1Dex3Actuator", return_value=FakeActuator()
+            ) as actuator_factory,
             mock.patch(f"{module}.infer_chunk", side_effect=fake_infer),
             mock.patch(f"{module}.chunk_delta_summary", return_value="safe"),
             mock.patch(f"{module}.confirm_actuation", side_effect=lambda *_args: events.append("confirm.ACTUATE")),
             mock.patch(
                 f"{module}.confirm_initialization",
-                side_effect=lambda *_args: events.append("confirm.INITIALIZE"),
+                side_effect=lambda *_args, **_kwargs: events.append("confirm.INITIALIZE"),
             ),
             mock.patch(f"{module}.confirm_policy_start", side_effect=lambda *_args: events.append("confirm.RUN")),
         ):
             run_groot(args)
 
         self.assertEqual(events.count("infer:discarded-preflight"), 1)
+        self.assertIs(actuator_factory.call_args.kwargs["gravity_feedforward"], False)
         self.assertEqual(events.count("infer:fresh-live"), 1)
-        self.assertEqual(initial_step_checks, [False, True])
+        self.assertEqual(initial_step_checks, [True, True])
         self.assertNotIn("actuator.submit:discarded-preflight", events)
         ordered = [
             "infer:discarded-preflight",
@@ -614,7 +731,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             "actuator.start",
             "actuator.arm",
             "confirm.INITIALIZE",
-            "actuator.initialize:xr-home",
+            "actuator.initialize:measured",
             "confirm.RUN",
             "policy.reset:2",
             "infer:fresh-live",
@@ -623,9 +740,11 @@ class GrootG1DeploymentTests(unittest.TestCase):
         positions = [events.index(event) for event in ordered]
         self.assertEqual(positions, sorted(positions))
 
-    def test_policy_warm_start_smoothly_reaches_first_target_then_resets_and_reinfers(self):
+    def test_default_warmup1_then_warmup2_then_live_order(self):
         events = []
         initial_step_checks = []
+        initialization_targets = []
+        warmup1_targets = []
         preflight = SimpleNamespace(length=1, name="discarded-preflight")
         warm_start = SimpleNamespace(length=1, name="discarded-warm-start")
         live = SimpleNamespace(length=1, name="fresh-live")
@@ -675,6 +794,11 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
             def initialize(self, spec):
                 events.append(f"actuator.initialize:{spec.mode}")
+                initialization_targets.append(spec)
+
+            def warmup_pose(self, spec):
+                events.append(f"actuator.warmup_pose:{spec.label}")
+                warmup1_targets.append(spec)
 
             def warm_start(self, chunk):
                 events.append(f"actuator.warm_start:{chunk.name}")
@@ -705,8 +829,11 @@ class GrootG1DeploymentTests(unittest.TestCase):
             network_interface=None,
             execution_horizon=1,
             max_chunks=1,
-            initialization="measured",
+            # Deliberately use a moving initialization: Warmup1 is a distinct
+            # second guarded pose transition, not a replacement for xr-home.
+            initialization="xr-home",
             initial_pose_file=None,
+            warmup1=True,
             policy_warm_start=True,
             sim=True,
             actuate=True,
@@ -727,7 +854,10 @@ class GrootG1DeploymentTests(unittest.TestCase):
             mock.patch(f"{module}.chunk_delta_summary", return_value="large first target"),
             mock.patch(f"{module}.confirm_actuation", side_effect=lambda *_args: events.append("confirm.ACTUATE")),
             mock.patch(
-                f"{module}.confirm_initialization", side_effect=lambda *_args: events.append("confirm.INITIALIZE")
+                f"{module}.confirm_initialization",
+                side_effect=lambda *_args, **kwargs: events.append(
+                    f"confirm.{kwargs.get('stage', 'INITIALIZE')}"
+                ),
             ),
             mock.patch(f"{module}.confirm_policy_start", side_effect=lambda *_args: events.append("confirm.RUN")),
             mock.patch(
@@ -741,9 +871,26 @@ class GrootG1DeploymentTests(unittest.TestCase):
             run_groot(args)
 
         self.assertEqual(initial_step_checks, [False, False, True])
+        self.assertEqual(len(initialization_targets), 1)
+        self.assertEqual(initialization_targets[0].mode, "xr-home")
+        np.testing.assert_array_equal(initialization_targets[0].arm, np.zeros(14))
+        self.assertEqual(len(warmup1_targets), 1)
+        np.testing.assert_array_equal(warmup1_targets[0].arm, TRAINING_START_JOINTS_RAD[:14])
+        np.testing.assert_array_equal(
+            warmup1_targets[0].left_hand,
+            TRAINING_START_JOINTS_RAD[14:21],
+        )
+        np.testing.assert_array_equal(
+            warmup1_targets[0].right_hand,
+            TRAINING_START_JOINTS_RAD[21:],
+        )
         self.assertNotIn("actuator.submit:discarded-preflight", events)
         self.assertNotIn("actuator.submit:discarded-warm-start", events)
         ordered = [
+            "confirm.INITIALIZE",
+            "actuator.initialize:xr-home",
+            "confirm.WARMUP1",
+            "actuator.warmup_pose:Warmup1: training episode 0 frame 0 measured pose",
             "confirm.RUN",
             "policy.reset:2",
             "infer:discarded-warm-start",
@@ -760,6 +907,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
     def test_live_runner_holds_then_warm_starts_a_second_goal(self):
         events = []
         initial_step_checks = []
+        goal_mode_calls = []
         chunks = iter(
             SimpleNamespace(length=1, name=name)
             for name in (
@@ -844,6 +992,15 @@ class GrootG1DeploymentTests(unittest.TestCase):
             events.append(f"infer:{chunk.name}")
             return chunk, 0.01
 
+        def fake_select_next_goal(_actuator, *, custom_goal_mode, mode_state):
+            goal_mode_calls.append((custom_goal_mode, mode_state["custom_goal_mode"]))
+            if len(goal_mode_calls) == 1:
+                # The operator enables custom entry but still chooses an exact
+                # trained task. The UI preference must survive that choice.
+                mode_state["custom_goal_mode"] = True
+                return "down-red-cup", TASKS["down-red-cup"]
+            return None
+
         args = argparse.Namespace(
             task="pick-red-cup",
             custom_goal=None,
@@ -856,6 +1013,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             initialization="measured",
             initial_pose_file=None,
             policy_warm_start=True,
+            future_goal_warmup2=True,
             show_camera=False,
             sim=True,
             actuate=True,
@@ -881,11 +1039,11 @@ class GrootG1DeploymentTests(unittest.TestCase):
             mock.patch(f"{module}.confirm_policy_continue"),
             mock.patch(
                 f"{module}._poll_active_command",
-                side_effect=(None, None, "s", None, None, None),
+                side_effect=(None, None, "s", None, None, "s"),
             ),
             mock.patch(
                 f"{module}._select_next_goal_while_holding",
-                return_value=("put-red-cup", TASKS["put-red-cup"]),
+                side_effect=fake_select_next_goal,
             ),
         ):
             run_groot(args)
@@ -911,6 +1069,185 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertNotIn("actuator.submit:discarded-preflight:1", events)
         self.assertNotIn("actuator.submit:pick-warm-start:1", events)
         self.assertNotIn("actuator.submit:put-warm-start:2", events)
+        self.assertEqual(goal_mode_calls, [(False, False), (True, True)])
+
+    def test_live_runner_custom_goal_seeds_custom_next_goal_mode(self):
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        mode_calls = []
+        policy = SimpleNamespace(
+            ping=lambda: True,
+            get_modality_config=lambda: {},
+            get_policy_metadata=lambda: {},
+            reset=lambda: None,
+            close=lambda: None,
+        )
+        reader = SimpleNamespace(close=lambda: None)
+        camera = SimpleNamespace(
+            config={
+                "head_camera": {
+                    "type": "fake",
+                    "image_shape": [480, 640],
+                    "binocular": False,
+                    "fps": 30,
+                }
+            },
+            close=lambda: None,
+        )
+        actuator = SimpleNamespace(
+            start=lambda: None,
+            arm=lambda: None,
+            initialize=lambda _spec: None,
+            close=lambda: None,
+        )
+        args = build_parser().parse_args(
+            [
+                "--custom-goal",
+                "move it somewhere novel",
+                "--actuate",
+                "--sim",
+                "--confirm-sim-network-isolated",
+                "--no-warmup1",
+                "--no-warmup2",
+            ]
+        )
+        contract = SimpleNamespace(
+            action_horizon=16,
+            video_keys=COLOUR_VIDEO_KEYS,
+            requires_depth=False,
+        )
+
+        def select_then_release(_actuator, *, custom_goal_mode, mode_state):
+            mode_calls.append((custom_goal_mode, mode_state["custom_goal_mode"]))
+            return None
+
+        with (
+            mock.patch(f"{module}.confirm_custom_goal"),
+            mock.patch(f"{module}.Gr00tClient", return_value=policy),
+            mock.patch(f"{module}.validate_model_contract", return_value=contract),
+            mock.patch(f"{module}.validate_policy_metadata", return_value=None),
+            mock.patch(f"{module}.initialize_dds"),
+            mock.patch(f"{module}.G1Dex3StateReader", return_value=reader),
+            mock.patch(f"{module}.TeleimagerCamera", return_value=camera),
+            mock.patch(f"{module}.infer_chunk", return_value=(SimpleNamespace(length=1), 0.01)),
+            mock.patch(f"{module}.chunk_delta_summary", return_value="bounded"),
+            mock.patch(f"{module}.confirm_actuation"),
+            mock.patch(f"{module}.SafeG1Dex3Actuator", return_value=actuator),
+            mock.patch(f"{module}.confirm_initialization"),
+            mock.patch(f"{module}.confirm_policy_start"),
+            mock.patch(f"{module}._prepare_policy_goal", return_value="ready"),
+            mock.patch(f"{module}._run_active_goal", return_value="hold"),
+            mock.patch(
+                f"{module}._select_next_goal_while_holding",
+                side_effect=select_then_release,
+            ),
+        ):
+            run_groot(args)
+
+        self.assertEqual(mode_calls, [(True, True)])
+
+    def test_future_goal_warmup2_is_independent_and_startup_stages_run_once(self):
+        events = []
+
+        class FakePolicy:
+            def ping(self):
+                return True
+
+            def get_modality_config(self):
+                return {}
+
+            def get_policy_metadata(self):
+                return {}
+
+            def reset(self):
+                events.append("policy.reset")
+
+            def close(self):
+                events.append("policy.close")
+
+        class FakeReader:
+            def close(self):
+                events.append("reader.close")
+
+        class FakeCamera:
+            config = {
+                "head_camera": {
+                    "type": "fake",
+                    "image_shape": [480, 640],
+                    "binocular": False,
+                    "fps": 30,
+                }
+            }
+
+            def close(self):
+                events.append("camera.close")
+
+        class FakeActuator:
+            def start(self):
+                events.append("actuator.start")
+
+            def arm(self):
+                events.append("actuator.arm")
+
+            def initialize(self, _spec):
+                events.append("actuator.initialize")
+
+            def warmup_pose(self, _spec):
+                events.append("actuator.warmup1")
+
+            def close(self):
+                events.append("actuator.close")
+
+        args = argparse.Namespace(
+            task="pick-red-cup",
+            custom_goal=None,
+            policy_host="127.0.0.1",
+            policy_port=5555,
+            image_host="camera",
+            network_interface=None,
+            execution_horizon=1,
+            max_chunks=1,
+            initialization="measured",
+            initial_pose_file=None,
+            warmup1=True,
+            policy_warm_start=True,
+            future_goal_warmup2=False,
+            show_camera=False,
+            sim=True,
+            actuate=True,
+            allow_unqualified_real=False,
+            confirm_sim_network_isolated=True,
+        )
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        contract = SimpleNamespace(action_horizon=16, video_keys=COLOUR_VIDEO_KEYS, requires_depth=False)
+        preflight = SimpleNamespace(length=1, name="discarded-preflight")
+        with (
+            mock.patch(f"{module}.Gr00tClient", return_value=FakePolicy()),
+            mock.patch(f"{module}.validate_model_contract", return_value=contract),
+            mock.patch(f"{module}.validate_policy_metadata", return_value=None),
+            mock.patch(f"{module}.initialize_dds"),
+            mock.patch(f"{module}.G1Dex3StateReader", return_value=FakeReader()),
+            mock.patch(f"{module}.TeleimagerCamera", return_value=FakeCamera()),
+            mock.patch(f"{module}.SafeG1Dex3Actuator", return_value=FakeActuator()),
+            mock.patch(f"{module}.infer_chunk", return_value=(preflight, 0.01)),
+            mock.patch(f"{module}.chunk_delta_summary", return_value="bounded"),
+            mock.patch(f"{module}.confirm_actuation"),
+            mock.patch(f"{module}.confirm_initialization"),
+            mock.patch(f"{module}.confirm_policy_start"),
+            mock.patch(f"{module}._prepare_policy_goal", side_effect=("ready", "ready")) as prepare,
+            mock.patch(f"{module}._run_active_goal", side_effect=("hold", "complete")),
+            mock.patch(
+                f"{module}._select_next_goal_while_holding",
+                return_value=("down-red-cup", TASKS["down-red-cup"]),
+            ),
+        ):
+            run_groot(args)
+
+        self.assertEqual(
+            [call.kwargs["warmup2_enabled"] for call in prepare.call_args_list],
+            [True, False],
+        )
+        self.assertEqual(events.count("actuator.initialize"), 1)
+        self.assertEqual(events.count("actuator.warmup1"), 1)
 
     def test_shadow_skips_initial_step_validation_for_every_chunk_but_measured_live_keeps_it(self):
         class StopAfterPreflight(Exception):
@@ -962,6 +1299,10 @@ class GrootG1DeploymentTests(unittest.TestCase):
                     max_chunks=max_chunks,
                     initialization=initialization,
                     initial_pose_file=None,
+                    # Preserve this test's measured-initialization premise now
+                    # that both deployment warmups default to enabled.
+                    warmup1=False,
+                    policy_warm_start=False,
                     sim=True,
                     actuate=actuate,
                     allow_unqualified_real=False,
@@ -987,6 +1328,87 @@ class GrootG1DeploymentTests(unittest.TestCase):
                         run_groot(args)
 
                 self.assertEqual(checks, expected_checks)
+
+    def test_parser_default_warmups_remain_passive_in_shadow_mode(self):
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        args = build_parser().parse_args(
+            [
+                "--task",
+                "pick-red-cup",
+                "--policy-host",
+                "127.0.0.1",
+                "--image-host",
+                "camera",
+                "--max-chunks",
+                "1",
+            ]
+        )
+        self.assertTrue(args.warmup1)
+        self.assertTrue(args.policy_warm_start)
+
+        policy = SimpleNamespace(
+            ping=lambda: True,
+            get_modality_config=lambda: {},
+            get_policy_metadata=lambda: {},
+            reset=mock.Mock(),
+            close=mock.Mock(),
+        )
+        reader = SimpleNamespace(close=mock.Mock())
+        camera = SimpleNamespace(
+            config={
+                "head_camera": {
+                    "type": "fake",
+                    "image_shape": [480, 640],
+                    "binocular": False,
+                    "fps": 30,
+                }
+            },
+            close=mock.Mock(),
+        )
+        actuator_factory = mock.Mock()
+        contract = SimpleNamespace(
+            action_horizon=16,
+            video_keys=COLOUR_VIDEO_KEYS,
+            requires_depth=False,
+        )
+        with (
+            mock.patch(f"{module}.Gr00tClient", return_value=policy),
+            mock.patch(f"{module}.validate_model_contract", return_value=contract),
+            mock.patch(f"{module}.validate_policy_metadata", return_value=None),
+            mock.patch(f"{module}.initialize_dds"),
+            mock.patch(f"{module}.G1Dex3StateReader", return_value=reader),
+            mock.patch(f"{module}.TeleimagerCamera", return_value=camera),
+            mock.patch(
+                f"{module}.infer_chunk",
+                return_value=(SimpleNamespace(length=1), 0.01),
+            ) as infer,
+            mock.patch(f"{module}.chunk_delta_summary", return_value="safe"),
+            mock.patch(f"{module}.SafeG1Dex3Actuator", actuator_factory),
+        ):
+            run_groot(args)
+
+        actuator_factory.assert_not_called()
+        self.assertFalse(infer.call_args.kwargs["validate_initial_step"])
+
+    def test_namespace_without_warmup1_preserves_legacy_measured_initialization(self):
+        args = argparse.Namespace(
+            execution_horizon=1,
+            max_chunks=1,
+            actuate=True,
+            sim=True,
+            network_interface=None,
+            confirm_sim_network_isolated=True,
+            allow_unqualified_real=False,
+            policy_host="127.0.0.1",
+            initialization="measured",
+            initial_pose_file=None,
+            inference_mode="synchronous",
+            rtc_frozen_steps=None,
+            rtc_ramp_rate=None,
+            command_conditioning="xr",
+        )
+        self.assertFalse(hasattr(args, "warmup1"))
+        validate_args(args)
 
     def test_actuation_confirmation_uses_r_and_cancels_on_s_or_q(self):
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
@@ -1840,8 +2262,8 @@ class GrootG1DeploymentTests(unittest.TestCase):
             assert_healthy=mock.Mock(),
             hold=mock.Mock(),
         )
-        # Stay in HOLD for an explicit s, reject one custom instruction, then
-        # choose the second trained task by its displayed number.
+        # Stay in HOLD for an explicit s, reject arbitrary text while the
+        # trained-task menu is active, then choose the second displayed task.
         stdin = io.StringIO("s\nmove it somewhere novel\nNO\n2\n")
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
         with (
@@ -1883,6 +2305,171 @@ class GrootG1DeploymentTests(unittest.TestCase):
             self.assertIsNone(_select_next_goal_while_holding(custom_release_actuator))
         self.assertEqual(custom_release_actuator.heartbeat.call_count, 2)
         self.assertEqual(custom_release_actuator.assert_healthy.call_count, 2)
+
+    def test_held_goal_selector_tab_toggles_custom_mode_on_and_back_off(self):
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+
+        custom_actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+        )
+        stdin = io.StringIO(f"{GOAL_MODE_TOGGLE}\nmove it somewhere novel\nYES\n")
+        with (
+            mock.patch.object(sys, "stdin", stdin),
+            mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
+            mock.patch("builtins.print"),
+        ):
+            selected = _select_next_goal_while_holding(custom_actuator)
+
+        self.assertEqual(selected, ("custom-goal", "move it somewhere novel"))
+        self.assertEqual(custom_actuator.heartbeat.call_count, 3)
+        self.assertEqual(custom_actuator.assert_healthy.call_count, 3)
+
+        trained_actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+        )
+        # A custom-seeded selector can return to the allowlisted menu. Once
+        # toggled off, arbitrary text stays rejected and cannot reach GR00T.
+        stdin = io.StringIO(f"{GOAL_MODE_TOGGLE}\nmove it somewhere novel\n1\n")
+        with (
+            mock.patch.object(sys, "stdin", stdin),
+            mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
+            mock.patch("builtins.print"),
+        ):
+            selected = _select_next_goal_while_holding(
+                trained_actuator,
+                custom_goal_mode=True,
+            )
+
+        expected_name = next(iter(TASKS))
+        self.assertEqual(selected, (expected_name, TASKS[expected_name]))
+        self.assertEqual(trained_actuator.heartbeat.call_count, 3)
+        self.assertEqual(trained_actuator.assert_healthy.call_count, 3)
+
+    def test_held_goal_selector_reports_tab_mode_for_persistence(self):
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        mode_state = {"custom_goal_mode": False}
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+        )
+        stdin = io.StringIO(f"{GOAL_MODE_TOGGLE}\nmove it somewhere novel\nYES\n")
+        with (
+            mock.patch.object(sys, "stdin", stdin),
+            mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
+            mock.patch("builtins.print"),
+        ):
+            selected = _select_next_goal_while_holding(
+                actuator,
+                custom_goal_mode=False,
+                mode_state=mode_state,
+            )
+
+        self.assertEqual(selected, ("custom-goal", "move it somewhere novel"))
+        self.assertEqual(mode_state, {"custom_goal_mode": True})
+
+        # The persisted preference, not the last selected task type, seeds the
+        # next powered-HOLD prompt and can be toggled back independently.
+        stdin = io.StringIO(f"{GOAL_MODE_TOGGLE}\n1\n")
+        with (
+            mock.patch.object(sys, "stdin", stdin),
+            mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
+            mock.patch("builtins.print"),
+        ):
+            selected = _select_next_goal_while_holding(
+                actuator,
+                custom_goal_mode=mode_state["custom_goal_mode"],
+                mode_state=mode_state,
+            )
+
+        expected_name = next(iter(TASKS))
+        self.assertEqual(selected, (expected_name, TASKS[expected_name]))
+        self.assertEqual(mode_state, {"custom_goal_mode": False})
+
+    def test_held_goal_selector_preserves_release_and_powered_stop_in_both_modes(self):
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        for custom_goal_mode in (False, True):
+            with self.subTest(custom_goal_mode=custom_goal_mode, command="q"):
+                actuator = SimpleNamespace(
+                    heartbeat=mock.Mock(),
+                    assert_healthy=mock.Mock(),
+                    hold=mock.Mock(),
+                )
+                stdin = io.StringIO("q\n")
+                with (
+                    mock.patch.object(sys, "stdin", stdin),
+                    mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
+                    mock.patch("builtins.print"),
+                ):
+                    self.assertIsNone(
+                        _select_next_goal_while_holding(
+                            actuator,
+                            custom_goal_mode=custom_goal_mode,
+                        )
+                    )
+                actuator.hold.assert_not_called()
+
+            with self.subTest(custom_goal_mode=custom_goal_mode, command="S"):
+                actuator = SimpleNamespace(
+                    heartbeat=mock.Mock(),
+                    assert_healthy=mock.Mock(),
+                    hold=mock.Mock(),
+                )
+                # S is idempotent powered STOP. Tab makes the following task
+                # selection deterministic regardless of the seeded mode.
+                stdin = io.StringIO(f"S\n{GOAL_MODE_TOGGLE}\n1\n" if custom_goal_mode else "S\n1\n")
+                with (
+                    mock.patch.object(sys, "stdin", stdin),
+                    mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
+                    mock.patch("builtins.print"),
+                ):
+                    selected = _select_next_goal_while_holding(
+                        actuator,
+                        custom_goal_mode=custom_goal_mode,
+                    )
+                expected_name = next(iter(TASKS))
+                self.assertEqual(selected, (expected_name, TASKS[expected_name]))
+                actuator.hold.assert_called_once_with()
+
+    def test_goal_mode_tab_is_immediate_without_enter_and_restores_tty(self):
+        master_fd, slave_fd = pty.openpty()
+        stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+        original = termios.tcgetattr(slave_fd)
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(),
+            request_immediate_hold=mock.Mock(),
+            request_immediate_release=mock.Mock(),
+        )
+
+        def write_tab_when_prompt_is_ready(*args, **_kwargs):
+            if args and args[0] == "Trained task> ":
+                os.write(master_fd, b"\t")
+
+        try:
+            with (
+                mock.patch.object(sys, "stdin", stdin),
+                mock.patch("builtins.print", side_effect=write_tab_when_prompt_is_ready),
+            ):
+                started_at = time.monotonic()
+                response = _readline_while_armed(
+                    actuator,
+                    "Trained task> ",
+                    timeout_s=1.0,
+                    goal_mode_toggle=True,
+                )
+                elapsed = time.monotonic() - started_at
+
+            self.assertEqual(response, GOAL_MODE_TOGGLE)
+            self.assertLess(elapsed, 0.25)
+            actuator.request_immediate_hold.assert_not_called()
+            actuator.request_immediate_release.assert_not_called()
+            self.assertEqual(termios.tcgetattr(slave_fd), original)
+        finally:
+            stdin.close()
+            os.close(master_fd)
+            os.close(slave_fd)
 
     def test_serializer_is_compatible_with_gr00t_server(self):
         try:
@@ -3061,6 +3648,49 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
         self.assertTrue(actuator._command_queue.empty())
 
+    def test_parent_guarded_warmup_pose_requires_and_preserves_hold(self):
+        actuator = object.__new__(SafeG1Dex3Actuator)
+        actuator._initialized = True
+        actuator._holding = True
+        actuator._chunk_in_flight = False
+        actuator._command_queue = queue.Queue(maxsize=1)
+        spec = training_start_spec()
+
+        with (
+            mock.patch.object(actuator, "_wait_for_hand_feedback") as hand_feedback,
+            mock.patch.object(actuator, "heartbeat") as heartbeat,
+            mock.patch.object(actuator, "_wait_status") as wait_status,
+        ):
+            actuator.warmup_pose(spec)
+
+        kind, created_at, queued_spec = actuator._command_queue.get_nowait()
+        self.assertEqual(kind, "warmup_pose")
+        self.assertLessEqual(time.monotonic() - created_at, 0.1)
+        self.assertIs(queued_spec, spec)
+        hand_feedback.assert_called_once_with()
+        heartbeat.assert_called_once_with()
+        wait_status.assert_called_once()
+        self.assertEqual(wait_status.call_args.args[0], "warmup_pose_completed")
+        self.assertEqual(wait_status.call_args.kwargs["payload"], spec.label)
+        self.assertTrue(actuator._holding)
+
+        for initialized, holding, in_flight in (
+            (False, True, False),
+            (True, False, False),
+            (True, True, True),
+        ):
+            with self.subTest(
+                initialized=initialized,
+                holding=holding,
+                in_flight=in_flight,
+            ):
+                actuator._initialized = initialized
+                actuator._holding = holding
+                actuator._chunk_in_flight = in_flight
+                with self.assertRaisesRegex(DeploymentError, "initialized HOLD"):
+                    actuator.warmup_pose(spec)
+                self.assertTrue(actuator._command_queue.empty())
+
     def test_parent_hold_is_acknowledged_idempotent_and_forbidden_during_a_chunk(self):
         actuator = object.__new__(SafeG1Dex3Actuator)
         actuator._initialized = True
@@ -3193,7 +3823,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         # close() reads this exact cache before draining any remaining statuses.
         self.assertTrue(actuator._stopped_acknowledged)
 
-    def test_child_reports_initializing_then_initialized_before_accepting_actions(self):
+    def test_child_orders_initialization_guarded_warmup_pose_then_policy_warmup(self):
         commands = queue.Queue(maxsize=1)
         statuses = queue.Queue(maxsize=32)
         stop = threading.Event()
@@ -3238,6 +3868,25 @@ class GrootG1DeploymentTests(unittest.TestCase):
             self.assertGreaterEqual(details["steps"], 1)
             self.assertEqual(statuses.get(timeout=1.0), ("initialized", "measured"))
 
+            warmup1 = InitializationSpec(
+                mode="pose-file",
+                label="recorded start pose",
+                arm=np.zeros(14),
+                left_hand=np.zeros(7),
+                right_hand=np.zeros(7),
+            )
+            commands.put(("warmup_pose", time.monotonic(), warmup1))
+            kind, details = statuses.get(timeout=1.0)
+            self.assertEqual(kind, "warmup_pose_started")
+            self.assertEqual(details["label"], "recorded start pose")
+            self.assertGreaterEqual(details["steps"], 1)
+            self.assertEqual(
+                statuses.get(timeout=1.0),
+                ("warmup_pose_completed", "recorded start pose"),
+            )
+
+            # Acceptance here proves Warmup1 left the child in acknowledged
+            # HOLD, which is required before policy Warmup2.
             warm_start = InitializationSpec(
                 mode="pose-file",
                 label="first policy target",
@@ -3750,7 +4399,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 return RobotState(
                     captured_at=clock.now,
                     mode_machine=0,
-                    arm=self._arm_target + (0.064 if settling else 0.0),
+                    # Remain outside the current reviewed 0.20-rad endpoint
+                    # tolerance until after the old three-second deadline.
+                    arm=self._arm_target + (0.21 if settling else 0.0),
                     arm_dq=np.full(14, 0.02 if settling else 0.0),
                     left_hand=self._left_target.copy(),
                     right_hand=self._right_target.copy(),

@@ -6,6 +6,20 @@ ssh -N \
   alex@192.168.0.159
 
 
+CUDA_VISIBLE_DEVICES=0 uv run --no-sync python -m \
+gr00t.eval.run_gr00t_server \
+    --model-path "$HOME/Development/Models/c_only_batch_32_acc_1_chunk_32_20k_1008_1/checkpoint-20000" \
+    --embodiment-tag NEW_EMBODIMENT \
+    --deployment-dataset-path \
+    "$HOME/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08/train" \
+    --device cuda:0 \
+    --host 127.0.0.1 \
+    --port 5555
+
+
+
+
+
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
   --actuate \
   --allow-unqualified-real \
@@ -13,7 +27,7 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
   --policy-host 127.0.0.1 \
   --policy-port 5555 \
   --image-host 192.168.123.164 \
-  --network-interface enp0s1 \
+  --network-interface enp132s0 \
   --initialization xr-home \
   --policy-warm-start \
   --inference-mode synchronous \
@@ -24,31 +38,36 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
 After that succeeds, increase --max-chunks gradually.
 RTC starter — H32 checkpoint
 Plain Text
+
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
   --actuate \
   --allow-unqualified-real \
-  --task pick-red-cup \
+  --task pick-wooden-block \
   --policy-host 127.0.0.1 \
   --policy-port 5555 \
   --image-host 192.168.123.164 \
-  --network-interface enp0s1 \
-  --initialization measured \
-  --policy-warm-start \
+  --network-interface enp132s0 \
+  --initialization xr-home \
   --inference-mode rtc \
   --execution-horizon 8 \
-  --max-chunks 4 \
+  --max-chunks 2 \
   --command-conditioning xr
+
+
+
 Leave RTC frozen steps and ramp rate unspecified: adaptive frozen-step estimation and checkpoint ramp rate 6.0 will be used. RTC max-chunks=4 provides a 32-action budget and should exercise actual handoffs.
 
 Synchronous shadow
 Plain Text
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
-  --task pick-red-cup \
+  --actuate \
+  --allow-unqualified-real \
+  --task pick-toothpaste \
   --policy-host 127.0.0.1 \
   --policy-port 5555 \
   --image-host 192.168.123.164 \
-  --network-interface enp0s1 \
-  --initialization measured \
+  --network-interface enp132s0 \
+  --initialization xr-home \
   --inference-mode synchronous \
   --execution-horizon 8 \
   --max-chunks 5 \
@@ -58,12 +77,12 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
 RTC shadow — H32 checkpoint
 Plain Text
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
-  --task pick-red-cup \
+  --task pick-toothpaste \
   --policy-host 127.0.0.1 \
   --policy-port 5555 \
   --image-host 192.168.123.164 \
-  --network-interface enp0s1 \
-  --initialization measured \
+  --network-interface enp132s0 \
+  --initialization xr-home \
   --inference-mode rtc \
   --execution-horizon 8 \
   --max-chunks 4 \

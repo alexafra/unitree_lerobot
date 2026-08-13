@@ -192,13 +192,18 @@ Do not run `xr_teleoperate/teleop/teleop_hand_and_arm.py`, Unitree's policy eval
 
 The XR program is already active before its `r/s/q` prompt: it commands all 14 arm joints and both seven-joint hands toward zero. Pressing `q` commands the arms home before exiting, so it is neither a pose-preserving handoff nor an emergency stop. This client therefore owns its complete initialization sequence instead of handing off from XR.
 
-Choose one explicit mode:
+Actuated runs use `--warmup1` by default after the selected initialization stage.
+Warmup1 slowly commands the 28 measured arm/hand joint values from training episode
+0, frame 0 (a cereal-box-pick frame). It does **not** reproduce the demonstration's
+legs, waist, pelvis height, or world pose, because those values are absent from the
+model contract. Both hands must be empty. The preceding initialization mode remains
+independently selectable:
 
 - `--initialization measured` is the default. It acquires arm authority while preserving freshly measured arm and hand positions.
 - `--initialization xr-home` slowly targets the same joint-zero staging pose used by XR: arms and both hands all zero. Both hands must be empty. This is a staging target, not a demonstrated task-start pose.
 - `--initialization pose-file --initial-pose-file PATH` is an experimental route to one reviewed, task-bound demonstration frame-zero pose. It can either preserve both measured hands or explicitly target both hands. Do not use an averaged or median dataset pose.
 
-For example, to request XR-compatible staging, add:
+For example, to run XR-compatible staging followed by both default warmups, add:
 
 ```bash
 --initialization xr-home
@@ -206,21 +211,26 @@ For example, to request XR-compatible staging, add:
 
 At the SIMULATE/ACTUATE gate, press `r` once (no Enter) to create command publishers; `s` or `q` cancels before authority is created. Command authority begins by holding measured positions. At a moving initialization gate, press `r` again to start the displayed initialization. Pressing `s` at that gate simply remains at the existing measured hold. Immediately before moving, the actuator again requires a fresh, stationary state at the held target. It follows a fixed, slow 100 Hz smooth joint-space interpolation, keeps its heartbeat/state/mode/tracking checks active, and reports completion only after arm/hand position stability and arm velocity satisfy a continuous dwell. This is the same XR joint-zero **target**, with a deliberately slower guarded motion profile. The interpolation is not collision-aware, so a clear workspace, support and an emergency-stop operator remain mandatory. Finally, the operator visually checks the robot and scene and presses `r` at the RUN gate. Only then does the client reset GR00T, capture fresh state/images, run new inference, validate raw values, condition executable commands, and submit policy motion. The earlier publisher-free model result is never executed.
 
-Actuated runs use policy warm-start by default. After the RUN gate, the client performs one fresh inference while deliberately skipping the current-pose-to-first-target jump check. It still validates the full response, joint limits, and finiteness. After the operator presses `r` at the WARMUP gate, the actuator follows its existing bounded 100 Hz interpolation to that first target. The entire inferred chunk is then discarded. Pressing `r` at the CONTINUE gate resets GR00T, captures a new observation from the reached pose, and reseeds the output conditioner there. The 0.03-rad arm ceiling and the per-joint Dex3 ceilings described above govern ordinary final 100 Hz commands; the narrow minimum-inward-recovery exception can exceed them, while `MAX_ARM_STEP_RAD` and `MAX_HAND_STEP_RAD` remain hard backstops. With `--command-conditioning none`, the original constants instead apply directly to raw policy targets at 30 Hz. Use `--no-policy-warm-start` only when deliberately testing the direct-start behavior.
+Actuated runs use `--warmup2` for the first goal by default. After the RUN gate, the client performs one fresh inference while deliberately skipping the current-pose-to-first-target jump check. It still validates the full response, joint limits, and finiteness. After the operator presses `r` at the WARMUP2 gate, the actuator follows its existing bounded 100 Hz interpolation to target zero of that inferred chunk; it does not execute the whole chunk. The entire inferred chunk is then discarded. Pressing `r` at the CONTINUE gate resets GR00T, captures a new observation from the reached pose, and reseeds the output conditioner there. The 0.03-rad arm ceiling and the per-joint Dex3 ceilings described above govern ordinary final 100 Hz commands; the narrow minimum-inward-recovery exception can exceed them, while `MAX_ARM_STEP_RAD` and `MAX_HAND_STEP_RAD` remain hard backstops. With `--command-conditioning none`, the original constants instead apply directly to raw policy targets at 30 Hz. Use `--no-warmup2` only when deliberately testing direct-start behavior for the first goal; `--no-policy-warm-start` remains a compatibility alias.
 
-This transition is available in both IsaacLab and the explicitly unqualified real path. It is a per-goal joint-space transition, not collision-aware planning and not a general license for large policy jumps. WARMUP and CONTINUE remain separate visual-inspection gates; each advances only when `r` is pressed.
+Replacement goals independently use `--future-goal-warmup2` by default. Use
+`--no-future-goal-warmup2` to reset and re-observe before executing a replacement
+goal directly, without its WARMUP2/CONTINUE transition. Initialization and Warmup1
+always remain one-time startup stages and are never repeated for replacement goals.
+
+These transitions are available in both IsaacLab and the explicitly unqualified real path. Warmup1 runs once per authority session; Warmup2 runs according to the separate first-goal and future-goal flags. They are joint-space transitions, not collision-aware planning. WARMUP1, WARMUP2, and CONTINUE remain separate visual-inspection gates; each advances only when `r` is pressed.
 
 During either synchronous or RTC actuation, the terminal has immediate single-key
 operator controls; Enter is not required:
 
 - At each standard authority or motion gate, `r` or `R` performs the displayed action. It does not resume an old goal from the STOP next-goal prompt, where `r` remains ordinary goal text until Enter. Arbitrary custom goals still require exact `YES` plus Enter.
 - `s` or `S` immediately captures the current measured arm/hand pose and keeps publishing it at 100 Hz. The client stops making GR00T requests and displays a next-goal prompt. This is a powered position STOP, not a passive brake or collision-safe freeze; it can continue exerting force and requires the client/watchdog to remain alive.
-- At the STOP prompt, enter a trained task ID, its menu number, its exact training sentence, or custom goal text. Either `q` or `Q` is the no-Enter release key. For literal goal text, hold Alt while pressing the key: `Alt+q` inserts `q`, and `Alt+Shift+q` inserts `Q`. Uppercase `S` remains stopped. Unknown text again requires exact `YES`. The new goal repeats GR00T reset, fresh inference, `WARMUP`, discarded chunk, `CONTINUE`, reset, and fresh strict inference.
+- At the STOP prompt, trained-task mode is the default and shows the numbered allowlist; unknown text remains in HOLD and is not silently treated as a custom goal. Press `Tab` (no Enter) to toggle custom-goal mode on or back to trained-task mode. A run launched with `--custom-goal` returns to the prompt in custom mode, while a trained start returns in trained mode. Custom text still requires exact `YES`. Either `q` or `Q` is the no-Enter release key; `Alt+q` inserts a literal `q`, `Alt+Shift+q` inserts `Q`, and uppercase `S` remains stopped. By default the new goal repeats GR00T reset, fresh inference, `WARMUP2`, discarded chunk, `CONTINUE`, reset, and fresh strict inference. `--no-future-goal-warmup2` instead resets once and begins fresh strict live inference directly. Initialization and Warmup1 are never repeated.
 - `q` or `Q` during active motion or at an armed line prompt requests orderly release immediately. `Ctrl-C` remains the independent release path. On real hardware, cleanup retains the final arm target while ramping `arm_sdk` authority to zero over 1.5 seconds, then sends Dex3 `stopMotors`; final pose and grasp after Unitree retakes authority are not guaranteed.
 
-A key pressed while a synchronous inference request is already running cannot cancel the network request itself. The actuator nevertheless responds immediately: `s` enters powered STOP and `q` starts release; any later server result is discarded. RTC uses the same keys, cancels its active plan, and discards any in-flight reply before accepting a new goal. Reaching finite `--max-chunks` without a STOP command still exits through normal release; use a sufficiently large but finite bound for an interactive pick/put session.
+A key pressed while a synchronous inference request is already running cannot cancel the network request itself. The actuator nevertheless responds immediately: `s` enters powered STOP and `q` starts release; any later server result is discarded. RTC uses the same keys, cancels its active plan, and discards any in-flight reply before accepting a new goal. The next-goal menu is entered from powered STOP/HOLD. Reaching finite `--max-chunks` without a STOP command still exits through normal release; use a sufficiently large but finite bound for an interactive pick/put session.
 
-The INITIALIZE, RUN, WARMUP, and CONTINUE gates time out after 60 seconds. The STOP goal prompt may wait indefinitely while continuing the heartbeat and safety checks. During the guarded initialization and warm-start interpolations themselves, `q`/`Q` remains the immediate orderly-abort key; `s` is intentionally not a mid-interpolation pause command. During policy execution, `s` is immediate powered STOP. `Ctrl-C`, rejection, timeout or a watchdog fault enters the existing authority-release and Dex3 `stopMotors` cleanup path. These are terminal keystrokes, so the client terminal must retain keyboard focus; they do not replace the robot's physical emergency stop.
+The WARMUP1/INITIALIZE, RUN, WARMUP2, and CONTINUE gates time out after 180 seconds. The STOP goal prompt may wait indefinitely while continuing the heartbeat and safety checks. During the guarded Warmup1/Warmup2 interpolations, `q`/`Q` remains the immediate orderly-abort key; `s` is intentionally not a mid-interpolation pause command. During policy execution, `s` is immediate powered STOP. `Ctrl-C`, rejection, timeout or a watchdog fault enters the existing authority-release and Dex3 `stopMotors` cleanup path. These are terminal keystrokes, so the client terminal must retain keyboard focus; they do not replace the robot's physical emergency stop.
 
 A pose file has this strict schema (all 28 `joint_names` must appear in the exact training order). The structure below is deliberately non-runnable: export and review one real episode's frame-zero values before replacing the arm placeholder.
 
@@ -341,9 +351,63 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
     --network-interface YOUR_ROBOT_NETWORK_INTERFACE \
     --execution-horizon 8 \
     --max-chunks 1 \
-    --initialization xr-home \
     --actuate \
     --allow-unqualified-real
 ```
 
-The program still completes a publisher-free observation/inference/action preflight. Each standard gate—ACTUATE/SIMULATE, INITIALIZE, RUN, WARMUP, and CONTINUE—advances with one `r` keypress and no Enter. On arming, its child process requires fresh state and a stationary 0.5-second dwell, initializes targets from that measured state, and ramps `arm_sdk` weight while holding it. During command execution, arm state older than 75 ms faults the actuator. A Dex3 state age above 75 ms instead freezes the exact outgoing targets; five distinct fresh paired hand samples are required to recover. An interrupted policy plan is discarded and remains in powered HOLD rather than resuming against an old clock. A hand age above 250 ms remains a hard fault. These measured thresholds are not a substitute for qualification. Orderly SIGINT, SIGTERM, and terminal-hangup cleanup attempts a time-based arm-authority ramp to zero, then sends Unitree's Dex3 `stopMotors` command to both hands; the CLI reports separate local release and resource-cleanup acknowledgments. SIGKILL, power loss, and a wedged DDS/network path can bypass those attempts. The override is not a safety guarantee or certification.
+The program still completes a publisher-free observation/inference/action preflight. Each standard gate—ACTUATE/SIMULATE, WARMUP1, RUN, WARMUP2, and CONTINUE—advances with one `r` keypress and no Enter. On arming, its child process requires fresh state and a stationary 0.5-second dwell, initializes targets from that measured state, and ramps `arm_sdk` weight while holding it. During command execution, arm state older than 75 ms faults the actuator. A Dex3 state age above 75 ms instead freezes the exact outgoing targets; five distinct fresh paired hand samples are required to recover. An interrupted policy plan is discarded and remains in powered HOLD rather than resuming against an old clock. A hand age above 500 ms remains a hard fault. These measured thresholds are not a substitute for qualification. Orderly SIGINT, SIGTERM, and terminal-hangup cleanup attempts a time-based arm-authority ramp to zero, then sends Unitree's Dex3 `stopMotors` command to both hands; the CLI reports separate local release and resource-cleanup acknowledgments. SIGKILL, power loss, and a wedged DDS/network path can bypass those attempts. The override is not a safety guarantee or certification.
+
+## Appendix: complete runner CLI reference
+
+This table is an exhaustive, source-audited reference for
+`python -m unitree_lerobot.eval_robot.eval_groot_g1`. Defaults are the parser
+defaults; where an unset value is resolved dynamically, the effective behavior
+is stated explicitly.
+
+| Flag(s) | Default | One-line meaning |
+|---|---:|---|
+| `-h`, `--help` | — | Print the parser-generated help text and exit. |
+| `--task TASK_ID` | unset | Select one exact trained task ID; omit both goal flags to use the interactive task menu. |
+| `--custom-goal TEXT` | unset | Send arbitrary goal text after explicit confirmation; mutually exclusive with `--task`. |
+| `--policy-host HOST` | `127.0.0.1` | Connect to the GR00T policy server at this host; actuation requires a loopback host. |
+| `--policy-port PORT` | `5555` | Connect to the GR00T policy server at this TCP port. |
+| `--image-host HOST` | automatic | Connect to TeleImager here; when omitted, use `192.168.123.164` for the robot or `127.0.0.1` with `--sim`. |
+| `--show-camera` | off | Display every decoded RGB and derived depth/normal frame actually sent to GR00T. |
+| `--network-interface INTERFACE` | unset | Select the CycloneDDS NIC; mandatory for real actuation and forbidden for stock IsaacLab actuation. |
+| `--execution-horizon N` | `8` | Execute or account for `N` 30 Hz actions per chunk/replan interval; `N` must be at least one and no larger than the model horizon. |
+| `--max-chunks N` | `1` | Bound the run to `N` chunks, giving an RTC action budget of `execution_horizon × N`; `N` must be at least one. |
+| `--inference-mode {synchronous,rtc}` | `synchronous` | Choose blocking chunk inference or experimental asynchronous Real-Time Chunking. |
+| `--command-conditioning {xr,none}` | `xr` | Select XR-style 100 Hz arm-lead/arm-hand slew conditioning, or `none` for guarded raw-target comparisons. |
+| `--gravity-feedforward`, `--no-gravity-feedforward` | enabled | Enable pose-dependent XR-compatible arm gravity torque on each final outgoing target, or explicitly publish zero feed-forward torque. |
+| `--rtc-frozen-steps N` | automatic | Override the RTC end-to-end delay budget with `N` 30 Hz actions; valid only in RTC mode. |
+| `--rtc-ramp-rate RATE` | checkpoint setting | Override the positive RTC denoising ramp rate; valid only in RTC mode. |
+| `--initialization {measured,xr-home,pose-file}` | `measured` | Choose the guarded pre-Warmup1 pose: preserve measured joints, move all 28 upper-body joints to zero, or load a reviewed pose file. |
+| `--initial-pose-file PATH` | unset | Supply the reviewed task-bound JSON required by `--initialization pose-file`; invalid with the other initialization modes. |
+| `--warmup1`, `--no-warmup1` | enabled | Enable or skip the one-time guarded move to training episode 0 frame 0 after initialization. |
+| `--warmup2`, `--no-warmup2` | enabled | Enable or skip the first goal's guarded move to target zero of a fresh inferred chunk before reset and live execution. |
+| `--policy-warm-start`, `--no-policy-warm-start` | enabled | Compatibility aliases for `--warmup2` and `--no-warmup2`; they control the same setting. |
+| `--future-goal-warmup2`, `--no-future-goal-warmup2` | enabled | Enable or skip Warmup2 for each accepted replacement goal; initialization and Warmup1 are never repeated. |
+| `--sim` | off | Use the IsaacLab DDS domain/topic path instead of real `rt/arm_sdk`. |
+| `--actuate` | off | Create command publishers after preflight and confirmation; when omitted, run publisher-free shadow evaluation. |
+| `--allow-unqualified-real` | off | Acknowledge the explicitly unqualified real-hardware path; required for real `--actuate` and ineffective with `--sim`. |
+| `--confirm-sim-network-isolated` | off | Assert that the IsaacLab host cannot reach any physical robot network; required for simulated actuation. |
+| `--log-dir DIR` | `./logs` | Place the new per-run log directory and timing diagnostics under this directory. |
+
+The accepted `--task` values are `pick-toothpaste`, `down-toothpaste`,
+`pick-red-cup`, `down-red-cup`, `pick-wooden-block`, `down-wooden-block`,
+`pick-cerealbox`, and `down-cerealbox`. The task IDs map to the exact training
+instructions defined in `groot_contract.py`; argparse rejects any other value.
+
+### Standalone zero-state-test CLI
+
+The separate
+`python -m unitree_lerobot.eval_robot.zero_state_test` utility intentionally has
+only the following options; it does not inherit the GR00T runner flags.
+
+| Flag(s) | Default | One-line meaning |
+|---|---:|---|
+| `-h`, `--help` | — | Print the parser-generated help text and exit. |
+| `--network-interface INTERFACE` | required | Select the explicit CycloneDDS Ethernet interface connected to the real G1. |
+| `--allow-unqualified-real` | off, but required | Acknowledge the unqualified real DDS/Dex3 failover behavior before the utility can actuate. |
+| `--gravity-feedforward`, `--no-gravity-feedforward` | enabled | Enable pose-dependent arm gravity torque for the recorded target, or explicitly publish zero feed-forward torque. |
+| `--log-dir DIR` | `./logs` | Place the new zero-state-test run log below this directory. |

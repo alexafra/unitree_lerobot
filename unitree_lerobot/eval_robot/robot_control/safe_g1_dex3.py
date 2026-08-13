@@ -59,6 +59,7 @@ from unitree_lerobot.eval_robot.groot_contract import (
     validate_initialization_spec,
     validate_measured_state,
 )
+from unitree_lerobot.eval_robot.robot_control.g1_arm_gravity import G1ArmGravityCompensator
 from unitree_lerobot.utils.depth_encoding import encode_depth_gray_rgb
 from unitree_lerobot.utils.surface_normal_encoding import encode_surface_normals_rgb
 
@@ -68,12 +69,12 @@ LOGGER = logging.getLogger(__name__)
 STATE_MAX_AGE_S = 0.25
 ACTUATOR_ARM_STATE_MAX_AGE_S = 0.075
 ACTUATOR_HAND_STATE_WARNING_AGE_S = 0.075
-ACTUATOR_HAND_STATE_MAX_AGE_S = 1.0 #SAFETYCHANGE 0.250 original
+ACTUATOR_HAND_STATE_MAX_AGE_S = 0.5 #SAFETYCHANGE 0.250 original
 ACTUATOR_HAND_RECOVERY_SAMPLES = 5
 # Backward-compatible name for tests/internal imports.  It remains the hard
 # arm-state deadline; hand state has its own limits above.
 ACTUATOR_STATE_MAX_AGE_S = ACTUATOR_ARM_STATE_MAX_AGE_S
-HEARTBEAT_TIMEOUT_S = 3.0 #SAFETYCHANGE was 1
+HEARTBEAT_TIMEOUT_S = 1.0 #SAFETYCHANGE was 1
 CHUNK_MAX_AGE_S = 0.25
 ARM_AUTHORITY_RAMP_S = 1.5
 # CHANGEDSAFETY: original local adapter default was 1.0 s; current is 1.5 s.
@@ -100,7 +101,7 @@ HAND_TRACKING_WARNING_CLEAR_RAD = 0.40
 HAND_TRACKING_WARNING_DWELL_S = 0.20
 HAND_COMMAND_HISTORY_SIZE = 128
 TRACKING_GRACE_S = 0.50
-MAX_ACTION_LATENESS_S = 0.05 #SAFETYCHANGE was 0.02
+MAX_ACTION_LATENESS_S = 0.02 #SAFETYCHANGE was 0.02
 # Missing one complete 30 Hz target-residency window invalidates the remaining
 # time-indexed plan even when the broader local lateness ceiling was relaxed.
 # The child freezes the last command and asks the parent for a fresh observation
@@ -1715,7 +1716,31 @@ class _G1Dex3CommandBackend:
 
     _supports_cleanup_phases = True
 
-    def __init__(self, simulation: bool, network_interface: str | None):
+    def __init__(
+        self,
+        simulation: bool,
+        network_interface: str | None,
+        gravity_feedforward: bool = True,
+    ):
+        if not isinstance(gravity_feedforward, bool):
+            raise DeploymentError("gravity_feedforward must be a bool")
+        # CHANGEDSAFETY: the original deployment adapter published zero arm
+        # feed-forward torque.  Unitree XR instead publishes static RNEA torque
+        # on every command; restore that demonstrated controller contract.
+        # Build and exercise the reviewed XR dynamics model before DDS is
+        # initialized and, critically, before any command publisher exists.
+        # Missing Pinocchio or a changed/invalid URDF therefore fails closed.
+        self._gravity_feedforward = gravity_feedforward
+        self._arm_gravity = G1ArmGravityCompensator() if gravity_feedforward else None
+        if self._arm_gravity is None:
+            # The explicit opt-out restores the pre-feed-forward command
+            # contract.  Do not import/build Pinocchio when it is disabled.
+            LOGGER.warning("G1 arm gravity feed-forward is disabled; outgoing arm tau is zero")
+        else:
+            LOGGER.info(
+                "XR-compatible G1 arm gravity feed-forward is ready: %s",
+                self._arm_gravity.urdf_path,
+            )
         initialize_dds(simulation, network_interface)
         self.simulation = simulation
         self.reader = G1Dex3StateReader(
@@ -1764,6 +1789,8 @@ class _G1Dex3CommandBackend:
         self._weight = 0.0
         self._released = False
         self._has_published = False
+        self._last_published_arm_q: np.ndarray | None = None
+        self._last_published_arm_tau: np.ndarray | None = None
         # Enabled only by the dedicated authority-ramp diagnostic.  Keeping the
         # timers dormant avoids changing the normal deployment hot path.
         self._authority_ramp_timing_enabled = False
@@ -1876,11 +1903,11 @@ class _G1Dex3CommandBackend:
         self._left_hand_publish_history.clear()
         self._right_hand_publish_history.clear()
 
-    def _publish_arm(self, require_qualified_state: bool = True) -> None:
+    def _write_arm_message(self, *, require_qualified_state: bool) -> None:
+        """CRC and write the already-populated arm message once."""
+
         timing_enabled = getattr(self, "_authority_ramp_timing_enabled", False)
         timing = getattr(self, "_last_publish_timing_ms", {})
-        for offset, index in enumerate(self._arm_indices):
-            self._arm_message.motor_cmd[index].q = float(self._arm_target[offset])
         if not self.simulation:
             # Never copy an unqualified/transient mode into a real arm command.
             # Operational writes also re-check the latest state immediately
@@ -1911,6 +1938,41 @@ class _G1Dex3CommandBackend:
         if write_ok is not True:
             raise DeploymentError("Arm DDS Write failed")
         self._has_published = True
+
+    def _publish_arm(self, require_qualified_state: bool = True) -> None:
+        # Reproduce XR teleoperation's Pinocchio RNEA feed-forward for the final
+        # outgoing q, including initialization, warmup, HOLD, authority ramps,
+        # and simulation.  compute() checks finiteness, joint order, and a
+        # conservative per-joint torque envelope before the DDS message changes.
+        # Allocate both cache candidates before touching the message or calling
+        # DDS.  After a successful Write, publishing the cache is only two
+        # reference assignments and cannot fail due to an array allocation.
+        candidate_q = self._arm_target.copy()
+        if self._arm_gravity is None:
+            gravity_tau = np.zeros(ARM_DOF, dtype=np.float64)
+        else:
+            gravity_tau = self._arm_gravity.compute(candidate_q)
+        for offset, index in enumerate(self._arm_indices):
+            command = self._arm_message.motor_cmd[index]
+            command.q = float(candidate_q[offset])
+            command.tau = float(gravity_tau[offset])
+        self._write_arm_message(require_qualified_state=require_qualified_state)
+        # Cache only after Write succeeds.  Cleanup can then shed arm_sdk
+        # authority even when the dynamics computation that triggered a fault
+        # is no longer usable.  The cached pair is exactly what DDS accepted.
+        self._last_published_arm_q = candidate_q
+        self._last_published_arm_tau = gravity_tau
+
+    def _publish_last_arm_for_release(self) -> None:
+        """Write the last successful q/tau while changing only authority weight."""
+
+        if self._last_published_arm_q is None or self._last_published_arm_tau is None:
+            raise DeploymentError("No successful arm q/tau is available for authority release")
+        for offset, index in enumerate(self._arm_indices):
+            command = self._arm_message.motor_cmd[index]
+            command.q = float(self._last_published_arm_q[offset])
+            command.tau = float(self._last_published_arm_tau[offset])
+        self._write_arm_message(require_qualified_state=False)
 
     def _publish_hands(self) -> None:
         # Snapshot canonical-order targets before either Write. History is
@@ -2040,7 +2102,7 @@ class _G1Dex3CommandBackend:
             )
             self.set_weight(start_weight * (1.0 - progress))
             try:
-                self._publish_arm(require_qualified_state=False)
+                self._publish_last_arm_for_release()
             except Exception as exc:
                 failures.append(f"arm_sdk authority release failed: {exc}")
                 break
@@ -2060,7 +2122,7 @@ class _G1Dex3CommandBackend:
         if last_successful_weight != 0.0:
             self.set_weight(0.0)
             try:
-                self._publish_arm(require_qualified_state=False)
+                self._publish_last_arm_for_release()
                 arm_writes += 1
                 last_successful_weight = 0.0
             except Exception as exc:
@@ -2705,6 +2767,7 @@ def _actuator_main(
     authority_ramp_diagnostics: bool = False,
     dds_hold_diagnostics: bool = False,
     run_log_dir: str | None = None,
+    gravity_feedforward: bool = True,
 ) -> None:
     if run_log_dir is not None:
         configure_process_logging(Path(run_log_dir) / "actuator.log")
@@ -2725,6 +2788,10 @@ def _actuator_main(
         urgent_hold_event = threading.Event()
     if command_conditioning not in COMMAND_CONDITIONING_MODES:
         _status(status_queue, "fault", f"Unknown command conditioning mode {command_conditioning!r}")
+        _status(status_queue, "stopped")
+        return
+    if not isinstance(gravity_feedforward, bool):
+        _status(status_queue, "fault", "gravity_feedforward must be a bool")
         _status(status_queue, "stopped")
         return
 
@@ -2758,7 +2825,16 @@ def _actuator_main(
         ]
     ] = []
     try:
-        backend = _G1Dex3CommandBackend(simulation, network_interface)
+        if gravity_feedforward:
+            # Preserve the original two-argument construction shape for older
+            # internal backend adapters; its API default is feed-forward on.
+            backend = _G1Dex3CommandBackend(simulation, network_interface)
+        else:
+            backend = _G1Dex3CommandBackend(
+                simulation,
+                network_interface,
+                gravity_feedforward=False,
+            )
         backend._authority_ramp_timing_enabled = authority_ramp_diagnostics or dds_hold_diagnostics
         if command_conditioning == "xr":
             conditioner = XrPolicyOutputConditioner()
@@ -3210,6 +3286,75 @@ def _actuator_main(
                     holding = True
                     replan_freeze_active = False
                     _status(status_queue, "holding", last_sequence)
+                    continue
+
+                if kind == "warmup_pose":
+                    if not isinstance(command, tuple) or len(command) != 3:
+                        raise DeploymentError("Malformed guarded warmup-pose command")
+                    if chunk is not None or not holding:
+                        raise DeploymentError(
+                            "Guarded warmup pose requires an acknowledged hold with no active chunk"
+                        )
+                    _, created_at, warmup_pose = command
+                    if not isinstance(warmup_pose, InitializationSpec):
+                        raise DeploymentError("Malformed guarded warmup-pose target")
+                    try:
+                        command_age = time.monotonic() - float(created_at)
+                    except (TypeError, ValueError) as exc:
+                        raise DeploymentError("Guarded warmup-pose timestamp is invalid") from exc
+                    if not np.isfinite(command_age) or not 0.0 <= command_age <= INITIALIZATION_COMMAND_MAX_AGE_S:
+                        raise DeploymentError("Guarded warmup-pose command expired before execution")
+
+                    hand_watchdog.reset(backend)
+                    state = _wait_for_initialization_start(
+                        backend,
+                        stop_event,
+                        heartbeat,
+                        hand_watchdog,
+                        hand_freshness_gate,
+                        status_queue,
+                    )
+                    if state is None:
+                        _status(status_queue, "warmup_pose_cancelled", warmup_pose.label)
+                        return
+                    command_start = RobotState(
+                        captured_at=state.captured_at,
+                        mode_machine=state.mode_machine,
+                        arm=backend._arm_target.copy(),
+                        arm_dq=state.arm_dq.copy(),
+                        left_hand=backend._left_target.copy(),
+                        right_hand=backend._right_target.copy(),
+                    )
+                    warmup_pose_chunk = build_initialization_chunk(command_start, warmup_pose)
+                    _status(
+                        status_queue,
+                        "warmup_pose_started",
+                        {
+                            "label": warmup_pose.label,
+                            "steps": warmup_pose_chunk.length,
+                            "duration_s": warmup_pose_chunk.length / PUBLISH_HZ,
+                        },
+                    )
+                    completed = _execute_initialization(
+                        backend,
+                        warmup_pose_chunk,
+                        stop_event,
+                        heartbeat,
+                        tracking_checks_after,
+                        hand_watchdog,
+                        hand_freshness_gate,
+                        status_queue,
+                        context=f"guarded warmup pose={warmup_pose.label}",
+                    )
+                    if not completed:
+                        _status(status_queue, "warmup_pose_cancelled", warmup_pose.label)
+                        return
+                    if conditioner is not None:
+                        conditioner.reset(backend._arm_target, backend._left_target, backend._right_target)
+                    hand_watchdog.reset(backend)
+                    tracking_checks_after = time.monotonic()
+                    holding = True
+                    _status(status_queue, "warmup_pose_completed", warmup_pose.label)
                     continue
 
                 if kind == "warm_start":
@@ -4005,9 +4150,12 @@ class SafeG1Dex3Actuator:
         authority_ramp_diagnostics: bool = False,
         dds_hold_diagnostics: bool = False,
         run_log_dir: str | None = None,
+        gravity_feedforward: bool = True,
     ):
         if command_conditioning not in COMMAND_CONDITIONING_MODES:
             raise DeploymentError(f"Unknown command conditioning mode {command_conditioning!r}")
+        if not isinstance(gravity_feedforward, bool):
+            raise DeploymentError("gravity_feedforward must be a bool")
         context = mp.get_context("spawn")
         self._command_queue = context.Queue(maxsize=1)
         self._status_queue = context.Queue(maxsize=32)
@@ -4024,8 +4172,18 @@ class SafeG1Dex3Actuator:
             self._urgent_hold_event,
             command_conditioning,
         )
-        if authority_ramp_diagnostics or dds_hold_diagnostics or run_log_dir is not None:
-            process_args += (authority_ramp_diagnostics, dds_hold_diagnostics, run_log_dir)
+        if (
+            authority_ramp_diagnostics
+            or dds_hold_diagnostics
+            or run_log_dir is not None
+            or not gravity_feedforward
+        ):
+            process_args += (
+                authority_ramp_diagnostics,
+                dds_hold_diagnostics,
+                run_log_dir,
+                gravity_feedforward,
+            )
         self._process = context.Process(
             target=_actuator_main,
             args=process_args,
@@ -4043,6 +4201,7 @@ class SafeG1Dex3Actuator:
         self._rtc_terminal: tuple[str, Any] | None = None
         self._last_replan_detail: dict[str, Any] | None = None
         self._command_conditioning = command_conditioning
+        self._gravity_feedforward = gravity_feedforward
         self._authority_ramp_diagnostics = authority_ramp_diagnostics
         self._last_authority_ramp_timing: dict[str, Any] | None = None
         self._dds_hold_diagnostics = dds_hold_diagnostics
@@ -4299,6 +4458,32 @@ class SafeG1Dex3Actuator:
             if self._immediate_release_requested.is_set():
                 raise ImmediateControlEvent("release")
             raise DeploymentError("Actuator process stopped")
+
+    def warmup_pose(self, spec: InitializationSpec) -> None:
+        """Move to one guarded non-policy pose and remain in powered HOLD."""
+
+        if not self._initialized or not self._holding or self._chunk_in_flight:
+            raise DeploymentError(
+                "Guarded warmup pose requires initialized HOLD with no chunk in flight"
+            )
+        validate_initialization_spec(spec)
+        self._wait_for_hand_feedback()
+        self.heartbeat()
+        try:
+            self._command_queue.put(("warmup_pose", time.monotonic(), spec), timeout=0.2)
+        except queue.Full as exc:
+            raise DeploymentError("Actuator command queue is full; refusing guarded warmup pose") from exc
+        self._wait_status(
+            "warmup_pose_completed",
+            timeout_s=(
+                INITIALIZATION_START_TIMEOUT_S
+                + INITIALIZATION_MAX_DURATION_S
+                + INITIALIZATION_CONVERGENCE_TIMEOUT_S
+                + 3.0
+            ),
+            payload=spec.label,
+        )
+        self._holding = True
 
     def warm_start(self, chunk: ActionChunk) -> None:
         """Smoothly reach a first policy target from an acknowledged hold."""

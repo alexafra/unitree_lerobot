@@ -26,9 +26,13 @@ from unitree_lerobot.utils.surface_normal_encoding import (
 
 TASKS = {
     "pick-toothpaste": "pick up the cylinder toothpaste.",
-    "put-toothpaste": "put down the cylinder toothpaste.",
+    "down-toothpaste": "put down the cylinder toothpaste.",
     "pick-red-cup": "pick up the red cup.",
-    "put-red-cup": "put down the red cup.",
+    "down-red-cup": "put down the red cup.",
+    "pick-wooden-block": "pick up the wooden block.",
+    "down-wooden-block": "put down the wooden block.",
+    "pick-cerealbox": "pick up the cereal box.",
+    "down-cerealbox": "put down the cereal box."
 }
 
 COLOUR_VIDEO_KEYS = ("ego_view",)
