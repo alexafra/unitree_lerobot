@@ -15,6 +15,13 @@ from unitree_lerobot.utils.depth_encoding import (
     DEPTH_OUTPUT_KEY,
     DEPTH_SOURCE_KEY,
 )
+from unitree_lerobot.utils.surface_normal_encoding import (
+    DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+    DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M,
+    PinholeIntrinsics,
+    SURFACE_NORMAL_OUTPUT_KEY,
+    surface_normals_encoding_metadata,
+)
 
 
 TASKS = {
@@ -26,7 +33,8 @@ TASKS = {
 
 COLOUR_VIDEO_KEYS = ("ego_view",)
 RGBD_VIDEO_KEYS = ("ego_view", DEPTH_OUTPUT_KEY)
-SUPPORTED_VIDEO_KEYS = (COLOUR_VIDEO_KEYS, RGBD_VIDEO_KEYS)
+SURFACE_NORMAL_VIDEO_KEYS = ("ego_view", SURFACE_NORMAL_OUTPUT_KEY)
+SUPPORTED_VIDEO_KEYS = (COLOUR_VIDEO_KEYS, RGBD_VIDEO_KEYS, SURFACE_NORMAL_VIDEO_KEYS)
 # Backwards-compatible public name used by existing callers/tests.
 VIDEO_KEYS = COLOUR_VIDEO_KEYS
 STATE_KEYS = ("left_arm", "right_arm", "left_hand", "right_hand")
@@ -36,6 +44,7 @@ EXPECTED_TRAINING_TAG = "new_embodiment"
 EXPECTED_ROBOT_TYPE = "Unitree_G1_Dex3_HeadOnly"
 EXPECTED_EGO_VIEW_SHAPE = [480, 640, 3]
 EXPECTED_DEPTH_VIEW_SHAPE = [480, 640, 3]
+EXPECTED_SURFACE_NORMAL_VIEW_SHAPE = [480, 640, 3]
 EXPECTED_ACTION_OUTPUT_CONTRACT = {
     "semantics": "absolute_joint_position",
     "use_relative_action": True,
@@ -168,13 +177,29 @@ class ModelContract:
 
     @property
     def requires_depth(self) -> bool:
+        """Whether the live camera must provide atomic aligned depth."""
+
+        return self.video_keys in (RGBD_VIDEO_KEYS, SURFACE_NORMAL_VIDEO_KEYS)
+
+    @property
+    def requires_depth_gray(self) -> bool:
         return self.video_keys == RGBD_VIDEO_KEYS
+
+    @property
+    def requires_surface_normals(self) -> bool:
+        return self.video_keys == SURFACE_NORMAL_VIDEO_KEYS
 
 
 @dataclass(frozen=True)
 class DepthEncodingContract:
     near_m: float
     far_m: float
+
+
+@dataclass(frozen=True)
+class SurfaceNormalEncodingContract:
+    intrinsics: PinholeIntrinsics
+    max_neighbor_depth_delta_m: float
 
 
 @dataclass(frozen=True)
@@ -247,11 +272,45 @@ def _validate_depth_metadata(contract: dict[str, Any]) -> DepthEncodingContract:
     return DepthEncodingContract(near_m=near_m, far_m=far_m)
 
 
+def _validate_surface_normal_metadata(contract: dict[str, Any]) -> SurfaceNormalEncodingContract:
+    video_shapes = contract.get("video_shapes")
+    if not isinstance(video_shapes, dict):
+        raise DeploymentError("Deployment dataset contract has no video_shapes for the surface-normal model")
+    expected_shapes = {
+        "ego_view": EXPECTED_EGO_VIEW_SHAPE,
+        SURFACE_NORMAL_OUTPUT_KEY: EXPECTED_SURFACE_NORMAL_VIEW_SHAPE,
+    }
+    for key, expected_shape in expected_shapes.items():
+        if video_shapes.get(key) != expected_shape:
+            raise DeploymentError(
+                f"Deployment dataset contract mismatch for video_shapes.{key}: "
+                f"got {video_shapes.get(key)!r}, expected {expected_shape!r}"
+            )
+
+    encoding = contract.get("surface_normals_encoding")
+    if not isinstance(encoding, dict):
+        raise DeploymentError(
+            "Deployment dataset contract has no surface_normals_encoding for the surface-normal model"
+        )
+    expected = surface_normals_encoding_metadata()
+    for field, value in expected.items():
+        if encoding.get(field) != value:
+            raise DeploymentError(
+                f"Unsupported surface-normal encoding for {field}: "
+                f"got {encoding.get(field)!r}, expected {value!r}"
+            )
+    return SurfaceNormalEncodingContract(
+        intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+        max_neighbor_depth_delta_m=DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M,
+    )
+
+
 def validate_policy_metadata(
     metadata: dict[str, Any],
     *,
     requires_depth: bool = False,
-) -> DepthEncodingContract | None:
+    requires_surface_normals: bool = False,
+) -> DepthEncodingContract | SurfaceNormalEncodingContract | None:
     if metadata.get("protocol_version") != 1:
         raise DeploymentError(f"Unsupported GR00T deployment protocol {metadata.get('protocol_version')!r}")
     if metadata.get("embodiment_tag") != EXPECTED_TRAINING_TAG:
@@ -287,6 +346,10 @@ def validate_policy_metadata(
                 "Unsupported checkpoint action output contract for "
                 f"{field}: got {action_output.get(field)!r}, expected {value!r}"
             )
+    if requires_depth and requires_surface_normals:
+        raise DeploymentError("A checkpoint cannot request depth_gray_view and surface_normals_view together")
+    if requires_surface_normals:
+        return _validate_surface_normal_metadata(contract)
     if requires_depth:
         return _validate_depth_metadata(contract)
     video_shapes = contract.get("video_shapes")
@@ -307,7 +370,7 @@ def _config_field(config: dict[str, Any], modality: str, field: str) -> Any:
 
 
 def validate_model_contract(config: dict[str, Any]) -> ModelContract:
-    """Accept only the explicitly supported G1/Dex3 colour or RGBD contracts."""
+    """Accept only the supported G1/Dex3 colour and geometry contracts."""
 
     expected = {
         "state": STATE_KEYS,
@@ -318,7 +381,7 @@ def validate_model_contract(config: dict[str, Any]) -> ModelContract:
     if video_keys not in SUPPORTED_VIDEO_KEYS:
         raise DeploymentError(
             f"Unsupported video keys from GR00T server: {video_keys}; expected exactly "
-            f"{COLOUR_VIDEO_KEYS} or {RGBD_VIDEO_KEYS}."
+            f"{COLOUR_VIDEO_KEYS}, {RGBD_VIDEO_KEYS}, or {SURFACE_NORMAL_VIDEO_KEYS}."
         )
     for modality, keys in expected.items():
         actual = tuple(_config_field(config, modality, "modality_keys"))
@@ -366,6 +429,7 @@ def make_observation(
     *,
     video_keys: tuple[str, ...] = COLOUR_VIDEO_KEYS,
     depth_gray: np.ndarray | None = None,
+    surface_normals: np.ndarray | None = None,
     allow_custom_instruction: bool = False,
 ) -> dict[str, Any]:
     """Build exactly the video/state/language inputs selected by the checkpoint."""
@@ -397,6 +461,8 @@ def make_observation(
     if video_keys == RGBD_VIDEO_KEYS:
         if depth_gray is None:
             raise DeploymentError("RGBD checkpoint requires depth_gray_view")
+        if surface_normals is not None:
+            raise DeploymentError("Depth checkpoint must not receive surface_normals_view")
         depth_gray = np.asarray(depth_gray)
         if list(depth_gray.shape) != EXPECTED_DEPTH_VIEW_SHAPE or depth_gray.dtype != np.uint8:
             raise DeploymentError(
@@ -404,8 +470,24 @@ def make_observation(
                 f"{tuple(EXPECTED_DEPTH_VIEW_SHAPE)}, got {depth_gray.shape} {depth_gray.dtype}"
             )
         video[DEPTH_OUTPUT_KEY] = np.ascontiguousarray(depth_gray)[None, None]
-    elif depth_gray is not None:
-        raise DeploymentError("Colour-only checkpoint must not receive depth_gray_view")
+    elif video_keys == SURFACE_NORMAL_VIDEO_KEYS:
+        if surface_normals is None:
+            raise DeploymentError("Surface-normal checkpoint requires surface_normals_view")
+        if depth_gray is not None:
+            raise DeploymentError("Surface-normal checkpoint must not receive depth_gray_view")
+        surface_normals = np.asarray(surface_normals)
+        if (
+            list(surface_normals.shape) != EXPECTED_SURFACE_NORMAL_VIEW_SHAPE
+            or surface_normals.dtype != np.uint8
+        ):
+            raise DeploymentError(
+                "Expected uint8 surface_normals_view with shape "
+                f"{tuple(EXPECTED_SURFACE_NORMAL_VIEW_SHAPE)}, got "
+                f"{surface_normals.shape} {surface_normals.dtype}"
+            )
+        video[SURFACE_NORMAL_OUTPUT_KEY] = np.ascontiguousarray(surface_normals)[None, None]
+    elif depth_gray is not None or surface_normals is not None:
+        raise DeploymentError("Colour-only checkpoint must not receive a geometry view")
 
     return {
         "video": video,

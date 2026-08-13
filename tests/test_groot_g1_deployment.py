@@ -59,6 +59,8 @@ from unitree_lerobot.eval_robot.groot_contract import (
     MAX_HAND_STEP_RAD,
     MEASURED_LIMIT_TOLERANCE_RAD,
     RGBD_VIDEO_KEYS,
+    SURFACE_NORMAL_VIDEO_KEYS,
+    SurfaceNormalEncodingContract,
     TASKS,
     load_initialization_spec,
     make_observation,
@@ -111,13 +113,30 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     request_live_camera_config,
 )
 from unitree_lerobot.utils.depth_encoding import encode_depth_gray_rgb
+from unitree_lerobot.utils.surface_normal_encoding import (
+    DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+    encode_surface_normals_rgb,
+    surface_normals_encoding_metadata,
+)
 
 
-def modality_config(action_horizon: int = 16, *, rgbd: bool = False):
+def modality_config(
+    action_horizon: int = 16,
+    *,
+    rgbd: bool = False,
+    surface_normals: bool = False,
+):
+    if rgbd and surface_normals:
+        raise ValueError("test config cannot request both geometry views")
+    video_keys = (
+        SURFACE_NORMAL_VIDEO_KEYS
+        if surface_normals
+        else RGBD_VIDEO_KEYS if rgbd else COLOUR_VIDEO_KEYS
+    )
     return {
         "video": {
             "delta_indices": [0],
-            "modality_keys": list(RGBD_VIDEO_KEYS if rgbd else COLOUR_VIDEO_KEYS),
+            "modality_keys": list(video_keys),
         },
         "state": {"delta_indices": [0], "modality_keys": list(ACTION_KEYS)},
         "action": {
@@ -254,6 +273,22 @@ class GrootG1DeploymentTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(imshow.call_args_list[0].args[1], rgb[..., ::-1])
         np.testing.assert_array_equal(imshow.call_args_list[1].args[1], depth[..., ::-1])
+
+    def test_camera_preview_labels_surface_normal_policy_view(self):
+        rgb = np.zeros((1, 2, 3), dtype=np.uint8)
+        normals = np.full((1, 2, 3), 128, dtype=np.uint8)
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        with (
+            mock.patch(f"{module}.cv2.imshow") as imshow,
+            mock.patch(f"{module}.cv2.waitKey", return_value=-1),
+        ):
+            show_camera_preview(rgb, normals, "surface_normals_view")
+
+        self.assertEqual(
+            [call.args[0] for call in imshow.call_args_list],
+            ["GR00T input: ego_view", "GR00T input: surface_normals_view"],
+        )
+        np.testing.assert_array_equal(imshow.call_args_list[1].args[1], normals[..., ::-1])
 
     def test_camera_preview_q_requests_normal_runner_cleanup(self):
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
@@ -1903,6 +1938,54 @@ class GrootG1DeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(DeploymentError, "Unsupported video keys"):
             validate_model_contract(reversed_config)
 
+    def test_model_contract_accepts_surface_normals_as_aligned_depth_geometry(self):
+        contract = validate_model_contract(modality_config(surface_normals=True))
+
+        self.assertTrue(contract.requires_depth)
+        self.assertFalse(contract.requires_depth_gray)
+        self.assertTrue(contract.requires_surface_normals)
+        self.assertEqual(contract.video_keys, SURFACE_NORMAL_VIDEO_KEYS)
+
+    def test_policy_metadata_validates_exact_surface_normal_contract(self):
+        metadata = {
+            "protocol_version": 1,
+            "embodiment_tag": "new_embodiment",
+            "action_output_contract": EXPECTED_ACTION_OUTPUT_CONTRACT,
+            "dataset_contract": {
+                "robot_type": EXPECTED_ROBOT_TYPE,
+                "fps": 30.0,
+                "observation_state_names": EXPECTED_JOINT_NAMES,
+                "action_names": EXPECTED_JOINT_NAMES,
+                "ego_view_shape": EXPECTED_EGO_VIEW_SHAPE,
+                "video_shapes": {
+                    "ego_view": EXPECTED_EGO_VIEW_SHAPE,
+                    "surface_normals_view": EXPECTED_DEPTH_VIEW_SHAPE,
+                },
+                "surface_normals_encoding": surface_normals_encoding_metadata(),
+            },
+        }
+
+        contract = validate_policy_metadata(metadata, requires_surface_normals=True)
+        self.assertEqual(
+            contract,
+            SurfaceNormalEncodingContract(
+                intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+                max_neighbor_depth_delta_m=0.05,
+            ),
+        )
+        malformed = {
+            **metadata,
+            "dataset_contract": {
+                **metadata["dataset_contract"],
+                "surface_normals_encoding": {
+                    **metadata["dataset_contract"]["surface_normals_encoding"],
+                    "orientation": "away_from_camera",
+                },
+            },
+        }
+        with self.assertRaisesRegex(DeploymentError, "surface-normal encoding for orientation"):
+            validate_policy_metadata(malformed, requires_surface_normals=True)
+
     def test_policy_metadata_requires_the_explicit_g1_training_tag(self):
         metadata = {
             "protocol_version": 1,
@@ -2151,6 +2234,33 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 np.zeros(7),
                 TASKS["pick-red-cup"],
                 video_keys=RGBD_VIDEO_KEYS,
+            )
+
+    def test_surface_normal_observation_contains_exactly_the_selected_views(self):
+        normals = np.full((480, 640, 3), 128, dtype=np.uint8)
+        observation = make_observation(
+            np.zeros((480, 640, 3), dtype=np.uint8),
+            np.zeros(14),
+            np.zeros(7),
+            np.zeros(7),
+            TASKS["pick-red-cup"],
+            video_keys=SURFACE_NORMAL_VIDEO_KEYS,
+            surface_normals=normals,
+        )
+
+        self.assertEqual(tuple(observation["video"]), SURFACE_NORMAL_VIDEO_KEYS)
+        np.testing.assert_array_equal(
+            observation["video"]["surface_normals_view"][0, 0],
+            normals,
+        )
+        with self.assertRaisesRegex(DeploymentError, "requires surface_normals_view"):
+            make_observation(
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros(14),
+                np.zeros(7),
+                np.zeros(7),
+                TASKS["pick-red-cup"],
+                video_keys=SURFACE_NORMAL_VIDEO_KEYS,
             )
 
     def test_action_parser_combines_arm_order_and_keeps_execution_prefix(self):
@@ -2503,6 +2613,53 @@ class GrootG1DeploymentTests(unittest.TestCase):
         np.testing.assert_array_equal(images.depth_gray, expected)
         with self.assertRaisesRegex(TimeoutError, "not new"):
             camera.read(timeout_s=0.015)
+
+    def test_rgbd_camera_encodes_atomic_aligned_depth_as_surface_normals(self):
+        bgr = np.zeros((480, 640, 3), dtype=np.uint8)
+        depth = np.full((480, 640), 625, dtype=np.uint16)
+        color_ok, color_jpeg = cv2.imencode(".jpg", bgr)
+        depth_ok, depth_png = cv2.imencode(".png", depth)
+        self.assertTrue(color_ok and depth_ok)
+        frame = TeleRgbdFrame(
+            sequence=12,
+            server_capture_monotonic_ns=1,
+            received_monotonic_ns=time.monotonic_ns(),
+            color_jpeg=color_jpeg.tobytes(),
+            aligned_depth_png=depth_png.tobytes(),
+        )
+
+        camera = object.__new__(TeleimagerCamera)
+        camera._requires_depth = True
+        camera._depth_encoding = None
+        camera._surface_normal_encoding = SurfaceNormalEncodingContract(
+            intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+            max_neighbor_depth_delta_m=0.05,
+        )
+        camera._depth_scale_m_per_unit = 0.001
+        camera._last_rgbd_sequence = None
+        camera._reported_stream_fps = False
+        camera._head_subscriber = SimpleNamespace(is_alive=lambda: True)
+        camera._client = SimpleNamespace(
+            get_head_rgbd_frame=lambda: frame,
+            get_head_rgbd_fps=lambda: 30.0,
+        )
+        camera.config = {
+            "head_camera": {
+                "image_shape": [480, 640],
+                "binocular": False,
+            }
+        }
+
+        images = camera.read(timeout_s=0.05)
+
+        self.assertIsNone(images.depth_gray)
+        expected = encode_surface_normals_rgb(
+            depth,
+            scale_m_per_unit=0.001,
+            intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+            max_neighbor_depth_delta_m=0.05,
+        )
+        np.testing.assert_array_equal(images.surface_normals, expected)
 
     def test_rgbd_camera_fails_closed_on_server_sequence_regression(self):
         frame = TeleRgbdFrame(

@@ -8,6 +8,7 @@ Script Json to Lerobot.
 # --include-depth Include aligned depth_0 as a normalized three-channel visual feature
 # --depth-near-m Fixed near bound used for depth normalization
 # --depth-far-m  Fixed far bound used for depth normalization
+# --include-surface-normals Include camera-frame normals derived from aligned depth_0
 
 python unitree_lerobot/utils/convert_unitree_json_to_lerobot.py \
     --raw-dir $HOME/datasets/g1_grabcube_double_hand \
@@ -26,6 +27,7 @@ import tyro
 import json
 import dataclasses
 import shutil
+import tempfile
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
@@ -33,6 +35,8 @@ from typing import Literal
 
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.utils import write_info
+from lerobot.datasets.video_utils import encode_video_frames
 
 from unitree_lerobot.utils.constants import ROBOT_CONFIGS
 from unitree_lerobot.utils.depth_encoding import (
@@ -44,6 +48,14 @@ from unitree_lerobot.utils.depth_encoding import (
     DEPTH_OUTPUT_KEY,
     DEPTH_SOURCE_KEY,
     encode_depth_gray_rgb,
+)
+from unitree_lerobot.utils.surface_normal_encoding import (
+    DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+    DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M,
+    SURFACE_NORMAL_OUTPUT_KEY,
+    PinholeIntrinsics,
+    encode_surface_normals_rgb,
+    surface_normals_encoding_metadata,
 )
 
 
@@ -59,6 +71,28 @@ class DatasetConfig:
 DEFAULT_DATASET_CONFIG = DatasetConfig()
 
 
+class SurfaceNormalsLeRobotDataset(LeRobotDataset):
+    """Use near-lossless 4:4:4 video only for the three independent normal axes."""
+
+    def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
+        if video_key != f"observation.images.{SURFACE_NORMAL_OUTPUT_KEY}":
+            return super()._encode_temporary_episode_video(video_key, episode_index)
+
+        temp_path = Path(tempfile.mkdtemp(dir=self.root)) / f"{video_key}_{episode_index:03d}.mp4"
+        img_dir = self._get_image_file_dir(episode_index, video_key)
+        encode_video_frames(
+            img_dir,
+            temp_path,
+            self.fps,
+            vcodec="h264",
+            pix_fmt="yuv444p",
+            crf=0,
+            overwrite=True,
+        )
+        shutil.rmtree(img_dir)
+        return temp_path
+
+
 class JsonDataset:
     def __init__(
         self,
@@ -68,6 +102,9 @@ class JsonDataset:
         include_depth: bool = False,
         depth_near_m: float = DEFAULT_DEPTH_NEAR_M,
         depth_far_m: float = DEFAULT_DEPTH_FAR_M,
+        include_surface_normals: bool = False,
+        surface_normal_intrinsics: PinholeIntrinsics = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+        surface_normal_max_neighbor_depth_delta_m: float = (DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M),
     ) -> None:
         """
         Initialize the dataset for loading and processing HDF5 files containing robot manipulation data.
@@ -86,6 +123,14 @@ class JsonDataset:
         self.include_depth = include_depth
         self.depth_near_m = depth_near_m
         self.depth_far_m = depth_far_m
+        self.include_surface_normals = include_surface_normals
+        self.surface_normal_intrinsics = surface_normal_intrinsics
+        self.surface_normal_max_neighbor_depth_delta_m = surface_normal_max_neighbor_depth_delta_m
+        # Validate the complete geometry contract before reading any frames.
+        surface_normals_encoding_metadata(
+            intrinsics=surface_normal_intrinsics,
+            max_neighbor_depth_delta_m=surface_normal_max_neighbor_depth_delta_m,
+        )
 
         # Initialize paths and cache
         self._init_paths()
@@ -208,12 +253,15 @@ class JsonDataset:
 
         return images
 
-    def _parse_depth_images(
+    def _parse_depth_derived_images(
         self,
         episode_path: str,
         episode_data: dict,
+        *,
+        include_depth: bool,
+        include_surface_normals: bool,
     ) -> dict[str, list[np.ndarray]]:
-        """Load aligned uint16 depth and convert it to a model-ready RGB image."""
+        """Load each aligned PNG16 once and generate requested model views."""
 
         images = defaultdict(list)
 
@@ -236,8 +284,6 @@ class JsonDataset:
         if rgb_camera_key is None:
             raise ValueError(f"No image mapping exists for {DEPTH_COLOR_SOURCE_KEY}")
 
-        output_key = DEPTH_OUTPUT_KEY
-
         for sample_data in episode_data["data"]:
             relative_path = sample_data.get("depths", {}).get(DEPTH_SOURCE_KEY)
 
@@ -259,16 +305,39 @@ class JsonDataset:
                     f"Expected HxW uint16 depth at {depth_path}; got shape={depth_u16.shape}, dtype={depth_u16.dtype}"
                 )
 
-            depth_rgb = encode_depth_gray_rgb(
-                depth_u16,
-                scale_m_per_unit=depth_scale,
-                near_m=self.depth_near_m,
-                far_m=self.depth_far_m,
-            )
+            if include_depth:
+                depth_rgb = encode_depth_gray_rgb(
+                    depth_u16,
+                    scale_m_per_unit=depth_scale,
+                    near_m=self.depth_near_m,
+                    far_m=self.depth_far_m,
+                )
+                images[DEPTH_OUTPUT_KEY].append(depth_rgb)
 
-            images[output_key].append(depth_rgb)
+            if include_surface_normals:
+                surface_normals_rgb = encode_surface_normals_rgb(
+                    depth_u16,
+                    scale_m_per_unit=depth_scale,
+                    intrinsics=self.surface_normal_intrinsics,
+                    max_neighbor_depth_delta_m=self.surface_normal_max_neighbor_depth_delta_m,
+                )
+                images[SURFACE_NORMAL_OUTPUT_KEY].append(surface_normals_rgb)
 
         return images
+
+    def _parse_depth_images(
+        self,
+        episode_path: str,
+        episode_data: dict,
+    ) -> dict[str, list[np.ndarray]]:
+        """Preserve the existing depth-only helper for downstream callers."""
+
+        return self._parse_depth_derived_images(
+            episode_path,
+            episode_data,
+            include_depth=True,
+            include_surface_normals=False,
+        )
 
     def get_item(
         self,
@@ -299,8 +368,15 @@ class JsonDataset:
 
         # Load camera images
         cameras = self._parse_images(file_path, episode_data)
-        if self.include_depth:
-            cameras.update(self._parse_depth_images(file_path, episode_data))
+        if self.include_depth or self.include_surface_normals:
+            cameras.update(
+                self._parse_depth_derived_images(
+                    file_path,
+                    episode_data,
+                    include_depth=self.include_depth,
+                    include_surface_normals=self.include_surface_normals,
+                )
+            )
 
         if not cameras:
             raise ValueError(f"No camera frames found for episode {file_path}")
@@ -352,6 +428,8 @@ def create_empty_dataset(
     has_velocity: bool = False,
     has_effort: bool = False,
     include_depth: bool = False,
+    include_surface_normals: bool = False,
+    surface_normal_intrinsics: PinholeIntrinsics = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ) -> LeRobotDataset:
     robot_config = ROBOT_CONFIGS[robot_type]
@@ -419,10 +497,26 @@ def create_empty_dataset(
             ],
         }
 
+    if include_surface_normals:
+        rgb_camera_key = robot_config.camera_to_image_key.get(DEPTH_COLOR_SOURCE_KEY)
+        if rgb_camera_key is None:
+            raise ValueError(f"No image mapping exists for {DEPTH_COLOR_SOURCE_KEY}")
+
+        features[f"observation.images.{SURFACE_NORMAL_OUTPUT_KEY}"] = {
+            "dtype": mode,
+            "shape": (surface_normal_intrinsics.height, surface_normal_intrinsics.width, 3),
+            "names": [
+                "height",
+                "width",
+                "channel",
+            ],
+        }
+
     if Path(HF_LEROBOT_HOME / repo_id).exists():
         shutil.rmtree(HF_LEROBOT_HOME / repo_id)
 
-    return LeRobotDataset.create(
+    dataset_type = SurfaceNormalsLeRobotDataset if include_surface_normals else LeRobotDataset
+    return dataset_type.create(
         repo_id=repo_id,
         fps=30,
         robot_type=robot_type,
@@ -443,6 +537,9 @@ def populate_dataset(
     include_depth: bool = False,
     depth_near_m: float = DEFAULT_DEPTH_NEAR_M,
     depth_far_m: float = DEFAULT_DEPTH_FAR_M,
+    include_surface_normals: bool = False,
+    surface_normal_intrinsics: PinholeIntrinsics = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+    surface_normal_max_neighbor_depth_delta_m: float = DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M,
 ) -> LeRobotDataset:
     json_dataset = JsonDataset(
         raw_dir,
@@ -450,6 +547,9 @@ def populate_dataset(
         include_depth=include_depth,
         depth_near_m=depth_near_m,
         depth_far_m=depth_far_m,
+        include_surface_normals=include_surface_normals,
+        surface_normal_intrinsics=surface_normal_intrinsics,
+        surface_normal_max_neighbor_depth_delta_m=surface_normal_max_neighbor_depth_delta_m,
     )
     for i in tqdm.tqdm(range(len(json_dataset))):
         episode = json_dataset.get_item(i)
@@ -488,10 +588,33 @@ def json_to_lerobot(
     include_depth: bool = False,
     depth_near_m: float = DEFAULT_DEPTH_NEAR_M,
     depth_far_m: float = DEFAULT_DEPTH_FAR_M,
+    include_surface_normals: bool = False,
+    surface_normals_width: int = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480.width,
+    surface_normals_height: int = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480.height,
+    surface_normals_fx: float = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480.fx,
+    surface_normals_fy: float = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480.fy,
+    surface_normals_cx: float = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480.cx,
+    surface_normals_cy: float = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480.cy,
+    surface_normals_max_neighbor_depth_delta_m: float = DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ):
     if (HF_LEROBOT_HOME / repo_id).exists():
         shutil.rmtree(HF_LEROBOT_HOME / repo_id)
+
+    surface_normal_intrinsics = PinholeIntrinsics(
+        width=surface_normals_width,
+        height=surface_normals_height,
+        fx=surface_normals_fx,
+        fy=surface_normals_fy,
+        cx=surface_normals_cx,
+        cy=surface_normals_cy,
+    )
+    # Validate even when the feature is disabled so invalid explicit CLI values
+    # fail deterministically rather than being silently ignored.
+    surface_normal_metadata = surface_normals_encoding_metadata(
+        intrinsics=surface_normal_intrinsics,
+        max_neighbor_depth_delta_m=surface_normals_max_neighbor_depth_delta_m,
+    )
 
     dataset = create_empty_dataset(
         repo_id,
@@ -500,6 +623,8 @@ def json_to_lerobot(
         has_effort=False,
         has_velocity=False,
         include_depth=include_depth,
+        include_surface_normals=include_surface_normals,
+        surface_normal_intrinsics=surface_normal_intrinsics,
         dataset_config=dataset_config,
     )
     if include_depth:
@@ -513,6 +638,13 @@ def json_to_lerobot(
             "invalid_value": 0,
             "valid_value_range": [1, 255],
         }
+    if include_surface_normals:
+        dataset.meta.info["surface_normals_encoding"] = surface_normal_metadata
+    # ``LeRobotDataset.finalize`` closes writers but does not write info.json.
+    # Persist custom geometry contracts before frame conversion so they survive
+    # image-mode datasets and interrupted conversions as well as video mode.
+    if include_depth or include_surface_normals:
+        write_info(dataset.meta.info, dataset.meta.root)
     dataset = populate_dataset(
         dataset,
         raw_dir,
@@ -520,6 +652,9 @@ def json_to_lerobot(
         include_depth=include_depth,
         depth_near_m=depth_near_m,
         depth_far_m=depth_far_m,
+        include_surface_normals=include_surface_normals,
+        surface_normal_intrinsics=surface_normal_intrinsics,
+        surface_normal_max_neighbor_depth_delta_m=surface_normals_max_neighbor_depth_delta_m,
     )
     dataset.finalize()
 
