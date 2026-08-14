@@ -21,6 +21,7 @@ python unitree_lerobot/utils/convert_unitree_json_to_lerobot.py \
 """
 
 import os
+import av
 import cv2
 import tqdm
 import tyro
@@ -30,13 +31,13 @@ import shutil
 import tempfile
 import numpy as np
 from pathlib import Path
+from PIL import Image
 from collections import defaultdict
 from typing import Literal
 
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import write_info
-from lerobot.datasets.video_utils import encode_video_frames
 
 from unitree_lerobot.utils.constants import ROBOT_CONFIGS
 from unitree_lerobot.utils.depth_encoding import (
@@ -71,23 +72,61 @@ class DatasetConfig:
 DEFAULT_DATASET_CONFIG = DatasetConfig()
 
 
-class SurfaceNormalsLeRobotDataset(LeRobotDataset):
-    """Use near-lossless 4:4:4 video only for the three independent normal axes."""
+def encode_lossless_geometry_video(
+    image_dir: Path,
+    video_path: Path,
+    fps: int,
+) -> None:
+    """Encode geometry bytes without a lossy RGB-to-YUV round trip."""
+
+    input_paths = sorted(image_dir.glob("frame-[0-9][0-9][0-9][0-9][0-9][0-9].png"))
+    if not input_paths:
+        raise FileNotFoundError(f"No geometry frames found in {image_dir}")
+
+    with Image.open(input_paths[0]) as first_image:
+        width, height = first_image.size
+
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    with av.open(str(video_path), "w") as output:
+        stream = output.add_stream(
+            "libx264rgb",
+            fps,
+            options={"g": "2", "crf": "0"},
+        )
+        stream.width = width
+        stream.height = height
+        stream.pix_fmt = "rgb24"
+
+        for input_path in input_paths:
+            with Image.open(input_path) as input_image:
+                frame = av.VideoFrame.from_image(input_image.convert("RGB"))
+            for packet in stream.encode(frame):
+                output.mux(packet)
+
+        for packet in stream.encode():
+            output.mux(packet)
+
+    if not video_path.is_file():
+        raise OSError(f"Geometry video encoding did not create {video_path}")
+
+
+class GeometryVideoLeRobotDataset(LeRobotDataset):
+    """Use byte-exact RGB H.264 for model geometry views only."""
 
     def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
-        if video_key != f"observation.images.{SURFACE_NORMAL_OUTPUT_KEY}":
+        geometry_video_keys = {
+            f"observation.images.{DEPTH_OUTPUT_KEY}",
+            f"observation.images.{SURFACE_NORMAL_OUTPUT_KEY}",
+        }
+        if video_key not in geometry_video_keys:
             return super()._encode_temporary_episode_video(video_key, episode_index)
 
         temp_path = Path(tempfile.mkdtemp(dir=self.root)) / f"{video_key}_{episode_index:03d}.mp4"
         img_dir = self._get_image_file_dir(episode_index, video_key)
-        encode_video_frames(
+        encode_lossless_geometry_video(
             img_dir,
             temp_path,
             self.fps,
-            vcodec="h264",
-            pix_fmt="yuv444p",
-            crf=0,
-            overwrite=True,
         )
         shutil.rmtree(img_dir)
         return temp_path
@@ -515,7 +554,7 @@ def create_empty_dataset(
     if Path(HF_LEROBOT_HOME / repo_id).exists():
         shutil.rmtree(HF_LEROBOT_HOME / repo_id)
 
-    dataset_type = SurfaceNormalsLeRobotDataset if include_surface_normals else LeRobotDataset
+    dataset_type = GeometryVideoLeRobotDataset if include_depth or include_surface_normals else LeRobotDataset
     return dataset_type.create(
         repo_id=repo_id,
         fps=30,

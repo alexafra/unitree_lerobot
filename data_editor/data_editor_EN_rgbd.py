@@ -8,7 +8,6 @@ from collections import defaultdict
 
 import numpy as np
 
-
 from PyQt5.QtCore import Qt, QTimer, QRect, pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QBrush
 from PyQt5.QtWidgets import (
@@ -24,6 +23,19 @@ from PyQt5.QtWidgets import (
     QFileDialog,
     QComboBox,
     QLineEdit
+)
+
+# Keep the documented ``cd data_editor && python data_editor_EN_rgbd.py``
+# launch path working while using the exact same encoder as conversion and
+# deployment.
+REPOSITORY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPOSITORY_ROOT not in sys.path:
+    sys.path.insert(0, REPOSITORY_ROOT)
+
+from unitree_lerobot.utils.surface_normal_encoding import (  # noqa: E402
+    DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+    SURFACE_NORMAL_OUTPUT_KEY,
+    encode_surface_normals_rgb,
 )
 
 
@@ -174,6 +186,74 @@ def load_depth_pixmap(
     ).copy()
 
     return QPixmap.fromImage(image)
+
+
+def aligned_depth_to_surface_normals_rgb(
+    depth,
+    depth_scale_m_per_unit=DEFAULT_DEPTH_SCALE_M_PER_UNIT,
+):
+    """Derive the training/deployment surface-normal view from aligned depth."""
+
+    return encode_surface_normals_rgb(
+        depth,
+        scale_m_per_unit=depth_scale_m_per_unit,
+        intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+    )
+
+
+def load_surface_normals_pixmap(
+    image_path,
+    depth_scale_m_per_unit=DEFAULT_DEPTH_SCALE_M_PER_UNIT,
+):
+    """Load aligned ``depth_0`` and derive its shared surface-normal encoding."""
+
+    import cv2
+
+    aligned_depth = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+
+    if aligned_depth is None:
+        return QPixmap()
+
+    normals_rgb = aligned_depth_to_surface_normals_rgb(
+        aligned_depth,
+        depth_scale_m_per_unit,
+    )
+
+    height, width, channels = normals_rgb.shape
+    bytes_per_line = channels * width
+
+    image = QImage(
+        normals_rgb.data,
+        width,
+        height,
+        bytes_per_line,
+        QImage.Format_RGB888,
+    ).copy()
+
+    return QPixmap.fromImage(image)
+
+
+def resolve_frame_display_paths(item):
+    """Map one raw frame to physical and derived editor display streams."""
+
+    colors = item.get("colors")
+    if not isinstance(colors, dict):
+        colors = {}
+
+    depths = item.get("depths")
+    if not isinstance(depths, dict):
+        depths = {}
+
+    aligned_depth_path = depths.get("depth_0")
+    return {
+        "color_0": colors.get("color_0"),
+        "depth_0": aligned_depth_path,
+        # This is deliberately the same source file as depth_0. The derived
+        # view is never read from or written to processed_raw.
+        SURFACE_NORMAL_OUTPUT_KEY: aligned_depth_path,
+        "raw_depth_0": depths.get("raw_depth_0"),
+    }
+
 
 class RangeSlider(QFrame):
     """
@@ -367,9 +447,17 @@ class DatasetPlayer(QWidget):
     """
 
     DISPLAY_STREAMS = {
-        "color_0": ("RGB Camera 0", False),
-        "depth_0": ("Aligned Depth", True),
-        "raw_depth_0": ("Raw Depth", True),
+        "color_0": ("RGB Camera 0", "color"),
+        "depth_0": ("Aligned Depth", "depth"),
+        SURFACE_NORMAL_OUTPUT_KEY: ("Surface Normals (from Aligned Depth)", "surface_normals"),
+        "raw_depth_0": ("Raw Depth", "depth"),
+    }
+
+    DISPLAY_GRID_POSITIONS = {
+        "color_0": (0, 0),
+        "depth_0": (0, 1),
+        SURFACE_NORMAL_OUTPUT_KEY: (1, 0),
+        "raw_depth_0": (1, 1),
     }
 
     FRAME_FILE_PATTERN = re.compile(
@@ -536,25 +624,12 @@ class DatasetPlayer(QWidget):
         grid = QGridLayout()
         grid.setSpacing(8)
 
-        grid.addWidget(
-            self.image_labels["color_0"],
-            0,
-            0,
-        )
-
-        grid.addWidget(
-            self.image_labels["depth_0"],
-            0,
-            1,
-        )
-
-        grid.addWidget(
-            self.image_labels["raw_depth_0"],
-            1,
-            0,
-            1,
-            2,
-        )
+        for stream_key, (row, column) in self.DISPLAY_GRID_POSITIONS.items():
+            grid.addWidget(
+                self.image_labels[stream_key],
+                row,
+                column,
+            )
 
         self.range_slider = RangeSlider()
         self.range_slider.rangeChanged.connect(self.on_range_changed)
@@ -1084,14 +1159,7 @@ class DatasetPlayer(QWidget):
             if not isinstance(frame_id, int):
                 continue
 
-            colors = item.get("colors") or {}
-            depths = item.get("depths") or {}
-
-            relative_paths = {
-                "color_0": colors.get("color_0"),
-                "depth_0": depths.get("depth_0"),
-                "raw_depth_0": depths.get("raw_depth_0"),
-            }
+            relative_paths = resolve_frame_display_paths(item)
 
             for stream_key, relative_path in relative_paths.items():
                 if not isinstance(relative_path, str):
@@ -1188,7 +1256,7 @@ class DatasetPlayer(QWidget):
         )
 
         for stream_key, stream_info in self.DISPLAY_STREAMS.items():
-            title, is_depth = stream_info
+            title, render_mode = stream_info
 
             label = self.image_labels[stream_key]
             image_path = frame_file_map.get(stream_key)
@@ -1205,13 +1273,24 @@ class DatasetPlayer(QWidget):
                 )
                 continue
 
-            if is_depth:
-                pixmap = load_depth_pixmap(
-                    image_path,
-                    self.depth_scale_m_per_unit,
+            try:
+                if render_mode == "depth":
+                    pixmap = load_depth_pixmap(
+                        image_path,
+                        self.depth_scale_m_per_unit,
+                    )
+                elif render_mode == "surface_normals":
+                    pixmap = load_surface_normals_pixmap(
+                        image_path,
+                        self.depth_scale_m_per_unit,
+                    )
+                else:
+                    pixmap = QPixmap(image_path)
+            except ValueError as error:
+                label.set_placeholder(
+                    f"{title}\nInvalid aligned depth\n{error}"
                 )
-            else:
-                pixmap = QPixmap(image_path)
+                continue
 
             if pixmap.isNull():
                 label.set_placeholder(
