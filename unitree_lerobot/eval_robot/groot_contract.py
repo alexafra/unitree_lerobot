@@ -178,6 +178,7 @@ RIGHT_HAND_UPPER = np.array(
 class ModelContract:
     action_horizon: int
     video_keys: tuple[str, ...] = COLOUR_VIDEO_KEYS
+    vision_input_contract: dict[str, Any] | None = None  # earlyfusion
 
     @property
     def requires_depth(self) -> bool:
@@ -204,6 +205,23 @@ class DepthEncodingContract:
 class SurfaceNormalEncodingContract:
     intrinsics: PinholeIntrinsics
     max_neighbor_depth_delta_m: float
+
+
+def _vision_input_contract(video_keys: tuple[str, ...], fusion: Any = None) -> dict[str, Any]:  # earlyfusion
+    layout = ["ego_view:0", "ego_view:1", "ego_view:2"]  # earlyfusion
+    if fusion is not None:  # earlyfusion
+        if not isinstance(fusion, list) or any(not isinstance(source, dict) for source in fusion):  # earlyfusion
+            raise DeploymentError("Server channel_fusion is malformed")  # earlyfusion
+        sources = [(source.get("key"), source.get("channels")) for source in fusion]  # earlyfusion
+        expected = {  # earlyfusion
+            RGBD_VIDEO_KEYS: [("ego_view", [0, 1, 2]), (DEPTH_OUTPUT_KEY, [0])],  # earlyfusion
+            SURFACE_NORMAL_VIDEO_KEYS: [("ego_view", [0, 1, 2]), (SURFACE_NORMAL_OUTPUT_KEY, [0, 1, 2])],  # earlyfusion
+        }.get(video_keys)  # earlyfusion
+        if sources != expected:  # earlyfusion
+            raise DeploymentError(f"Unsupported channel_fusion for {video_keys}: {sources!r}")  # earlyfusion
+        layout = [f"{key}:{channel}" for key, channels in sources for channel in channels]  # earlyfusion
+    channels = len(layout)  # earlyfusion
+    return {"version": 1, "mode": "early_channel_fusion" if fusion is not None else "separate_views", "input_channels": channels, "channel_layout": layout, "patch_embed_init": {3: "original_rgb", 4: "rgb_mean", 6: "zeros"}[channels], "wire_video_keys": list(video_keys)}  # earlyfusion
 
 
 @dataclass(frozen=True)
@@ -314,6 +332,7 @@ def validate_policy_metadata(
     *,
     requires_depth: bool = False,
     requires_surface_normals: bool = False,
+    vision_input_contract: dict[str, Any] | None = None,  # earlyfusion
 ) -> DepthEncodingContract | SurfaceNormalEncodingContract | None:
     if metadata.get("protocol_version") != 1:
         raise DeploymentError(f"Unsupported GR00T deployment protocol {metadata.get('protocol_version')!r}")
@@ -352,6 +371,10 @@ def validate_policy_metadata(
             )
     if requires_depth and requires_surface_normals:
         raise DeploymentError("A checkpoint cannot request depth_gray_view and surface_normals_view together")
+    if vision_input_contract is not None:  # earlyfusion
+        actual_vision = metadata.get("vision_input_contract")  # earlyfusion
+        if actual_vision != vision_input_contract:  # earlyfusion
+            raise DeploymentError(f"GR00T vision input contract mismatch: got {actual_vision!r}, expected {vision_input_contract!r}")  # earlyfusion
     if requires_surface_normals:
         return _validate_surface_normal_metadata(contract)
     if requires_depth:
@@ -387,6 +410,9 @@ def validate_model_contract(config: dict[str, Any]) -> ModelContract:
             f"Unsupported video keys from GR00T server: {video_keys}; expected exactly "
             f"{COLOUR_VIDEO_KEYS}, {RGBD_VIDEO_KEYS}, or {SURFACE_NORMAL_VIDEO_KEYS}."
         )
+    video_config = config["video"]  # earlyfusion
+    fusion = video_config.get("channel_fusion") if isinstance(video_config, dict) else getattr(video_config, "channel_fusion", None)  # earlyfusion
+    vision_input_contract = _vision_input_contract(video_keys, fusion)  # earlyfusion
     for modality, keys in expected.items():
         actual = tuple(_config_field(config, modality, "modality_keys"))
         if actual != keys:
@@ -421,7 +447,7 @@ def validate_model_contract(config: dict[str, Any]) -> ModelContract:
             )
         if state_key not in (None, key):
             raise DeploymentError(f"Action '{key}' refers to unexpected state key {state_key!r}")
-    return ModelContract(action_horizon=len(action_indices), video_keys=video_keys)
+    return ModelContract(action_horizon=len(action_indices), video_keys=video_keys, vision_input_contract=vision_input_contract)  # earlyfusion
 
 
 def make_observation(

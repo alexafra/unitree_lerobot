@@ -2687,6 +2687,14 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertTrue(contract.requires_surface_normals)
         self.assertEqual(contract.video_keys, SURFACE_NORMAL_VIDEO_KEYS)
 
+    def test_model_contract_preserves_separate_wire_views_for_early_fusion(self):  # earlyfusion
+        config = modality_config(surface_normals=True)  # earlyfusion
+        config["video"]["channel_fusion"] = [{"key": "ego_view", "channels": [0, 1, 2]}, {"key": "surface_normals_view", "channels": [0, 1, 2]}]  # earlyfusion
+        contract = validate_model_contract(config)  # earlyfusion
+        self.assertEqual(contract.vision_input_contract["input_channels"], 6)  # earlyfusion
+        self.assertEqual(contract.vision_input_contract["wire_video_keys"], list(SURFACE_NORMAL_VIDEO_KEYS))  # earlyfusion
+        self.assertEqual(contract.vision_input_contract["channel_layout"][-3:], ["surface_normals_view:0", "surface_normals_view:1", "surface_normals_view:2"])  # earlyfusion
+
     def test_policy_metadata_validates_exact_surface_normal_contract(self):
         metadata = {
             "protocol_version": 1,
@@ -2753,6 +2761,11 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 },
             },
         }
+        vision_contract = validate_model_contract(modality_config(rgbd=True)).vision_input_contract  # earlyfusion
+        metadata["vision_input_contract"] = vision_contract  # earlyfusion
+        validate_policy_metadata(metadata, requires_depth=True, vision_input_contract=vision_contract)  # earlyfusion
+        with self.assertRaisesRegex(DeploymentError, "vision input contract mismatch"):  # earlyfusion
+            validate_policy_metadata(metadata, requires_depth=True, vision_input_contract={**vision_contract, "input_channels": 4})  # earlyfusion
         validate_policy_metadata(metadata)
         depth_contract = validate_policy_metadata(metadata, requires_depth=True)
         self.assertEqual(depth_contract, DepthEncodingContract(near_m=0.25, far_m=1.0))

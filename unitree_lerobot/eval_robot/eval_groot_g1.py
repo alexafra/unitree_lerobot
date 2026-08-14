@@ -2117,6 +2117,7 @@ def run(args: argparse.Namespace) -> None:
             policy_metadata,
             requires_depth=requires_depth_gray,
             requires_surface_normals=requires_surface_normals,
+            vision_input_contract=getattr(contract, "vision_input_contract", None),  # earlyfusion
         )
         if args.execution_horizon > contract.action_horizon:
             raise DeploymentError(
