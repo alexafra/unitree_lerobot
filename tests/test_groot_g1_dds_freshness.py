@@ -9,18 +9,20 @@ from unittest import mock
 
 import numpy as np
 
+from unitree_lerobot.eval_robot import eval_groot_g1
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     ACTUATOR_ARM_STATE_MAX_AGE_S,
     ACTUATOR_HAND_RECOVERY_SAMPLES,
     ACTUATOR_HAND_STATE_MAX_AGE_S,
-    ACTUATOR_HAND_STATE_WARNING_AGE_S,
+    ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
+    ACTUATOR_HAND_STATE_PAUSE_AGE_S,
     G1Dex3StateReader,
     HandStateFreshnessGate,
     RobotState,
     _G1Dex3CommandBackend,
     _actuator_main,
 )
-from unitree_lerobot.eval_robot.groot_contract import InitializationSpec
+from unitree_lerobot.eval_robot.groot_contract import ActionChunk, InitializationSpec
 
 
 def _state(*, captured_at: float, left_at: float, right_at: float) -> RobotState:
@@ -41,7 +43,11 @@ class HandFreshnessGateTests(unittest.TestCase):
     def test_short_gap_pauses_and_requires_distinct_paired_samples(self):
         gate = HandStateFreshnessGate()
         entered = gate.check(
-            _state(captured_at=10.0, left_at=9.90, right_at=10.0),
+            _state(
+                captured_at=10.0,
+                left_at=10.0 - ACTUATOR_HAND_STATE_PAUSE_AGE_S - 0.025,
+                right_at=10.0,
+            ),
             now=10.0,
         )
         self.assertFalse(entered.ready)
@@ -55,22 +61,53 @@ class HandFreshnessGateTests(unittest.TestCase):
             self.assertFalse(gate.check(first_pair, now=10.011).ready)
 
         result = None
+        progress = []
         for index in range(2, ACTUATOR_HAND_RECOVERY_SAMPLES + 1):
             timestamp = 10.0 + index * 0.01
             result = gate.check(
                 _state(captured_at=timestamp, left_at=timestamp, right_at=timestamp),
                 now=timestamp,
             )
+            progress.append(result.fresh_samples)
         assert result is not None
         self.assertTrue(result.ready)
         self.assertTrue(result.recovered)
+        self.assertEqual(progress, list(range(2, ACTUATOR_HAND_RECOVERY_SAMPLES + 1)))
+
+    def test_operator_hold_boundary_is_reported_once(self):
+        gate = HandStateFreshnessGate()
+        entered = gate.check(
+            _state(
+                captured_at=30.0,
+                left_at=30.0 - ACTUATOR_HAND_STATE_PAUSE_AGE_S - 0.001,
+                right_at=30.0,
+            ),
+            now=30.0,
+        )
+        self.assertTrue(entered.entered)
+        self.assertFalse(entered.operator_hold_entered)
+
+        operator_hold = gate.check(
+            _state(
+                captured_at=30.2,
+                left_at=30.2 - ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S - 0.001,
+                right_at=30.2,
+            ),
+            now=30.2,
+        )
+        self.assertTrue(operator_hold.operator_hold_entered)
+        repeated = gate.check(
+            _state(captured_at=30.21, left_at=29.8, right_at=30.21),
+            now=30.21,
+        )
+        self.assertFalse(repeated.operator_hold_entered)
 
     def test_warning_boundary_is_soft_not_inclusive(self):
         gate = HandStateFreshnessGate()
         result = gate.check(
             _state(
                 captured_at=20.0,
-                left_at=20.0 - ACTUATOR_HAND_STATE_WARNING_AGE_S,
+                left_at=20.0 - ACTUATOR_HAND_STATE_PAUSE_AGE_S + 1e-9,
                 right_at=20.0,
             ),
             now=20.0,
@@ -160,6 +197,65 @@ class SplitReaderDeadlineTests(unittest.TestCase):
             reader.latest()
 
 
+class InFlightInferenceFenceTests(unittest.TestCase):
+    def test_response_computed_across_pause_generation_is_discarded(self):
+        class Actuator:
+            hand_pause_generation = 0
+
+            def wait_for_hand_feedback(self):
+                pass
+
+        class Policy:
+            def __init__(self, actuator):
+                self.actuator = actuator
+                self.calls = 0
+                self.resets = 0
+
+            def get_action(self, _observation):
+                self.calls += 1
+                if self.calls == 1:
+                    self.actuator.hand_pause_generation += 1
+                return {"action": self.calls}
+
+            def reset(self):
+                self.resets += 1
+
+        actuator = Actuator()
+        policy = Policy(actuator)
+        state = SimpleNamespace(
+            arm=np.zeros(14),
+            left_hand=np.zeros(7),
+            right_hand=np.zeros(7),
+        )
+        parsed = ActionChunk(
+            arm=np.zeros((8, 14)),
+            left_hand=np.zeros((8, 7)),
+            right_hand=np.zeros((8, 7)),
+        )
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        with (
+            mock.patch(
+                f"{module}.capture_policy_observation",
+                return_value=({"video": object()}, state),
+            ) as capture,
+            mock.patch(f"{module}.parse_action_chunk", return_value=parsed),
+        ):
+            result, _inference_s = eval_groot_g1.infer_chunk(
+                policy,
+                object(),
+                object(),
+                "goal",
+                SimpleNamespace(action_horizon=32),
+                execution_horizon=8,
+                actuator=actuator,
+            )
+
+        self.assertEqual(policy.calls, 2)
+        self.assertEqual(policy.resets, 1)
+        self.assertEqual(capture.call_count, 2)
+        self.assertEqual(result.hand_pause_generation, 1)
+
+
 class ReleaseSchedulerTests(unittest.TestCase):
     def test_zero_weight_release_is_one_arm_write_then_both_hand_stops(self):
         backend = object.__new__(_G1Dex3CommandBackend)
@@ -207,7 +303,7 @@ class ActivePauseIntegrationTests(unittest.TestCase):
                 self._arm_target = np.zeros(14)
                 self._left_target = np.zeros(7)
                 self._right_target = np.zeros(7)
-                self.stale_hands = False
+                self.hand_age_s = 0.0
                 self.first_policy_target = threading.Event()
                 self.policy_targets: list[float] = []
                 self.released = False
@@ -215,7 +311,7 @@ class ActivePauseIntegrationTests(unittest.TestCase):
 
             def state(self):
                 now = time.monotonic()
-                hand_at = now - 0.10 if self.stale_hands else now
+                hand_at = now - self.hand_age_s
                 return RobotState(
                     captured_at=min(now, hand_at),
                     mode_machine=0,
@@ -256,6 +352,8 @@ class ActivePauseIntegrationTests(unittest.TestCase):
         statuses = queue.Queue(maxsize=32)
         stop = threading.Event()
         heartbeat = FakeHeartbeat()
+        hand_pause_generation = FakeHeartbeat()
+        hand_pause_generation.value = 0
         module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
         with (
             mock.patch(f"{module}._G1Dex3CommandBackend", PausingBackend),
@@ -266,6 +364,7 @@ class ActivePauseIntegrationTests(unittest.TestCase):
             thread = threading.Thread(
                 target=_actuator_main,
                 args=(True, None, commands, statuses, stop, heartbeat),
+                kwargs={"hand_pause_generation": hand_pause_generation},
                 daemon=True,
             )
             thread.start()
@@ -302,7 +401,7 @@ class ActivePauseIntegrationTests(unittest.TestCase):
             )
             backend = PausingBackend.instance
             self.assertTrue(backend.first_policy_target.wait(timeout=1.0))
-            backend.stale_hands = True
+            backend.hand_age_s = ACTUATOR_HAND_STATE_PAUSE_AGE_S + 0.025
 
             pause_seen = False
             deadline = time.monotonic() + 1.0
@@ -310,15 +409,86 @@ class ActivePauseIntegrationTests(unittest.TestCase):
                 kind, _value = statuses.get(timeout=0.2)
                 pause_seen = kind == "hand_state_pause"
             self.assertTrue(pause_seen)
-            backend.stale_hands = False
+            backend.hand_age_s = 0.0
 
-            terminal_seen = False
+            replan_seen = False
+            replan_detail = None
             deadline = time.monotonic() + 1.0
-            while time.monotonic() < deadline and not terminal_seen:
+            while time.monotonic() < deadline and not replan_seen:
                 kind, value = statuses.get(timeout=0.2)
-                terminal_seen = kind == "holding" and value == 1
-            self.assertTrue(terminal_seen)
+                if kind == "replan_required":
+                    replan_seen = True
+                    replan_detail = value
+            self.assertTrue(replan_seen)
+            self.assertEqual(replan_detail["reason"], "hand_state_recovered")
+            self.assertEqual(replan_detail["recovery_samples"], ACTUATOR_HAND_RECOVERY_SAMPLES)
             self.assertLessEqual(max(backend.policy_targets), 0.01)
+
+            # A plan produced before the pause generation changed must be
+            # rejected at the actuator boundary even though feedback is now
+            # healthy. No target from it may be published.
+            stale_arm = np.zeros((4, 14))
+            stale_arm[:, 0] = 0.02
+            targets_before_stale_plan = list(backend.policy_targets)
+            commands.put(
+                (
+                    "chunk",
+                    2,
+                    time.monotonic(),
+                    0,
+                    stale_arm,
+                    np.zeros((4, 7)),
+                    np.zeros((4, 7)),
+                )
+            )
+            kind, detail = statuses.get(timeout=1.0)
+            self.assertEqual(kind, "replan_required")
+            self.assertEqual(detail["reason"], "hand_pause_generation_changed")
+            self.assertFalse(detail["plan_installed"])
+            self.assertEqual(backend.policy_targets, targets_before_stale_plan)
+
+            # A current-generation replacement may start. If the same
+            # feedback age crosses 300 ms, automatic resume is revoked and a
+            # terminal powered HOLD is emitted for this sequence.
+            backend.first_policy_target.clear()
+            current_arm = np.zeros((4, 14))
+            current_arm[:, 0] = np.array([0.02, 0.03, 0.04, 0.05])
+            commands.put(
+                (
+                    "chunk",
+                    3,
+                    time.monotonic(),
+                    1,
+                    current_arm,
+                    np.zeros((4, 7)),
+                    np.zeros((4, 7)),
+                )
+            )
+            self.assertTrue(backend.first_policy_target.wait(timeout=1.0))
+            backend.hand_age_s = ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S + 0.025
+
+            seen: dict[str, object] = {}
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and "holding" not in seen:
+                kind, value = statuses.get(timeout=0.2)
+                seen[kind] = value
+            self.assertIn("hand_state_pause", seen)
+            self.assertIn("hand_state_operator_hold", seen)
+            self.assertEqual(seen.get("holding"), 3)
+
+            backend.hand_age_s = 0.0
+            progress = []
+            recovered = False
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and not recovered:
+                kind, value = statuses.get(timeout=0.2)
+                if kind == "hand_state_recovery_progress":
+                    progress.append(value["fresh_samples"])
+                elif kind == "hand_state_recovered":
+                    recovered = True
+                self.assertNotEqual(kind, "replan_required")
+            self.assertTrue(recovered)
+            self.assertEqual(progress, [1, 2, 3])
 
             stop.set()
             thread.join(timeout=1.0)

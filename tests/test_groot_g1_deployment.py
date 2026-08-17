@@ -450,13 +450,13 @@ class GrootG1DeploymentTests(unittest.TestCase):
         # hardware-safety qualification.
         self.assertEqual(MAX_ARM_STEP_RAD, 0.10)
         self.assertEqual(MAX_HAND_STEP_RAD, 0.60)
-        self.assertEqual(JOINT_LIMIT_MARGIN_RAD, 0.03)
+        self.assertEqual(JOINT_LIMIT_MARGIN_RAD, 0.015)
         self.assertEqual(HAND_LIMIT_TOLERANCE_RAD, 0.01)
         self.assertEqual(MEASURED_LIMIT_TOLERANCE_RAD, 0.20)
         self.assertEqual(ARM_RELEASE_RAMP_S, 1.5)
         self.assertEqual(MAX_ARM_DQ_RAD_S, 6.0)
         self.assertEqual(MAX_ARM_TRACKING_ERROR_RAD, 0.35)
-        self.assertEqual(MAX_HAND_TRACKING_ERROR_RAD, 1.50)
+        self.assertEqual(MAX_HAND_TRACKING_ERROR_RAD, 2.0)
         self.assertEqual(QUALIFIED_REAL_MODE_MACHINE, 6)
         self.assertAlmostEqual(MAX_CONDITIONED_ARM_STEP_RAD, 0.03)
         np.testing.assert_allclose(

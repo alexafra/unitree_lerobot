@@ -51,6 +51,8 @@ from unitree_lerobot.eval_robot.run_logging import (
 )
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     G1Dex3StateReader,
+    HandFeedbackOperatorHold,
+    HandFeedbackReplan,
     ImmediateControlEvent,
     RtcTerminalEvent,
     SafeG1Dex3Actuator,
@@ -1109,6 +1111,25 @@ def _raise_if_immediate_control(actuator: SafeG1Dex3Actuator | None) -> None:
         raise OperatorStop
 
 
+def _hand_pause_generation(actuator: SafeG1Dex3Actuator | None) -> int | None:
+    if actuator is None:
+        return None
+    value = getattr(actuator, "hand_pause_generation", None)
+    return None if value is None else int(value)
+
+
+def _wait_for_hand_feedback(actuator: SafeG1Dex3Actuator | None) -> None:
+    if actuator is None:
+        return
+    waiter = getattr(actuator, "wait_for_hand_feedback", None)
+    if callable(waiter):
+        waiter()
+        return
+    checker = getattr(actuator, "assert_healthy", None)
+    if callable(checker):
+        checker()
+
+
 def capture_policy_observation(
     state_reader: G1Dex3StateReader,
     camera: TeleimagerCamera,
@@ -1121,12 +1142,20 @@ def capture_policy_observation(
 ) -> tuple[dict[str, object], object]:
     if actuator is not None:
         _raise_if_immediate_control(actuator)
+        waiter = getattr(actuator, "wait_for_hand_feedback", None)
+        if callable(waiter):
+            waiter()
         actuator.heartbeat()
     state = state_reader.read(timeout_s=0.5)
     if actuator is not None:
         _raise_if_immediate_control(actuator)
         actuator.heartbeat()
     images = camera.read(timeout_s=camera_timeout_s)
+    if actuator is not None:
+        waiter = getattr(actuator, "wait_for_hand_feedback", None)
+        if callable(waiter):
+            waiter()
+        actuator.heartbeat()
     depth_gray = getattr(images, "depth_gray", None)
     surface_normals = getattr(images, "surface_normals", None)
     if show_camera:
@@ -1165,37 +1194,56 @@ def infer_chunk(
     show_camera: bool = False,
     allow_custom_instruction: bool = False,
 ) -> tuple[ActionChunk, float]:
-    observation, state = capture_policy_observation(
-        state_reader,
-        camera,
-        instruction,
-        model_contract,
-        actuator,
-        camera_timeout_s,
-        show_camera,
-        allow_custom_instruction,
-    )
-    started = time.monotonic()
-    try:
-        action = policy.get_action(observation)
-    except BaseException:
-        _raise_if_immediate_control(actuator)
-        raise
-    inference_s = time.monotonic() - started
-    if actuator is not None:
-        _raise_if_immediate_control(actuator)
-        actuator.assert_healthy()
-    chunk = parse_action_chunk(
-        action,
-        model_horizon=model_contract.action_horizon,
-        execution_horizon=execution_horizon,
-        current_arm=state.arm,
-        current_left=state.left_hand,
-        current_right=state.right_hand,
-        validate_initial_step=validate_initial_step,
-        validate_target_steps=command_conditioning == "none",
-    )
-    return chunk, inference_s
+    while True:
+        pause_generation = _hand_pause_generation(actuator)
+        observation, state = capture_policy_observation(
+            state_reader,
+            camera,
+            instruction,
+            model_contract,
+            actuator,
+            camera_timeout_s,
+            show_camera,
+            allow_custom_instruction,
+        )
+        if actuator is not None and _hand_pause_generation(actuator) != pause_generation:
+            LOGGER.warning("Discarded observation captured across a Dex3 feedback pause; recapturing")
+            continue
+        started = time.monotonic()
+        try:
+            action = policy.get_action(observation)
+        except BaseException:
+            _raise_if_immediate_control(actuator)
+            raise
+        inference_s = time.monotonic() - started
+        if actuator is not None:
+            _raise_if_immediate_control(actuator)
+            _wait_for_hand_feedback(actuator)
+            if _hand_pause_generation(actuator) != pause_generation:
+                LOGGER.warning(
+                    "Discarded policy response computed across a Dex3 feedback pause; "
+                    "resetting and inferring from a fresh observation"
+                )
+                policy.reset()
+                continue
+        chunk = parse_action_chunk(
+            action,
+            model_horizon=model_contract.action_horizon,
+            execution_horizon=execution_horizon,
+            current_arm=state.arm,
+            current_left=state.left_hand,
+            current_right=state.right_hand,
+            validate_initial_step=validate_initial_step,
+            validate_target_steps=command_conditioning == "none",
+        )
+        if pause_generation is not None:
+            chunk = ActionChunk(
+                arm=chunk.arm,
+                left_hand=chunk.left_hand,
+                right_hand=chunk.right_hand,
+                hand_pause_generation=pause_generation,
+            )
+        return chunk, inference_s
 
 
 def infer_plan(
@@ -1211,28 +1259,39 @@ def infer_plan(
     show_camera: bool = False,
     allow_custom_instruction: bool = False,
 ) -> tuple[ActionChunk, float]:
-    observation, state = capture_policy_observation(
-        state_reader,
-        camera,
-        instruction,
-        model_contract,
-        actuator,
-        camera_timeout_s,
-        show_camera,
-        allow_custom_instruction,
-    )
-    started = time.monotonic()
-    try:
-        action = policy.get_action(observation)
-    except BaseException:
-        _raise_if_immediate_control(actuator)
-        raise
-    inference_s = time.monotonic() - started
-    if actuator is not None:
-        _raise_if_immediate_control(actuator)
-        actuator.assert_healthy()
-    return (
-        parse_action_plan(
+    while True:
+        pause_generation = _hand_pause_generation(actuator)
+        observation, state = capture_policy_observation(
+            state_reader,
+            camera,
+            instruction,
+            model_contract,
+            actuator,
+            camera_timeout_s,
+            show_camera,
+            allow_custom_instruction,
+        )
+        if actuator is not None and _hand_pause_generation(actuator) != pause_generation:
+            LOGGER.warning("Discarded observation captured across a Dex3 feedback pause; recapturing")
+            continue
+        started = time.monotonic()
+        try:
+            action = policy.get_action(observation)
+        except BaseException:
+            _raise_if_immediate_control(actuator)
+            raise
+        inference_s = time.monotonic() - started
+        if actuator is not None:
+            _raise_if_immediate_control(actuator)
+            _wait_for_hand_feedback(actuator)
+            if _hand_pause_generation(actuator) != pause_generation:
+                LOGGER.warning(
+                    "Discarded policy response computed across a Dex3 feedback pause; "
+                    "resetting and inferring from a fresh observation"
+                )
+                policy.reset()
+                continue
+        plan = parse_action_plan(
             action,
             model_horizon=model_contract.action_horizon,
             current_arm=state.arm,
@@ -1240,9 +1299,15 @@ def infer_plan(
             current_right=state.right_hand,
             validate_initial_step=validate_initial_step,
             validate_target_steps=command_conditioning == "none",
-        ),
-        inference_s,
-    )
+        )
+        if pause_generation is not None:
+            plan = ActionChunk(
+                arm=plan.arm,
+                left_hand=plan.left_hand,
+                right_hand=plan.right_hand,
+                hand_pause_generation=pause_generation,
+            )
+        return plan, inference_s
 
 
 def chunk_delta_summary(chunk: ActionChunk, state_reader: G1Dex3StateReader) -> str:
@@ -1272,6 +1337,10 @@ def _prepare_policy_goal(
     """Reset a goal session and optionally perform its guarded warm-start."""
 
     try:
+        # A goal selected from the 300 ms operator-HOLD terminal is explicit
+        # consent to try again, but no policy-server command may be sent until
+        # three distinct paired Dex3 readings have re-established feedback.
+        _wait_for_hand_feedback(actuator)
         _run_with_immediate_operator_keys(actuator, policy.reset)
         if warmup2_enabled is None:
             warmup2_enabled = bool(getattr(args, "policy_warm_start", True))
@@ -1302,6 +1371,13 @@ def _prepare_policy_goal(
         return "hold"
     except OperatorRelease:
         return "release"
+    except HandFeedbackOperatorHold as exc:
+        LOGGER.warning(
+            "Dex3 feedback crossed 300 ms during goal preparation; remaining in powered HOLD: %s",
+            exc.detail,
+            extra={"terminal_yellow": True},
+        )
+        return "hold"
     LOGGER.warning(
         "Warmup2 first target inferred in %.3fs: %s",
         inference_s,
@@ -1310,10 +1386,36 @@ def _prepare_policy_goal(
     decision = confirm_policy_warm_start(actuator, delta_summary)
     if decision in {"hold", "release"}:
         return decision
-    _run_blocking_motion_with_immediate_release(
-        actuator,
-        lambda: actuator.warm_start(warm_start_chunk),
-    )
+    try:
+        _run_blocking_motion_with_immediate_release(
+            actuator,
+            lambda: actuator.warm_start(warm_start_chunk),
+        )
+    except HandFeedbackReplan as exc:
+        LOGGER.warning(
+            "Warmup2 policy target was invalidated by a Dex3 feedback pause; "
+            "re-observing the same goal: %s",
+            exc.detail,
+            extra={"terminal_yellow": True},
+        )
+        return _prepare_policy_goal(
+            policy,
+            state_reader,
+            camera,
+            actuator,
+            instruction,
+            contract,
+            args,
+            allow_custom_instruction=allow_custom_instruction,
+            warmup2_enabled=warmup2_enabled,
+        )
+    except HandFeedbackOperatorHold as exc:
+        LOGGER.warning(
+            "Dex3 feedback crossed 300 ms before Warmup2 motion; remaining in powered HOLD: %s",
+            exc.detail,
+            extra={"terminal_yellow": True},
+        )
+        return "hold"
     LOGGER.warning("Warmup2 reached target 0; the inferred chunk was discarded")
     decision = confirm_policy_continue(actuator)
     if decision in {"hold", "release"}:
@@ -1414,6 +1516,14 @@ def _run_active_goal(
         except OperatorRelease:
             LOGGER.warning("Operator requested immediate orderly authority release")
             outcome = "release"
+        except HandFeedbackOperatorHold as exc:
+            LOGGER.warning(
+                "Dex3 feedback crossed 300 ms; goal %r was abandoned in powered HOLD: %s",
+                task_name,
+                exc.detail,
+                extra={"terminal_yellow": True},
+            )
+            outcome = "hold"
         except ImmediateControlEvent as exc:
             if exc.action == "release":
                 outcome = "release"
@@ -1483,7 +1593,18 @@ def _run_active_goal_controlled(
             LOGGER.warning("Operator requested orderly authority release; inferred chunk discarded")
             return "release"
 
-        sequence = actuator.submit(chunk)
+        try:
+            sequence = actuator.submit(chunk)
+        except HandFeedbackReplan as exc:
+            LOGGER.warning(
+                "Policy chunk was invalidated at installation by a Dex3 feedback pause; "
+                "re-observing goal %r: %s",
+                task_name,
+                exc.detail,
+                extra={"terminal_yellow": True},
+            )
+            policy.reset()
+            continue
         completion = actuator.wait_completed(
             sequence,
             timeout_s=args.execution_horizon / CONTROL_HZ + 1.0,
@@ -1498,17 +1619,30 @@ def _run_active_goal_controlled(
             detail = getattr(actuator, "last_replan_detail", None)
             if not isinstance(detail, dict):
                 detail = {}
-            LOGGER.warning(
-                "AUTOMATIC REPLAN after scheduler discontinuity during goal %r: sequence=%s action=%s "
-                "lateness=%.3fs; discarded %s stale actions and refetching from a fresh observation "
-                "without entering operator HOLD; full timing ring retained for post-release dump",
-                task_name,
-                detail.get("sequence", sequence),
-                detail.get("action_index", "?"),
-                float(detail.get("lateness_s", 0.0)),
-                detail.get("discarded_actions", "?"),
-                extra={"terminal_yellow": True},
-            )
+            if detail.get("reason") == "hand_state_recovered":
+                LOGGER.warning(
+                    "AUTOMATIC REPLAN after transient Dex3 feedback recovery during goal %r: "
+                    "pause=%.3fs, safety readings=%s/3; discarded %s old actions and "
+                    "refetching from a fresh observation",
+                    task_name,
+                    float(detail.get("pause_s", 0.0)),
+                    detail.get("recovery_samples", "?"),
+                    detail.get("discarded_actions", "?"),
+                    extra={"terminal_yellow": True},
+                )
+            else:
+                LOGGER.warning(
+                    "AUTOMATIC REPLAN after scheduler discontinuity during goal %r: sequence=%s "
+                    "action=%s lateness=%.3fs; discarded %s stale actions and refetching from a "
+                    "fresh observation without entering operator HOLD; full timing ring retained "
+                    "for post-release dump",
+                    task_name,
+                    detail.get("sequence", sequence),
+                    detail.get("action_index", "?"),
+                    float(detail.get("lateness_s", 0.0)),
+                    detail.get("discarded_actions", "?"),
+                    extra={"terminal_yellow": True},
+                )
             executed_before_gap = max(0, int(detail.get("action_index", 0)))
             remaining_action_budget = max(0, remaining_action_budget - executed_before_gap)
             if remaining_action_budget == 0:
@@ -1616,19 +1750,32 @@ def _run_active_goal_rtc(
                     detail = {}
                 consumed = int(detail.get("rtc_total_actions", detail.get("action_index", 0)))
                 remaining_action_budget = max(0, remaining_action_budget - max(0, consumed))
-                LOGGER.warning(
-                    "AUTOMATIC RTC REPLAN after scheduler discontinuity during goal %r: sequence=%s action=%s "
-                    "lateness=%.3fs; discarded %s stale actions and refetching a fresh plan "
-                    "without entering operator HOLD (remaining action budget=%d); full timing ring "
-                    "retained for post-release dump",
-                    task_name,
-                    detail.get("sequence", "?"),
-                    detail.get("action_index", "?"),
-                    float(detail.get("lateness_s", 0.0)),
-                    detail.get("discarded_actions", "?"),
-                    remaining_action_budget,
-                    extra={"terminal_yellow": True},
-                )
+                if detail.get("reason") == "hand_state_recovered":
+                    LOGGER.warning(
+                        "AUTOMATIC RTC REPLAN after transient Dex3 feedback recovery during goal %r: "
+                        "pause=%.3fs, safety readings=%s/3; discarded %s old actions and "
+                        "refetching a fresh plan (remaining action budget=%d)",
+                        task_name,
+                        float(detail.get("pause_s", 0.0)),
+                        detail.get("recovery_samples", "?"),
+                        detail.get("discarded_actions", "?"),
+                        remaining_action_budget,
+                        extra={"terminal_yellow": True},
+                    )
+                else:
+                    LOGGER.warning(
+                        "AUTOMATIC RTC REPLAN after scheduler discontinuity during goal %r: "
+                        "sequence=%s action=%s lateness=%.3fs; discarded %s stale actions and "
+                        "refetching a fresh plan without entering operator HOLD (remaining action "
+                        "budget=%d); full timing ring retained for post-release dump",
+                        task_name,
+                        detail.get("sequence", "?"),
+                        detail.get("action_index", "?"),
+                        float(detail.get("lateness_s", 0.0)),
+                        detail.get("discarded_actions", "?"),
+                        remaining_action_budget,
+                        extra={"terminal_yellow": True},
+                    )
                 if remaining_action_budget == 0:
                     outcome = "complete"
                     break
@@ -1640,6 +1787,14 @@ def _run_active_goal_rtc(
         except OperatorRelease:
             LOGGER.warning("Operator requested immediate orderly authority release during RTC")
             outcome = "release"
+        except HandFeedbackOperatorHold as exc:
+            LOGGER.warning(
+                "Dex3 feedback crossed 300 ms; RTC goal %r was abandoned in powered HOLD: %s",
+                task_name,
+                exc.detail,
+                extra={"terminal_yellow": True},
+            )
+            outcome = "hold"
         except ImmediateControlEvent as exc:
             if exc.action == "release":
                 outcome = "release"
@@ -1696,7 +1851,10 @@ def _run_active_goal_rtc_controlled(
         if action_budget_override is None
         else int(action_budget_override)
     )
-    current_sequence = actuator.start_rtc(plan, action_budget=action_budget)
+    try:
+        current_sequence = actuator.start_rtc(plan, action_budget=action_budget)
+    except HandFeedbackReplan:
+        return "replan"
     current_plan = plan
     # Store the post-capture part of recent delays. Each request adds its own
     # measured capture delay exactly once when selecting the frozen prefix.
@@ -1707,6 +1865,7 @@ def _run_active_goal_rtc_controlled(
     request_count = 0
     handoff_count = 0
     next_snapshot_at = 0.0
+    hand_pause_seen = False
 
     LOGGER.info(
         "RTC live plan started for %r: horizon=%d, minimum execution=%d, action budget=%d",
@@ -1750,6 +1909,16 @@ def _run_active_goal_rtc_controlled(
                 LOGGER.error("RTC plan underrun/rejection; child entered powered HOLD: %s", detail)
                 _drain_rtc_worker(worker, actuator)
                 return "hold"
+
+            if actuator.hand_state_paused:
+                hand_pause_seen = True
+            if hand_pause_seen:
+                # The child discarded the time-indexed plan at pause entry.
+                # Do not consume an in-flight response or request another one;
+                # recovery will surface as a fresh-replan event, while the
+                # 300 ms boundary surfaces as terminal HOLD.
+                time.sleep(0.002)
+                continue
 
             response = worker.poll()
             if response is not None:
@@ -2410,6 +2579,10 @@ def run(args: argparse.Namespace) -> None:
                     selector_kwargs["return_to_start"] = True
                 next_goal = _select_next_goal_while_holding(actuator, **selector_kwargs)
                 custom_goal_mode = mode_state["custom_goal_mode"]
+                if next_goal is not None:
+                    acknowledge = getattr(actuator, "acknowledge_hand_operator_hold", None)
+                    if callable(acknowledge):
+                        acknowledge()
                 if next_goal != RETURN_TO_START:
                     break
                 decision = confirm_return_to_start(actuator, return_to_start_spec)

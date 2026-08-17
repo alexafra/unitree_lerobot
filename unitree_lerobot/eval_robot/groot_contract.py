@@ -229,6 +229,11 @@ class ActionChunk:
     arm: np.ndarray
     left_hand: np.ndarray
     right_hand: np.ndarray
+    # Live inference stamps the Dex3 feedback-pause generation that was
+    # current when this plan was produced.  Offline callers leave it unset.
+    # The actuator checks this immediately before installing policy motion so
+    # a result computed across a feedback outage can never become executable.
+    hand_pause_generation: int | None = None
 
     @property
     def length(self) -> int:

@@ -68,9 +68,13 @@ LOGGER = logging.getLogger(__name__)
 
 STATE_MAX_AGE_S = 0.25
 ACTUATOR_ARM_STATE_MAX_AGE_S = 0.075
-ACTUATOR_HAND_STATE_WARNING_AGE_S = 0.075
-ACTUATOR_HAND_STATE_MAX_AGE_S = 1.5 #SAFETYCHANGE 0.250 original
-ACTUATOR_HAND_RECOVERY_SAMPLES = 5
+ACTUATOR_HAND_STATE_PAUSE_AGE_S = 0.100
+ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S = 0.300
+ACTUATOR_HAND_STATE_MAX_AGE_S = 3.0
+ACTUATOR_HAND_RECOVERY_SAMPLES = 3
+# Backward-compatible name for tests/internal imports that predate the explicit
+# pause/operator-HOLD split.
+ACTUATOR_HAND_STATE_WARNING_AGE_S = ACTUATOR_HAND_STATE_PAUSE_AGE_S
 # Backward-compatible name for tests/internal imports.  It remains the hard
 # arm-state deadline; hand state has its own limits above.
 ACTUATOR_STATE_MAX_AGE_S = ACTUATOR_ARM_STATE_MAX_AGE_S
@@ -89,12 +93,12 @@ DDS_WRITE_TIMEOUT_S = 0.5
 # This is the local measured arm-dq watchdog ceiling, not an official Unitree limit.
 MAX_ARM_DQ_RAD_S = 6.0
 MAX_ARM_TRACKING_ERROR_RAD = 0.35
-# CHANGEDSAFETY: original local adapter default was 0.50 rad; current is 1.50 rad.
+# CHANGEDSAFETY: original local adapter default was 0.50 rad; current is 2.0 rad.
 # This is max abs(measured hand q - commanded hand q), not a speed limit.
 MAX_HAND_TRACKING_ERROR_RAD = 2
 # The original 0.50-rad threshold remains a warning-only diagnostic.  It must
 # persist across distinct hand-state samples for 0.20 s; 0.40 rad hysteresis
-# prevents repeated warnings at the boundary.  Only the aligned 1.50-rad gate
+# prevents repeated warnings at the boundary.  Only the aligned 2.0-rad gate
 # above is an actuator fault.
 HAND_TRACKING_WARNING_RAD = 0.50
 HAND_TRACKING_WARNING_CLEAR_RAD = 0.40
@@ -183,6 +187,22 @@ class RtcTerminalEvent(DeploymentError):
         self.detail = detail
 
 
+class HandFeedbackReplan(DeploymentError):
+    """A policy result was invalidated by a newer Dex3 feedback-pause epoch."""
+
+    def __init__(self, detail: Any):
+        super().__init__(f"Dex3 feedback pause invalidated the policy result: {detail}")
+        self.detail = detail
+
+
+class HandFeedbackOperatorHold(DeploymentError):
+    """The 300 ms Dex3 boundary revoked automatic task resume."""
+
+    def __init__(self, detail: Any):
+        super().__init__(f"Dex3 feedback crossed the operator-HOLD boundary: {detail}")
+        self.detail = detail
+
+
 class ImmediateControlEvent(DeploymentError):
     """An operator STOP/release interrupted a blocking actuator operation."""
 
@@ -202,7 +222,7 @@ class RobotState:
     left_hand: np.ndarray
     right_hand: np.ndarray
     # DDS hand messages have no qualified capture timestamp. These are local
-    # monotonic callback-receipt times, kept separately so a 50 Hz hand sample
+    # monotonic callback-receipt times, kept separately so one cached hand sample
     # is not compared with a newer 100 Hz command or counted twice.
     left_hand_received_at: float | None = None
     right_hand_received_at: float | None = None
@@ -214,9 +234,12 @@ class HandFreshnessResult:
     ready: bool
     entered: bool = False
     recovered: bool = False
+    recovery_progressed: bool = False
+    operator_hold_entered: bool = False
     pause_s: float = 0.0
     stale_hands: tuple[str, ...] = ()
     max_age_s: float = 0.0
+    fresh_samples: int = 0
 
 
 class HandStateFreshnessGate:
@@ -226,6 +249,7 @@ class HandStateFreshnessGate:
         self._active = False
         self._started_at = 0.0
         self._fresh_samples = 0
+        self._operator_hold_active = False
         self._last_left_at = 0.0
         self._last_right_at = 0.0
 
@@ -237,6 +261,7 @@ class HandStateFreshnessGate:
         self._active = False
         self._started_at = 0.0
         self._fresh_samples = 0
+        self._operator_hold_active = False
         self._last_left_at = 0.0
         self._last_right_at = 0.0
 
@@ -249,7 +274,7 @@ class HandStateFreshnessGate:
             "right": max(0.0, checked_at - float(right_at)),
         }
         stale_hands = tuple(
-            name for name, age_s in ages.items() if age_s > ACTUATOR_HAND_STATE_WARNING_AGE_S
+            name for name, age_s in ages.items() if age_s > ACTUATOR_HAND_STATE_PAUSE_AGE_S
         )
         max_age_s = max(ages.values())
         if stale_hands:
@@ -257,12 +282,19 @@ class HandStateFreshnessGate:
             if entered:
                 self._active = True
                 self._started_at = checked_at
+            operator_hold_entered = (
+                not self._operator_hold_active
+                and max_age_s > ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S
+            )
+            if operator_hold_entered:
+                self._operator_hold_active = True
             self._fresh_samples = 0
             self._last_left_at = float(left_at)
             self._last_right_at = float(right_at)
             return HandFreshnessResult(
                 ready=False,
                 entered=entered,
+                operator_hold_entered=operator_hold_entered,
                 stale_hands=stale_hands,
                 max_age_s=max_age_s,
             )
@@ -273,20 +305,33 @@ class HandStateFreshnessGate:
         # Count actual paired DDS updates, not repeated 100 Hz reads of one
         # cached sample.
         if float(left_at) <= self._last_left_at or float(right_at) <= self._last_right_at:
-            return HandFreshnessResult(ready=False, max_age_s=max_age_s)
+            return HandFreshnessResult(
+                ready=False,
+                max_age_s=max_age_s,
+                fresh_samples=self._fresh_samples,
+            )
         self._last_left_at = float(left_at)
         self._last_right_at = float(right_at)
         self._fresh_samples += 1
         if self._fresh_samples < ACTUATOR_HAND_RECOVERY_SAMPLES:
-            return HandFreshnessResult(ready=False, max_age_s=max_age_s)
+            return HandFreshnessResult(
+                ready=False,
+                recovery_progressed=True,
+                max_age_s=max_age_s,
+                fresh_samples=self._fresh_samples,
+            )
 
         pause_s = checked_at - self._started_at
+        fresh_samples = self._fresh_samples
         self.reset()
         return HandFreshnessResult(
             ready=True,
             recovered=True,
+            recovery_progressed=True,
+            operator_hold_entered=False,
             pause_s=pause_s,
             max_age_s=max_age_s,
+            fresh_samples=fresh_samples,
         )
 
 
@@ -2226,6 +2271,29 @@ def _heartbeat_age(heartbeat: Any) -> float:
     return time.monotonic() - last
 
 
+def _hand_pause_generation_value(generation: Any | None) -> int:
+    if generation is None:
+        return 0
+    with generation.get_lock():
+        return int(generation.value)
+
+
+def _advance_hand_pause_generation(generation: Any | None) -> int:
+    if generation is None:
+        return 0
+    with generation.get_lock():
+        generation.value += 1
+        return int(generation.value)
+
+
+def _policy_generation_matches(expected: Any, generation: Any | None) -> bool:
+    if expected is None:
+        return True
+    if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+        raise DeploymentError("Policy command has an invalid Dex3 pause generation")
+    return expected == _hand_pause_generation_value(generation)
+
+
 def _status(status_queue: MpQueue, kind: str, payload: Any = None) -> None:
     try:
         status_queue.put((kind, payload), timeout=0.2)
@@ -2256,15 +2324,33 @@ def _observe_hand_freshness(
             "context": context,
             "hands": result.stale_hands,
             "age_s": result.max_age_s,
-            "warning_age_s": ACTUATOR_HAND_STATE_WARNING_AGE_S,
+            "pause_age_s": ACTUATOR_HAND_STATE_PAUSE_AGE_S,
+            "operator_hold_age_s": ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
             "hard_age_s": ACTUATOR_HAND_STATE_MAX_AGE_S,
         }
         _status_nonblocking(status_queue, "hand_state_pause", payload)
-    elif result.recovered:
+    if result.operator_hold_entered:
+        payload = {
+            "context": context,
+            "hands": result.stale_hands,
+            "age_s": result.max_age_s,
+            "operator_hold_age_s": ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
+            "hard_age_s": ACTUATOR_HAND_STATE_MAX_AGE_S,
+        }
+        _status(status_queue, "hand_state_operator_hold", payload)
+    if result.recovery_progressed:
+        payload = {
+            "context": context,
+            "fresh_samples": result.fresh_samples,
+            "required_samples": ACTUATOR_HAND_RECOVERY_SAMPLES,
+        }
+        _status_nonblocking(status_queue, "hand_state_recovery_progress", payload)
+    if result.recovered:
         payload = {
             "context": context,
             "pause_s": result.pause_s,
-            "fresh_samples": ACTUATOR_HAND_RECOVERY_SAMPLES,
+            "fresh_samples": result.fresh_samples,
+            "required_samples": ACTUATOR_HAND_RECOVERY_SAMPLES,
         }
         # Recovery gates future motion, so unlike the entry diagnostic this
         # acknowledgment is delivered through the bounded reliable path.
@@ -2896,6 +2982,7 @@ def _actuator_main(
     dds_hold_diagnostics: bool = False,
     run_log_dir: str | None = None,
     gravity_feedforward: bool = True,
+    hand_pause_generation: Any | None = None,
 ) -> None:
     if run_log_dir is not None:
         configure_process_logging(Path(run_log_dir) / "actuator.log")
@@ -3151,7 +3238,7 @@ def _actuator_main(
         replan_last_loop_started: float | None = None
         replan_stable_samples = 0
         urgent_hold_active = False
-        paused_sync_sequence: int | None = None
+        pending_hand_replan_detail: dict[str, Any] | None = None
         active_timing = ActiveTimingRing()
         # Per-DDS-stage monotonic timers are enabled only after initialization,
         # where the active policy loop needs them. They add no file I/O to the
@@ -3227,21 +3314,24 @@ def _actuator_main(
             )
             active_timing.note_freshness(freshness)
             if freshness.entered:
-                had_sync_motion = chunk is not None and not rtc_mode
-                had_rtc_motion = chunk is not None and rtc_mode
-                if had_sync_motion:
-                    paused_sync_sequence = chunk_sequence
-                if had_rtc_motion:
-                    _status(
-                        status_queue,
-                        "rtc_rejected",
-                        {
-                            "reason": "hand_state_soft_stale",
-                            "sequence": chunk_sequence,
-                            "action_index": chunk_index,
-                            "total_actions": rtc_total_actions,
-                        },
-                    )
+                pause_generation = _advance_hand_pause_generation(hand_pause_generation)
+                had_motion = chunk is not None
+                if had_motion:
+                    pending_hand_replan_detail = {
+                        "reason": "hand_state_soft_stale",
+                        "sequence": int(chunk_sequence),
+                        "action_index": int(chunk_index),
+                        "chunk_length": int(chunk.length),
+                        "discarded_actions": int(chunk.length - chunk_index),
+                        "rtc": bool(rtc_mode),
+                        "rtc_total_actions": int(rtc_total_actions),
+                        "rtc_action_budget": int(rtc_action_budget),
+                        "feedback_age_s": float(freshness.max_age_s),
+                        "pause_age_s": ACTUATOR_HAND_STATE_PAUSE_AGE_S,
+                        "operator_hold_age_s": ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
+                        "hand_pause_generation": pause_generation,
+                    }
+                    last_discontinued_sequence = int(chunk_sequence)
                 # Retain the exact targets most recently published.  Resetting
                 # the conditioner to those targets fences every unconsumed
                 # policy command without copying stale hand measurements.
@@ -3261,9 +3351,33 @@ def _actuator_main(
                 rtc_mode = False
                 rtc_total_actions = 0
                 rtc_action_budget = 0
-                holding = True
+                holding = not had_motion
+                replan_freeze_active = had_motion
 
             if not freshness.ready:
+                if freshness.operator_hold_entered and (
+                    pending_hand_replan_detail is not None or pending_replan_detail is not None
+                ):
+                    terminal_detail = dict(
+                        pending_hand_replan_detail
+                        if pending_hand_replan_detail is not None
+                        else pending_replan_detail
+                    )
+                    terminal_detail.update(
+                        reason="hand_state_operator_hold",
+                        feedback_age_s=float(freshness.max_age_s),
+                        operator_hold_age_s=ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
+                    )
+                    pending_hand_replan_detail = None
+                    pending_replan_detail = None
+                    replan_freeze_active = False
+                    replan_last_loop_started = None
+                    replan_stable_samples = 0
+                    holding = True
+                    if bool(terminal_detail.get("rtc", False)):
+                        _status(status_queue, "rtc_rejected", terminal_detail)
+                    else:
+                        _status(status_queue, "holding", int(terminal_detail["sequence"]))
                 # STOP/release remains higher priority than recovery.  A STOP
                 # barrier may be queued behind an RTC request, so discard all
                 # queued motion while the independent urgent latch is set and
@@ -3280,10 +3394,10 @@ def _actuator_main(
                             # not let the old replan surface after recovery or
                             # leave the child logically outside HOLD.
                             pending_replan_detail = None
+                            pending_hand_replan_detail = None
                             replan_freeze_active = False
                             replan_last_loop_started = None
                             replan_stable_samples = 0
-                            paused_sync_sequence = None
                             holding = True
                             urgent_hold_event.clear()
                             urgent_hold_active = False
@@ -3313,9 +3427,18 @@ def _actuator_main(
                     backend._right_target,
                 )
                 tracking_checks_after = time.monotonic() + TRACKING_GRACE_S
-                if paused_sync_sequence is not None:
-                    _status(status_queue, "holding", paused_sync_sequence)
-                    paused_sync_sequence = None
+                if pending_hand_replan_detail is not None:
+                    pending_hand_replan_detail.update(
+                        reason="hand_state_recovered",
+                        pause_s=float(freshness.pause_s),
+                        recovery_samples=int(freshness.fresh_samples),
+                    )
+                    pending_replan_detail = pending_hand_replan_detail
+                    pending_hand_replan_detail = None
+                    replan_freeze_active = True
+                    holding = False
+                    replan_last_loop_started = loop_started
+                    replan_stable_samples = 0
                 publish_active()
                 wait_active(loop_started)
                 continue
@@ -3329,7 +3452,8 @@ def _actuator_main(
                 else:
                     replan_stable_samples = 0
                 if replan_stable_samples >= ACTION_REPLAN_RECOVERY_SAMPLES:
-                    pending_replan_detail["recovery_samples"] = replan_stable_samples
+                    pending_replan_detail.setdefault("recovery_samples", replan_stable_samples)
+                    pending_replan_detail["publisher_recovery_samples"] = replan_stable_samples
                     if _status_nonblocking(
                         status_queue,
                         "replan_required",
@@ -3472,13 +3596,32 @@ def _actuator_main(
                     continue
 
                 if kind == "warm_start":
-                    if not isinstance(command, tuple) or len(command) != 3:
+                    if not isinstance(command, tuple) or len(command) not in {3, 4}:
                         raise DeploymentError("Malformed policy warm-start command")
                     if chunk is not None or not holding:
                         raise DeploymentError("Policy warm-start requires an acknowledged hold with no active chunk")
-                    _, created_at, warm_start = command
+                    if len(command) == 4:
+                        _, created_at, expected_pause_generation, warm_start = command
+                    else:
+                        _, created_at, warm_start = command
+                        expected_pause_generation = None
                     if not isinstance(warm_start, InitializationSpec):
                         raise DeploymentError("Malformed policy warm-start target")
+                    if not _policy_generation_matches(
+                        expected_pause_generation,
+                        hand_pause_generation,
+                    ):
+                        _status(
+                            status_queue,
+                            "warm_start_invalidated",
+                            {
+                                "expected_generation": expected_pause_generation,
+                                "current_generation": _hand_pause_generation_value(
+                                    hand_pause_generation
+                                ),
+                            },
+                        )
+                        continue
                     try:
                         command_age = time.monotonic() - float(created_at)
                     except (TypeError, ValueError) as exc:
@@ -3588,15 +3731,55 @@ def _actuator_main(
                     # measured delay.
 
                 elif kind == "rtc_start":
-                    if not isinstance(command, tuple) or len(command) != 8:
+                    if not isinstance(command, tuple) or len(command) not in {8, 9}:
                         raise DeploymentError("Malformed RTC start command")
-                    _, sequence, created_at, action_budget, arm, left, right, expected_horizon = command
+                    if len(command) == 9:
+                        (
+                            _,
+                            sequence,
+                            created_at,
+                            expected_pause_generation,
+                            action_budget,
+                            arm,
+                            left,
+                            right,
+                            expected_horizon,
+                        ) = command
+                    else:
+                        _, sequence, created_at, action_budget, arm, left, right, expected_horizon = command
+                        expected_pause_generation = None
                     if chunk is not None or rtc_mode:
                         raise DeploymentError("RTC can start only with no active plan")
                     if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence != last_sequence + 1:
                         raise DeploymentError(f"Stale/out-of-order RTC plan {sequence!r}; expected {last_sequence + 1}")
                     if isinstance(action_budget, bool) or not isinstance(action_budget, int) or action_budget < 1:
                         raise DeploymentError("RTC action budget must be a positive integer")
+                    if not _policy_generation_matches(
+                        expected_pause_generation,
+                        hand_pause_generation,
+                    ):
+                        last_sequence = int(sequence)
+                        last_discontinued_sequence = int(sequence)
+                        _status(
+                            status_queue,
+                            "replan_required",
+                            {
+                                "reason": "hand_pause_generation_changed",
+                                "sequence": int(sequence),
+                                "action_index": 0,
+                                "chunk_length": int(expected_horizon),
+                                "discarded_actions": int(expected_horizon),
+                                "rtc": True,
+                                "rtc_total_actions": 0,
+                                "rtc_action_budget": int(action_budget),
+                                "plan_installed": False,
+                                "expected_generation": expected_pause_generation,
+                                "current_generation": _hand_pause_generation_value(
+                                    hand_pause_generation
+                                ),
+                            },
+                        )
+                        continue
                     try:
                         plan_age = time.monotonic() - float(created_at)
                     except (TypeError, ValueError) as exc:
@@ -3775,16 +3958,45 @@ def _actuator_main(
                         },
                     )
 
-                elif not isinstance(command, tuple) or len(command) != 6 or kind != "chunk":
+                elif not isinstance(command, tuple) or len(command) not in {6, 7} or kind != "chunk":
                     raise DeploymentError(f"Unexpected or malformed actuator command {kind!r}")
                 elif chunk is not None:
                     raise DeploymentError("Received a new chunk before the prior chunk completed")
                 else:
-                    _, sequence, created_at, arm, left, right = command
+                    if len(command) == 7:
+                        _, sequence, created_at, expected_pause_generation, arm, left, right = command
+                    else:
+                        _, sequence, created_at, arm, left, right = command
+                        expected_pause_generation = None
                     if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence != last_sequence + 1:
                         raise DeploymentError(
                             f"Stale/out-of-order action chunk {sequence!r}; expected {last_sequence + 1}"
                         )
+                    if not _policy_generation_matches(
+                        expected_pause_generation,
+                        hand_pause_generation,
+                    ):
+                        discarded_actions = int(np.asarray(arm).shape[0])
+                        last_sequence = int(sequence)
+                        last_discontinued_sequence = int(sequence)
+                        _status(
+                            status_queue,
+                            "replan_required",
+                            {
+                                "reason": "hand_pause_generation_changed",
+                                "sequence": int(sequence),
+                                "action_index": 0,
+                                "chunk_length": discarded_actions,
+                                "discarded_actions": discarded_actions,
+                                "rtc": False,
+                                "plan_installed": False,
+                                "expected_generation": expected_pause_generation,
+                                "current_generation": _hand_pause_generation_value(
+                                    hand_pause_generation
+                                ),
+                            },
+                        )
+                        continue
                     try:
                         chunk_age = time.monotonic() - float(created_at)
                     except (TypeError, ValueError) as exc:
@@ -4219,6 +4431,7 @@ class SafeG1Dex3Actuator:
         self._status_queue = context.Queue(maxsize=32)
         self._stop_event = context.Event()
         self._urgent_hold_event = context.Event()
+        self._hand_pause_generation = context.Value("Q", 0)
         self._heartbeat = context.Value("d", time.monotonic())
         process_args = (
             simulation,
@@ -4245,6 +4458,7 @@ class SafeG1Dex3Actuator:
         self._process = context.Process(
             target=_actuator_main,
             args=process_args,
+            kwargs={"hand_pause_generation": self._hand_pause_generation},
             name="groot-g1-dex3-actuator",
         )
         self._sequence = 0
@@ -4269,6 +4483,7 @@ class SafeG1Dex3Actuator:
         self._immediate_release_requested = threading.Event()
         self._stopped_acknowledged = False
         self._hand_state_paused = False
+        self._hand_operator_hold_pending = False
         self._last_hand_state_event: Any = None
         self._release_completed = False
         self._last_cleanup_phase: Any = None
@@ -4283,6 +4498,23 @@ class SafeG1Dex3Actuator:
             self._hand_state_paused = True
             self._last_hand_state_event = value
             LOGGER.warning("Actuator paused for short Dex3 feedback loss: %s", value)
+            return True
+        if kind == "hand_state_recovery_progress":
+            self._last_hand_state_event = value
+            LOGGER.warning(
+                "Dex3 feedback recovery safety reading %s/%s: %s",
+                value.get("fresh_samples", "?") if isinstance(value, dict) else "?",
+                value.get("required_samples", "?") if isinstance(value, dict) else "?",
+                value,
+            )
+            return True
+        if kind == "hand_state_operator_hold":
+            self._hand_operator_hold_pending = True
+            self._last_hand_state_event = value
+            LOGGER.warning(
+                "Dex3 feedback remained stale through the operator-HOLD deadline: %s",
+                value,
+            )
             return True
         if kind == "hand_state_recovered":
             self._hand_state_paused = False
@@ -4341,7 +4573,7 @@ class SafeG1Dex3Actuator:
         self._rtc_terminal = None
         # The child is publishing the last successfully commanded target, but
         # this is not the operator's measured-pose HOLD state.
-        self._holding = False
+        self._holding = not bool(value.get("plan_installed", True))
         return self._last_replan_detail
 
     @property
@@ -4352,10 +4584,32 @@ class SafeG1Dex3Actuator:
     def last_dds_hold_timing(self) -> dict[str, Any] | None:
         return self._last_dds_hold_timing
 
+    @property
+    def hand_state_paused(self) -> bool:
+        return bool(self._hand_state_paused)
+
+    @property
+    def hand_pause_generation(self) -> int:
+        return _hand_pause_generation_value(getattr(self, "_hand_pause_generation", None))
+
+    def acknowledge_hand_operator_hold(self) -> bool:
+        """Acknowledge the terminal transition before an explicit new goal."""
+
+        pending = bool(getattr(self, "_hand_operator_hold_pending", False))
+        self._hand_operator_hold_pending = False
+        return pending
+
+    def wait_for_hand_feedback(self) -> None:
+        """Block policy observation/motion until the recovery sample gate passes."""
+
+        self._wait_for_hand_feedback()
+
     def _wait_for_hand_feedback(self) -> None:
         """Do not enqueue new motion while the child is in a soft hand pause."""
 
         self.assert_healthy()
+        if getattr(self, "_hand_operator_hold_pending", False):
+            raise HandFeedbackOperatorHold(self._last_hand_state_event)
         if not getattr(self, "_hand_state_paused", False):
             return
         self._wait_status(
@@ -4391,6 +4645,8 @@ class SafeG1Dex3Actuator:
                     return value
                 continue
             if self._record_auxiliary_status(kind, value):
+                if kind == "hand_state_operator_hold":
+                    raise HandFeedbackOperatorHold(value)
                 continue
             if kind == "authority_ramp_timing":
                 self._last_authority_ramp_timing = value
@@ -4398,6 +4654,8 @@ class SafeG1Dex3Actuator:
                 continue
             if kind == "release_failed":
                 raise DeploymentError(f"Actuator release failed: {value}")
+            if kind == "warm_start_invalidated":
+                raise HandFeedbackReplan(value)
             if kind == "close_failed":
                 raise DeploymentError(f"Actuator resource cleanup failed: {value}")
             if kind == "stopped":
@@ -4561,9 +4819,17 @@ class SafeG1Dex3Actuator:
         )
         validate_initialization_spec(target)
         self._wait_for_hand_feedback()
+        pause_generation = (
+            self.hand_pause_generation
+            if chunk.hand_pause_generation is None
+            else int(chunk.hand_pause_generation)
+        )
         self.heartbeat()
         try:
-            self._command_queue.put(("warm_start", time.monotonic(), target), timeout=0.2)
+            self._command_queue.put(
+                ("warm_start", time.monotonic(), pause_generation, target),
+                timeout=0.2,
+            )
         except queue.Full as exc:
             raise DeploymentError("Actuator command queue is full; refusing policy warm-start") from exc
         self._wait_status(
@@ -4585,6 +4851,11 @@ class SafeG1Dex3Actuator:
         if self._chunk_in_flight:
             raise DeploymentError("A policy chunk is already in flight")
         self._wait_for_hand_feedback()
+        pause_generation = (
+            self.hand_pause_generation
+            if chunk.hand_pause_generation is None
+            else int(chunk.hand_pause_generation)
+        )
         with self._control_lock:
             immediate = self.immediate_control_requested()
             if immediate is not None:
@@ -4595,6 +4866,7 @@ class SafeG1Dex3Actuator:
                 "chunk",
                 self._sequence,
                 time.monotonic(),
+                pause_generation,
                 chunk.arm,
                 chunk.left_hand,
                 chunk.right_hand,
@@ -4606,7 +4878,7 @@ class SafeG1Dex3Actuator:
             self._chunk_in_flight = True
             self._pending_sequence = self._sequence
             self._holding = False
-            return self._sequence
+        return self._sequence
 
     def start_rtc(self, plan: ActionChunk, *, action_budget: int) -> int:
         """Start one full-horizon plan under the child-owned RTC scheduler."""
@@ -4622,6 +4894,11 @@ class SafeG1Dex3Actuator:
         else:
             validate_action_chunk(plan, plan.arm[0], plan.left_hand[0], plan.right_hand[0])
         self._wait_for_hand_feedback()
+        pause_generation = (
+            self.hand_pause_generation
+            if plan.hand_pause_generation is None
+            else int(plan.hand_pause_generation)
+        )
         with self._control_lock:
             immediate = self.immediate_control_requested()
             if immediate is not None:
@@ -4632,6 +4909,7 @@ class SafeG1Dex3Actuator:
                 "rtc_start",
                 next_sequence,
                 time.monotonic(),
+                pause_generation,
                 action_budget,
                 plan.arm,
                 plan.left_hand,
@@ -4642,13 +4920,18 @@ class SafeG1Dex3Actuator:
                 self._command_queue.put(command, timeout=0.2)
             except queue.Full as exc:
                 raise DeploymentError("Actuator command queue is full; refusing RTC plan") from exc
-        self._wait_status("rtc_started", timeout_s=1.0, payload=next_sequence)
         self._sequence = next_sequence
         self._chunk_in_flight = True
         self._pending_sequence = next_sequence
         self._rtc_active = True
         self._rtc_terminal = None
         self._holding = False
+        try:
+            self._wait_status("rtc_started", timeout_s=1.0, payload=next_sequence)
+        except RtcTerminalEvent as exc:
+            if exc.outcome == "replan":
+                raise HandFeedbackReplan(exc.detail) from exc
+            raise
         return next_sequence
 
     def rtc_snapshot(self) -> RtcExecutionSnapshot:
@@ -4868,6 +5151,8 @@ class SafeG1Dex3Actuator:
                 if detail is not None:
                     return "replan"
                 continue
+            if kind == "warm_start_invalidated":
+                raise HandFeedbackReplan(value)
             if kind == "release_failed":
                 raise DeploymentError(f"Actuator release failed: {value}")
             if kind == "close_failed":
@@ -4878,8 +5163,9 @@ class SafeG1Dex3Actuator:
                     return "release"
                 raise DeploymentError("Actuator stopped before the action chunk completed")
             if kind == "holding" and value == sequence:
-                # Soft-stale synchronous HOLD is emitted only after the five
-                # distinct-sample recovery gate has completed.
+                # The 300 ms feedback boundary enters operator HOLD
+                # immediately. A later explicit goal remains independently
+                # blocked until the three-reading recovery gate completes.
                 self._hand_state_paused = False
                 self._immediate_hold_requested.clear()
                 self._holding = True

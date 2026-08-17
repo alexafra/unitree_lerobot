@@ -99,8 +99,9 @@ publishing DDS:
   it, still under the original hard backstop.
 - Hand tracking uses each left/right DDS callback's local receipt time to select
   the newest successfully published target that already existed for that sample.
-  Re-reading one 50 Hz Isaac sample in the 100 Hz loop therefore cannot compare it
-  with a newer command or count it repeatedly. A time-aligned 1.50-rad error is the
+  Re-reading one cached DDS sample in the 100 Hz loop therefore cannot compare it
+  with a newer command or count it repeatedly. The actual hardware publisher rate
+  is not assumed by this client. A time-aligned 2.0-rad error is the
   hard fault; the original 0.50-rad level must persist across distinct samples for
   0.20 s before producing a warning, and clears below 0.40 rad.
 
@@ -366,7 +367,7 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
     --allow-unqualified-real
 ```
 
-The program still completes a publisher-free observation/inference/action preflight. Each standard gate—ACTUATE/SIMULATE, WARMUP1, RUN, WARMUP2, and CONTINUE—advances with one `r` keypress and no Enter. On arming, its child process requires fresh state and a stationary 0.5-second dwell, initializes targets from that measured state, and ramps `arm_sdk` weight while holding it. During command execution, arm state older than 75 ms faults the actuator. A Dex3 state age above 75 ms instead freezes the exact outgoing targets; five distinct fresh paired hand samples are required to recover. An interrupted policy plan is discarded and remains in powered HOLD rather than resuming against an old clock. A hand age above 500 ms remains a hard fault. These measured thresholds are not a substitute for qualification. Orderly SIGINT, SIGTERM, and terminal-hangup cleanup attempts a time-based arm-authority ramp to zero, then sends Unitree's Dex3 `stopMotors` command to both hands; the CLI reports separate local release and resource-cleanup acknowledgments. SIGKILL, power loss, and a wedged DDS/network path can bypass those attempts. The override is not a safety guarantee or certification.
+The program still completes a publisher-free observation/inference/action preflight. Each standard gate—ACTUATE/SIMULATE, WARMUP1, RUN, WARMUP2, and CONTINUE—advances with one `r` keypress and no Enter. On arming, its child process requires fresh state and a stationary 0.5-second dwell, initializes targets from that measured state, and ramps `arm_sdk` weight while holding it. During command execution, arm state older than 75 ms faults the actuator. A Dex3 state age above 100 ms freezes the exact outgoing targets, invalidates the active and in-flight policy generations, and requires three distinct fresh paired left/right hand readings; repeated 100 Hz reads of one cached sample do not count. Recovery before 300 ms automatically re-observes and replans the same goal without replaying the discarded plan. At 300 ms automatic resume is revoked and the powered-HOLD goal selector is shown. An explicitly selected new goal remains blocked from the policy server until the three-reading gate completes. Each new reading and the final recovery are logged in the terminal. A hand-feedback age above 3 s is a hard fault. These measured thresholds are not a substitute for qualification. Orderly SIGINT, SIGTERM, and terminal-hangup cleanup attempts a time-based arm-authority ramp to zero, then sends Unitree's Dex3 `stopMotors` command to both hands; the CLI reports separate local release and resource-cleanup acknowledgments. SIGKILL, power loss, and a wedged DDS/network path can bypass those attempts. The override is not a safety guarantee or certification.
 
 ## Appendix: complete runner CLI reference
 

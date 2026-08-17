@@ -356,8 +356,8 @@ class G1ArmGravityBackendIntegrationTests(unittest.TestCase):
                 return SimpleNamespace(value=value, get_lock=lambda: threading.Lock())
 
             @staticmethod
-            def Process(*, target, args, name):
-                return SimpleNamespace(target=target, args=args, name=name)
+            def Process(*, target, args, name, kwargs=None):
+                return SimpleNamespace(target=target, args=args, name=name, kwargs=kwargs or {})
 
         module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
         with mock.patch(f"{module}.mp.get_context", return_value=Context()):
@@ -369,6 +369,10 @@ class G1ArmGravityBackendIntegrationTests(unittest.TestCase):
 
         self.assertIs(actuator._process.target, _actuator_main)
         self.assertIs(actuator._process.args[-1], False)
+        self.assertIs(
+            actuator._process.kwargs["hand_pause_generation"],
+            actuator._hand_pause_generation,
+        )
         self.assertFalse(actuator._gravity_feedforward)
 
         with mock.patch(f"{module}.mp.get_context", return_value=Context()):

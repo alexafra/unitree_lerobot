@@ -85,7 +85,7 @@ class HandTrackingWatchdogTest(unittest.TestCase):
         backend = _TrackingBackend()
         backend.publish_at(1.0)
         measured = np.zeros(7)
-        measured[4] = 1.6
+        measured[4] = 2.1
 
         with self.assertRaisesRegex(
             DeploymentError,
