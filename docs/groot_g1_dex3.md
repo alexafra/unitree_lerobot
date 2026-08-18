@@ -369,6 +369,30 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
 
 The program still completes a publisher-free observation/inference/action preflight. Each standard gate—ACTUATE/SIMULATE, WARMUP1, RUN, WARMUP2, and CONTINUE—advances with one `r` keypress and no Enter. On arming, its child process requires fresh state and a stationary 0.5-second dwell, initializes targets from that measured state, and ramps `arm_sdk` weight while holding it. During command execution, arm state older than 75 ms faults the actuator. A Dex3 state age above 100 ms freezes the exact outgoing targets, invalidates the active and in-flight policy generations, and requires three distinct fresh paired left/right hand readings; repeated 100 Hz reads of one cached sample do not count. Recovery before 300 ms automatically re-observes and replans the same goal without replaying the discarded plan. At 300 ms automatic resume is revoked and the powered-HOLD goal selector is shown. An explicitly selected new goal remains blocked from the policy server until the three-reading gate completes. Each new reading and the final recovery are logged in the terminal. A hand-feedback age above 3 s is a hard fault. These measured thresholds are not a substitute for qualification. Orderly SIGINT, SIGTERM, and terminal-hangup cleanup attempts a time-based arm-authority ramp to zero, then sends Unitree's Dex3 `stopMotors` command to both hands; the CLI reports separate local release and resource-cleanup acknowledgments. SIGKILL, power loss, and a wedged DDS/network path can bypass those attempts. The override is not a safety guarantee or certification.
 
+## 7. Optional local iOS voice goals
+
+`--voice` adds the GrootVoiceCommander TCP protocol without disabling any
+terminal control. The listener accepts authenticated newline-delimited JSON on
+port 8765 by default. Store the same 16–256-character token configured in the
+phone either in a mode-0600 file passed with `--voice-session-token-file`, or in
+the `GROOT_VOICE_SESSION_TOKEN` environment variable. The token itself is never
+accepted as a command-line argument or written to the run manifest.
+
+The app's proposal and separate confirmation tap remain mandatory. Proposing a
+goal while a policy is active requests powered HOLD; no proposed goal is sent to
+GR00T. After the confirmed message arrives, exact normalized `stop` or `pause`
+text remains in powered HOLD, and exact `quit` text releases authority and exits.
+Exact `return to start` invokes the existing guarded Return-to-Start path only
+when `--return-to-start` is enabled; otherwise it is rejected while HOLD is
+maintained. Every other confirmed phrase follows the normal trained/custom goal
+path with a fresh observation and inference. These words are convenience
+commands, not an emergency-stop channel; physical safety equipment and terminal
+`s`/`q` remain authoritative.
+
+Add `--confirm-text` to require a second local terminal confirmation after the
+phone confirmation. The terminal task menu, custom text, `s`, `q`, Tab and
+Shift+Tab controls remain usable whenever voice input is enabled.
+
 ## Appendix: complete runner CLI reference
 
 This table is an exhaustive, source-audited reference for
@@ -381,6 +405,11 @@ is stated explicitly.
 | `-h`, `--help` | — | Print the parser-generated help text and exit. |
 | `--task TASK_ID` | unset | Select one exact trained task ID; omit both goal flags to use the interactive task menu. |
 | `--custom-goal TEXT` | unset | Send arbitrary goal text after explicit confirmation; mutually exclusive with `--task`. |
+| `--voice`, `--no-voice` | disabled | Enable or disable the authenticated GrootVoiceCommander TCP listener while retaining terminal controls. |
+| `--confirm-text`, `--no-confirm-text` | disabled | With `--voice`, require an additional local terminal confirmation before accepting phone text. |
+| `--voice-listen-host HOST` | `0.0.0.0` | Bind the local voice TCP listener to this address. |
+| `--voice-port PORT` | `8765` | Bind the local voice TCP listener to this port. |
+| `--voice-session-token-file PATH` | environment | Read the session token from this file; when omitted, use `GROOT_VOICE_SESSION_TOKEN`. |
 | `--policy-host HOST` | `127.0.0.1` | Connect to the GR00T policy server at this host; actuation requires a loopback host. |
 | `--policy-port PORT` | `5555` | Connect to the GR00T policy server at this TCP port. |
 | `--image-host HOST` | automatic | Connect to TeleImager here; when omitted, use `192.168.123.164` for the robot or `127.0.0.1` with `--sim`. |

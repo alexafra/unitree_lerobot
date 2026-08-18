@@ -63,6 +63,11 @@ from unitree_lerobot.eval_robot.training_start_pose import (
     TRAINING_START_SOURCE,
     training_start_spec,
 )
+from unitree_lerobot.eval_robot.voice_command_server import (
+    DEFAULT_VOICE_PORT,
+    VoiceCommandServer,
+    load_voice_session_token,
+)
 from unitree_lerobot.utils.depth_encoding import DEPTH_OUTPUT_KEY
 from unitree_lerobot.utils.surface_normal_encoding import SURFACE_NORMAL_OUTPUT_KEY
 
@@ -80,6 +85,12 @@ PREVIEW_WINDOWS = (
 )
 STOP_COMMANDS = {"stop", "s"}
 EXIT_COMMANDS = {"quit", "q"}
+VOICE_STOP_COMMANDS = {"stop", "pause"}
+VOICE_EXIT_COMMANDS = {"quit"}
+VOICE_RETURN_TO_START_COMMAND = "return to start"
+VOICE_INPUT_AVAILABLE = "\x00voice-input-available"
+VOICE_STAY_HOLDING = "\x00voice-stay-holding"
+VOICE_RETURN_TO_START_UNAVAILABLE = "\x00voice-return-to-start-unavailable"
 RTC_MIN_MODEL_HORIZON = 32
 RTC_DELAY_HISTORY = 8
 
@@ -242,11 +253,27 @@ class _OperatorTerminal:
                 raise DeploymentError("Could not restore the operator terminal; releasing authority") from exc
 
 
-def _readline_before_authority(prompt: str, *, confirmation_mode: bool = False) -> str:
+def _readline_before_authority(
+    prompt: str,
+    *,
+    confirmation_mode: bool = False,
+    external_pending: Callable[[], bool] | None = None,
+) -> str:
     """Read unarmed text or an r/s/q single-key confirmation."""
 
     if not sys.stdin.isatty():
         print(prompt, end="", flush=True)
+        if external_pending is not None:
+            while True:
+                if external_pending():
+                    print()
+                    return VOICE_INPUT_AVAILABLE
+                try:
+                    readable, _, _ = select.select([sys.stdin], [], [], 0.1)
+                except (OSError, TypeError, ValueError) as exc:
+                    raise DeploymentError("Could not poll terminal input") from exc
+                if readable:
+                    break
         response = sys.stdin.readline()
         if response == "":
             raise DeploymentError("stdin closed while waiting for operator input")
@@ -279,6 +306,15 @@ def _readline_before_authority(prompt: str, *, confirmation_mode: bool = False) 
     entered = bytearray()
     try:
         while True:
+            if external_pending is not None and external_pending():
+                print()
+                return VOICE_INPUT_AVAILABLE
+            try:
+                readable, _, _ = select.select([fd], [], [], 0.1)
+            except (OSError, TypeError, ValueError) as exc:
+                raise DeploymentError("Could not poll operator input") from exc
+            if not readable:
+                continue
             value = os.read(fd, 1)
             if value == b"":
                 raise DeploymentError("stdin closed while waiting for operator input")
@@ -430,7 +466,13 @@ class _RtcInferenceWorker:
             self._thread.join(timeout=6.0)
 
 
-def select_instruction(task_name: str | None, custom_goal: str | None = None) -> tuple[str, str]:
+def select_instruction(
+    task_name: str | None,
+    custom_goal: str | None = None,
+    *,
+    voice_server: VoiceCommandServer | None = None,
+    confirm_voice_text: bool = False,
+) -> tuple[str, str]:
     if custom_goal is not None:
         if task_name is not None:
             raise DeploymentError("--task and --custom-goal are mutually exclusive")
@@ -446,12 +488,25 @@ def select_instruction(task_name: str | None, custom_goal: str | None = None) ->
     task_names = list(TASKS)
     for index, name in enumerate(task_names, start=1):
         print(f"  {index}. {name:16s}  {TASKS[name]}")
-    try:
-        selected = int(_readline_before_authority("Task number: "))
-        name = task_names[selected - 1]
-    except (EOFError, ValueError, IndexError) as exc:
-        raise DeploymentError("A valid trained task must be selected") from exc
-    return name, TASKS[name]
+    while True:
+        if voice_server is not None:
+            voice_goal = _take_initial_voice_command(voice_server, confirm_voice_text=confirm_voice_text)
+            if voice_goal == VOICE_STAY_HOLDING:
+                continue
+            if isinstance(voice_goal, tuple):
+                return voice_goal
+        response = _readline_before_authority(
+            "Task number: ",
+            external_pending=(None if voice_server is None else lambda: voice_server.command_pending),
+        )
+        if response == VOICE_INPUT_AVAILABLE:
+            continue
+        try:
+            selected = int(response)
+            name = task_names[selected - 1]
+        except (EOFError, ValueError, IndexError) as exc:
+            raise DeploymentError("A valid trained task must be selected") from exc
+        return name, TASKS[name]
 
 
 def confirm_custom_goal(instruction: str) -> None:
@@ -480,6 +535,94 @@ def resolve_runtime_goal(response: str) -> tuple[str, str] | None:
         if value == instruction:
             return task_name, instruction
     return None
+
+
+def _voice_warning(goal: str) -> str:
+    lowered = goal.casefold()
+    if lowered in VOICE_STOP_COMMANDS:
+        return "Confirmed STOP/PAUSE will keep the robot in powered HOLD."
+    if lowered in VOICE_EXIT_COMMANDS:
+        return "Confirmed QUIT will release command authority and exit."
+    if lowered == VOICE_RETURN_TO_START_COMMAND:
+        return "Confirmed RETURN TO START will request the configured guarded startup target when enabled."
+    return (
+        "The robot is entering powered HOLD. Confirm only after reviewing the complete goal; "
+        "custom language may be outside the fine-tuning distribution."
+    )
+
+
+def _start_voice_server(
+    args: argparse.Namespace,
+    *,
+    on_proposal: Callable[[], None] | None = None,
+) -> VoiceCommandServer:
+    token_path = getattr(args, "voice_session_token_file", None)
+    try:
+        token = load_voice_session_token(token_path)
+        server = VoiceCommandServer(
+            getattr(args, "voice_listen_host", "0.0.0.0"),
+            int(getattr(args, "voice_port", DEFAULT_VOICE_PORT)),
+            token,
+            warning_factory=_voice_warning,
+            on_proposal=on_proposal,
+        )
+        server.start()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise DeploymentError(f"Could not start voice command server: {exc}") from exc
+    host, port = server.address
+    LOGGER.info("Voice command server listening on TCP %s:%d", host, port)
+    return server
+
+
+def _resolve_confirmed_voice_goal(
+    goal: str,
+    *,
+    allow_return_to_start: bool = False,
+) -> tuple[str, str] | str:
+    lowered = goal.casefold()
+    if lowered in VOICE_STOP_COMMANDS:
+        return VOICE_STAY_HOLDING
+    if lowered in VOICE_EXIT_COMMANDS:
+        return "release"
+    if lowered == VOICE_RETURN_TO_START_COMMAND:
+        return RETURN_TO_START if allow_return_to_start else VOICE_RETURN_TO_START_UNAVAILABLE
+    trained = resolve_runtime_goal(goal)
+    if trained is not None:
+        return trained
+    return select_instruction(None, goal)
+
+
+def _take_initial_voice_command(
+    voice_server: VoiceCommandServer,
+    *,
+    confirm_voice_text: bool,
+) -> tuple[str, str] | str | None:
+    command = voice_server.poll_command()
+    if command is None:
+        return None
+    if confirm_voice_text:
+        response = _readline_before_authority(
+            f"Voice text: {command.goal!r}. Type YES to accept locally: "
+        )
+        if response != "YES":
+            voice_server.reject_command(command, "local_confirmation_rejected", "Local text confirmation rejected")
+            return VOICE_STAY_HOLDING
+    resolved = _resolve_confirmed_voice_goal(command.goal)
+    if resolved == VOICE_RETURN_TO_START_UNAVAILABLE:
+        voice_server.reject_command(
+            command,
+            "return_to_start_disabled",
+            "Return to Start is not enabled for this run",
+        )
+        return VOICE_STAY_HOLDING
+    if not voice_server.accept_command(command):
+        LOGGER.warning("Voice proposal disconnected before it could be accepted")
+        return VOICE_STAY_HOLDING
+    if resolved == "release":
+        raise OperatorRelease
+    if resolved == VOICE_STAY_HOLDING:
+        LOGGER.info("Voice STOP/PAUSE accepted before command authority; remaining stationary")
+    return resolved
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -545,6 +688,14 @@ def validate_args(args: argparse.Namespace) -> None:
     command_conditioning = getattr(args, "command_conditioning", "xr")
     if command_conditioning not in {"none", "xr"}:
         raise DeploymentError("--command-conditioning must be none or xr")
+    voice_enabled = bool(getattr(args, "voice", False))
+    if getattr(args, "confirm_text", False) and not voice_enabled:
+        raise DeploymentError("--confirm-text requires --voice")
+    voice_port = int(getattr(args, "voice_port", DEFAULT_VOICE_PORT))
+    if not 1 <= voice_port <= 65535:
+        raise DeploymentError("--voice-port must be in 1..65535")
+    if voice_enabled and not str(getattr(args, "voice_listen_host", "")).strip():
+        raise DeploymentError("--voice-listen-host cannot be empty")
 
 
 def confirm_actuation(simulation: bool, task_name: str, instruction: str) -> None:
@@ -584,6 +735,7 @@ def _readline_while_armed(
     confirmation_mode: bool = False,
     goal_mode_toggle: bool = False,
     return_to_start: bool = False,
+    external_pending: Callable[[], bool] | None = None,
 ) -> str:
     """Read a terminal line while continuously servicing the actuator watchdog."""
 
@@ -596,12 +748,16 @@ def _readline_while_armed(
             confirmation_mode=confirmation_mode,
             goal_mode_toggle=goal_mode_toggle,
             return_to_start=return_to_start,
+            external_pending=external_pending,
         )
     LOGGER.warning("stdin is not a TTY; armed input is line-buffered and immediate keys are unavailable")
     print(prompt, end="", flush=True)
     while True:
         actuator.heartbeat()
         actuator.assert_healthy()
+        if external_pending is not None and external_pending():
+            print()
+            return VOICE_INPUT_AVAILABLE
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0.0:
             print()
@@ -642,6 +798,7 @@ def _readline_with_immediate_prompt_controls(
     confirmation_mode: bool = False,
     goal_mode_toggle: bool = False,
     return_to_start: bool = False,
+    external_pending: Callable[[], bool] | None = None,
 ) -> str:
     """Read an armed line while keeping the physical Q key fail-safe.
 
@@ -676,6 +833,9 @@ def _readline_with_immediate_prompt_controls(
         while True:
             actuator.heartbeat()
             actuator.assert_healthy()
+            if external_pending is not None and external_pending():
+                print()
+                return VOICE_INPUT_AVAILABLE
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0.0:
                 print()
@@ -846,12 +1006,67 @@ def _poll_active_command(terminal: _OperatorTerminal | None = None) -> str | Non
     return response.strip()
 
 
+def _take_held_voice_command(
+    actuator: SafeG1Dex3Actuator,
+    voice_server: VoiceCommandServer,
+    *,
+    confirm_voice_text: bool,
+    return_to_start: bool = False,
+) -> tuple[str, str] | str:
+    command = voice_server.poll_command()
+    if command is None:
+        return VOICE_INPUT_AVAILABLE
+    if confirm_voice_text:
+        response = _readline_while_armed(
+            actuator,
+            f"Voice text: {command.goal!r}. Type YES to accept locally; S holds; q releases: ",
+            timeout_s=OPERATOR_CONFIRMATION_TIMEOUT_S,
+        )
+        if response != "YES":
+            voice_server.reject_command(command, "local_confirmation_rejected", "Local text confirmation rejected")
+            lowered = response.casefold()
+            if lowered in EXIT_COMMANDS:
+                return "release"
+            if lowered in STOP_COMMANDS:
+                _finish_operator_stop(actuator)
+            return VOICE_STAY_HOLDING
+
+    resolved = _resolve_confirmed_voice_goal(
+        command.goal,
+        allow_return_to_start=return_to_start,
+    )
+    if resolved == VOICE_RETURN_TO_START_UNAVAILABLE:
+        voice_server.reject_command(
+            command,
+            "return_to_start_disabled",
+            "Return to Start is not enabled for this run",
+        )
+        LOGGER.warning("Voice RETURN TO START rejected because --return-to-start is disabled")
+        return VOICE_STAY_HOLDING
+    if not voice_server.accept_command(
+        command,
+        service_callback=lambda: (actuator.heartbeat(), actuator.assert_healthy()),
+    ):
+        LOGGER.warning("Voice connection closed before the confirmed command could be accepted")
+        return VOICE_STAY_HOLDING
+    if resolved == VOICE_STAY_HOLDING:
+        _finish_operator_stop(actuator)
+        LOGGER.warning("Confirmed voice STOP/PAUSE: remaining in powered HOLD")
+    elif resolved == "release":
+        LOGGER.warning("Confirmed voice QUIT: releasing command authority")
+    else:
+        LOGGER.warning("Confirmed voice goal accepted: %r", command.goal)
+    return resolved
+
+
 def _select_next_goal_while_holding(
     actuator: SafeG1Dex3Actuator,
     *,
     custom_goal_mode: bool = False,
     mode_state: dict[str, bool] | None = None,
     return_to_start: bool = False,
+    voice_server: VoiceCommandServer | None = None,
+    confirm_voice_text: bool = False,
 ) -> tuple[str, str] | str | None:
     """Wait in powered hold, with an explicit trained/custom goal-mode toggle."""
 
@@ -877,6 +1092,21 @@ def _select_next_goal_while_holding(
 
     show_mode()
     while True:
+        if voice_server is not None and voice_server.command_pending:
+            voice_result = _take_held_voice_command(
+                actuator,
+                voice_server,
+                confirm_voice_text=confirm_voice_text,
+                return_to_start=return_to_start,
+            )
+            if voice_result in {VOICE_INPUT_AVAILABLE, VOICE_STAY_HOLDING}:
+                continue
+            if voice_result == "release":
+                return None
+            if voice_result == RETURN_TO_START:
+                return RETURN_TO_START
+            assert isinstance(voice_result, tuple)
+            return voice_result
         prompt = "Custom goal> " if custom_goal_mode else "Trained task> "
         response = _readline_while_armed(
             actuator,
@@ -884,7 +1114,10 @@ def _select_next_goal_while_holding(
             timeout_s=None,
             goal_mode_toggle=True,
             return_to_start=return_to_start,
+            external_pending=(None if voice_server is None else lambda: voice_server.command_pending),
         )
+        if response == VOICE_INPUT_AVAILABLE:
+            continue
         if response == RETURN_TO_START:
             return RETURN_TO_START
         if response == GOAL_MODE_TOGGLE:
@@ -2242,7 +2475,20 @@ def run(args: argparse.Namespace) -> None:
     validate_args(args)
     repository_root = Path(__file__).resolve().parents[2]
     os.chdir(repository_root)
-    task_name, instruction = select_instruction(args.task, getattr(args, "custom_goal", None))
+    voice_enabled = bool(getattr(args, "voice", False))
+    initial_voice_server: VoiceCommandServer | None = None
+    try:
+        if voice_enabled and args.task is None and getattr(args, "custom_goal", None) is None:
+            initial_voice_server = _start_voice_server(args)
+        task_name, instruction = select_instruction(
+            args.task,
+            getattr(args, "custom_goal", None),
+            voice_server=initial_voice_server,
+            confirm_voice_text=bool(getattr(args, "confirm_text", False)),
+        )
+    finally:
+        if initial_voice_server is not None:
+            initial_voice_server.close()
     allow_custom_instruction = task_name == "custom-goal"
     if allow_custom_instruction and instruction not in TASKS.values():
         LOGGER.warning(
@@ -2265,6 +2511,7 @@ def run(args: argparse.Namespace) -> None:
     camera: TeleimagerCamera | None = None
     state_reader: G1Dex3StateReader | None = None
     actuator: SafeG1Dex3Actuator | None = None
+    voice_server: VoiceCommandServer | None = None
     cleanup_error: Exception | None = None
     try:
         policy = Gr00tClient(args.policy_host, args.policy_port)
@@ -2504,6 +2751,11 @@ def run(args: argparse.Namespace) -> None:
             actuator,
             warmup1 if warmup1 is not None else configured_initialization,
         )
+        if voice_enabled:
+            voice_server = _start_voice_server(
+                args,
+                on_proposal=actuator.request_immediate_hold,
+            )
 
         # The publisher-free result predates initialization and is deliberately
         # discarded. Every initial or replacement goal resets and re-observes.
@@ -2577,6 +2829,9 @@ def run(args: argparse.Namespace) -> None:
                 # implement the pre-feature selector signature.
                 if return_to_start_enabled:
                     selector_kwargs["return_to_start"] = True
+                if voice_server is not None:
+                    selector_kwargs["voice_server"] = voice_server
+                    selector_kwargs["confirm_voice_text"] = bool(getattr(args, "confirm_text", False))
                 next_goal = _select_next_goal_while_holding(actuator, **selector_kwargs)
                 custom_goal_mode = mode_state["custom_goal_mode"]
                 if next_goal is not None:
@@ -2609,6 +2864,8 @@ def run(args: argparse.Namespace) -> None:
     finally:
         active_exception = sys.exc_info()[1]
         active_error = active_exception is not None
+        if voice_server is not None:
+            voice_server.close()
         if actuator is not None:
             try:
                 actuator.close()
@@ -2640,6 +2897,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--custom-goal",
         metavar="TEXT",
         help="Send custom language goal text instead of one of the exact trained task strings",
+    )
+    parser.add_argument(
+        "--voice",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Accept reviewed goals from GrootVoiceCommander over authenticated local TCP while "
+            "retaining all terminal controls"
+        ),
+    )
+    parser.add_argument(
+        "--confirm-text",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="With --voice, require an additional local terminal confirmation of phone text",
+    )
+    parser.add_argument(
+        "--voice-listen-host",
+        default="0.0.0.0",
+        help="Local address for the voice TCP listener (default: all local interfaces)",
+    )
+    parser.add_argument(
+        "--voice-port",
+        type=int,
+        default=DEFAULT_VOICE_PORT,
+        help=f"Voice TCP listener port (default: {DEFAULT_VOICE_PORT})",
+    )
+    parser.add_argument(
+        "--voice-session-token-file",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "File containing the voice session token; otherwise read "
+            "GROOT_VOICE_SESSION_TOKEN from the environment"
+        ),
     )
     parser.add_argument("--policy-host", default="127.0.0.1")
     parser.add_argument("--policy-port", type=int, default=5555)
