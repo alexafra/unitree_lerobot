@@ -29,8 +29,9 @@ ssh -N \
 
 # Start with one chunk to qualify the new authority handoff. After that passes,
 # change only --max-chunks deliberately for a full stacking attempt. Warmup2 is
-# enabled below; replace --warmup2 with --no-warmup2 to skip it. The separate
-# --no-future-goal-warmup2 keeps later goal changes from invoking it.
+# enabled below; replace --warmup2 with --no-warmup2 to skip it at startup and
+# after Return-to-Start. The separate --no-future-goal-warmup2 skips Warmup2
+# only for direct replacement goals that do not follow Return-to-Start.
 cd /home/alex/Development/unitree_lerobot
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
   --actuate \

@@ -1193,7 +1193,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
         self.assertEqual(mode_calls, [(True, True, False)])
 
-    def test_future_goal_warmup2_is_independent_and_startup_stages_run_once(self):
+    def test_warmup2_routing_is_independent_and_startup_stages_run_once(self):
         events = []
         warmup_specs = []
 
@@ -1253,8 +1253,16 @@ class GrootG1DeploymentTests(unittest.TestCase):
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
         contract = SimpleNamespace(action_horizon=16, video_keys=COLOUR_VIDEO_KEYS, requires_depth=False)
         preflight = SimpleNamespace(length=1, name="discarded-preflight")
-        for warmup1_enabled in (True, False):
-            with self.subTest(warmup1=warmup1_enabled):
+        for returned_to_start in (False, True):
+            for warmup1_enabled in (True, False):
+                if returned_to_start:
+                    next_goals = (
+                        RETURN_TO_START,
+                        ("down-red-cup", TASKS["down-red-cup"]),
+                        None,
+                    )
+                else:
+                    next_goals = (("down-red-cup", TASKS["down-red-cup"]), None)
                 events.clear()
                 warmup_specs.clear()
                 args = argparse.Namespace(
@@ -1283,21 +1291,34 @@ class GrootG1DeploymentTests(unittest.TestCase):
                     mock.patch(f"{module}._run_active_goal", side_effect=("complete", "complete")),
                     mock.patch(
                         f"{module}._select_next_goal_while_holding",
-                        side_effect=(RETURN_TO_START, ("down-red-cup", TASKS["down-red-cup"]), None),
+                        side_effect=next_goals,
                     ),
-                    mock.patch(f"{module}.confirm_return_to_start", return_value="continue"),
+                    mock.patch(
+                        f"{module}.confirm_return_to_start",
+                        return_value="continue",
+                    ) as confirm_return_to_start,
                 ):
                     run_groot(args)
 
                 self.assertEqual(
                     [call.kwargs["warmup2_enabled"] for call in prepare.call_args_list],
-                    [True, False],
+                    # --warmup2 governs startup and the first goal after an
+                    # explicit reset. A direct replacement instead follows
+                    # --future-goal-warmup2, which is disabled in this test.
+                    [True, returned_to_start],
                 )
+                self.assertEqual(confirm_return_to_start.call_count, int(returned_to_start))
                 self.assertEqual(events.count("actuator.initialize"), 1)
                 self.assertEqual(events.count("actuator.hold"), 2)
-                self.assertEqual(len(warmup_specs), 2 if warmup1_enabled else 1)
-                expected = TRAINING_START_JOINTS_RAD[:14] if warmup1_enabled else np.zeros(14)
-                np.testing.assert_array_equal(warmup_specs[-1].arm, expected)
+                self.assertEqual(
+                    len(warmup_specs),
+                    int(warmup1_enabled) + int(returned_to_start),
+                )
+                if warmup_specs:
+                    expected = (
+                        TRAINING_START_JOINTS_RAD[:14] if warmup1_enabled else np.zeros(14)
+                    )
+                    np.testing.assert_array_equal(warmup_specs[-1].arm, expected)
 
     def test_shadow_skips_initial_step_validation_for_every_chunk_but_measured_live_keeps_it(self):
         class StopAfterPreflight(Exception):

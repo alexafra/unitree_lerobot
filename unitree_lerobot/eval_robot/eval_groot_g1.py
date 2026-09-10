@@ -2807,8 +2807,10 @@ def run(args: argparse.Namespace) -> None:
 
         # The publisher-free result predates initialization and is deliberately
         # discarded. Every initial or replacement goal resets and re-observes.
-        # The first and replacement-goal Warmup2 transitions are independently
-        # configurable; neither replacement path repeats initialization/Warmup1.
+        # Warmup2 is governed by --warmup2 for the first goal and for the next
+        # goal after an explicit Return-to-Start reset. Direct replacement goals
+        # use the independent --future-goal-warmup2 setting. None repeats
+        # initialization or Warmup1.
         if sys.stdin.isatty():
             print(
                 "\nACTIVE GOAL CONTROLS (NO ENTER): press s to STOP in a powered position hold; "
@@ -2816,11 +2818,12 @@ def run(args: argparse.Namespace) -> None:
             )
 
         first_goal = True
+        warmup2_after_return_to_start = False
         custom_goal_mode = allow_custom_instruction
         while True:
             warmup2_enabled = (
                 bool(getattr(args, "policy_warm_start", True))
-                if first_goal
+                if first_goal or warmup2_after_return_to_start
                 else bool(getattr(args, "future_goal_warmup2", True))
             )
             preparation = _prepare_policy_goal(
@@ -2840,6 +2843,7 @@ def run(args: argparse.Namespace) -> None:
             if preparation == "hold":
                 outcome = "hold"
             else:
+                warmup2_after_return_to_start = False
                 runner = _run_active_goal_rtc if inference_mode == "rtc" else _run_active_goal
                 outcome = runner(
                     policy,
@@ -2894,6 +2898,7 @@ def run(args: argparse.Namespace) -> None:
                     break
                 if decision == "hold":
                     continue
+                warmup2_after_return_to_start = True
             if next_goal is None:
                 LOGGER.warning("Operator requested orderly authority release from HOLD")
                 break
@@ -3059,8 +3064,9 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "For actuated runs, smoothly reach the first target of one fresh inferred chunk, "
-            "discard that chunk, reset/re-observe, then begin live execution (default: enabled; "
+            "For actuated runs, smoothly reach the first target of one fresh inferred chunk "
+            "at startup and after an explicit Return-to-Start reset, discard that chunk, "
+            "reset/re-observe, then begin live execution (default: enabled; "
             "--[no-]policy-warm-start remains a compatibility alias)"
         ),
     )
@@ -3069,8 +3075,9 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "For each accepted replacement goal after the first, perform the guarded Warmup2 "
-            "first-target transition before live execution (default: enabled). Initialization "
+            "For each direct replacement goal that does not follow Return-to-Start, perform "
+            "the guarded Warmup2 first-target transition before live execution (default: "
+            "enabled). Explicit Return-to-Start resets follow --warmup2 instead; initialization "
             "and Warmup1 are never repeated"
         ),
     )
