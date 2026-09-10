@@ -6,7 +6,6 @@ head_camera:
   zmq_port: 5555
   depth_zmq_port: 5558
   raw_depth_zmq_port: 5559
-  depth_scale_m_per_unit: 0.001
   binocular: false
   type: realsense
   image_shape:
@@ -15,6 +14,7 @@ head_camera:
   fps: 30
   enable_depth: true
   serial_number: '242322076480'
+  depth_scale_m_per_unit: 0.0010000000474974513
 left_wrist_camera:
   type: uvc
   enable_zmq: false

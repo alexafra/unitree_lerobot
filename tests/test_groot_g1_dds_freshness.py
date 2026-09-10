@@ -19,6 +19,7 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     G1Dex3StateReader,
     HandStateFreshnessGate,
     RobotState,
+    SafeG1Dex3Actuator,
     _G1Dex3CommandBackend,
     _actuator_main,
 )
@@ -40,6 +41,9 @@ def _state(*, captured_at: float, left_at: float, right_at: float) -> RobotState
 
 
 class HandFreshnessGateTests(unittest.TestCase):
+    def test_operator_hold_boundary_is_one_and_a_quarter_seconds(self):
+        self.assertEqual(ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S, 1.25)
+
     def test_short_gap_pauses_and_requires_distinct_paired_samples(self):
         gate = HandStateFreshnessGate()
         entered = gate.check(
@@ -74,6 +78,39 @@ class HandFreshnessGateTests(unittest.TestCase):
         self.assertTrue(result.recovered)
         self.assertEqual(progress, list(range(2, ACTUATOR_HAND_RECOVERY_SAMPLES + 1)))
 
+    def test_observed_one_second_gap_recovers_automatically(self):
+        gate = HandStateFreshnessGate()
+        outage = gate.check(
+            _state(captured_at=20.0, left_at=20.0 - 1.04, right_at=20.0),
+            now=20.0,
+        )
+        self.assertTrue(outage.entered)
+        self.assertFalse(outage.operator_hold_entered)
+
+        recovered = None
+        for index in range(1, ACTUATOR_HAND_RECOVERY_SAMPLES + 1):
+            timestamp = 20.0 + index * 0.01
+            recovered = gate.check(
+                _state(captured_at=timestamp, left_at=timestamp, right_at=timestamp),
+                now=timestamp,
+            )
+        assert recovered is not None
+        self.assertTrue(recovered.ready)
+        self.assertTrue(recovered.recovered)
+
+    def test_pause_log_is_simple_and_yellow(self):
+        actuator = SafeG1Dex3Actuator.__new__(SafeG1Dex3Actuator)
+        payload = {"hands": ("right",), "age_s": 0.101}
+
+        with self.assertLogs(
+            "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3",
+            level="WARNING",
+        ) as captured:
+            self.assertTrue(actuator._record_auxiliary_status("hand_state_pause", payload))
+
+        self.assertEqual(captured.records[-1].getMessage(), "DDS drop — waiting for reconnection")
+        self.assertTrue(getattr(captured.records[-1], "terminal_yellow", False))
+
     def test_operator_hold_boundary_is_reported_once(self):
         gate = HandStateFreshnessGate()
         entered = gate.check(
@@ -97,7 +134,11 @@ class HandFreshnessGateTests(unittest.TestCase):
         )
         self.assertTrue(operator_hold.operator_hold_entered)
         repeated = gate.check(
-            _state(captured_at=30.21, left_at=29.8, right_at=30.21),
+            _state(
+                captured_at=30.21,
+                left_at=30.21 - ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S - 0.01,
+                right_at=30.21,
+            ),
             now=30.21,
         )
         self.assertFalse(repeated.operator_hold_entered)
@@ -140,7 +181,7 @@ class SplitReaderDeadlineTests(unittest.TestCase):
         reader._rejected_zero_hand_frames = {"left": 0, "right": 0}
         return reader
 
-    def test_arm_remains_hard_at_75ms_while_hand_uses_configured_deadline(self):
+    def test_arm_remains_hard_at_100ms_while_hand_uses_configured_deadline(self):
         now = 100.0
         reader = self._reader(now)
         reader._updated_at["left"] = now - 0.10
@@ -151,7 +192,7 @@ class SplitReaderDeadlineTests(unittest.TestCase):
             state = reader.latest()
         self.assertAlmostEqual(state.left_hand_received_at, now - 0.10)
 
-        reader._updated_at["arm"] = now - 0.076
+        reader._updated_at["arm"] = now - 0.101
         with (
             mock.patch(
                 "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.time.monotonic",
@@ -159,7 +200,7 @@ class SplitReaderDeadlineTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 TimeoutError,
-                r"arm .*ACTUATOR_ARM_STATE_MAX_AGE_S=0\.075s",
+                r"arm .*ACTUATOR_ARM_STATE_MAX_AGE_S=0\.100s",
             ),
         ):
             reader.latest()
@@ -448,7 +489,7 @@ class ActivePauseIntegrationTests(unittest.TestCase):
             self.assertEqual(backend.policy_targets, targets_before_stale_plan)
 
             # A current-generation replacement may start. If the same
-            # feedback age crosses 300 ms, automatic resume is revoked and a
+            # feedback age crosses 1.25 s, automatic resume is revoked and a
             # terminal powered HOLD is emitted for this sequence.
             backend.first_policy_target.clear()
             current_arm = np.zeros((4, 14))

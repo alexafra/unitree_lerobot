@@ -50,6 +50,7 @@ from unitree_lerobot.eval_robot.run_logging import (
     write_json,
 )
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
+    ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
     G1Dex3StateReader,
     HandFeedbackOperatorHold,
     HandFeedbackReplan,
@@ -1211,6 +1212,42 @@ def confirm_return_to_start(
     return _confirm_goal_transition(actuator, warning, "RETURN TO START")
 
 
+def _run_return_to_start_from_hold(
+    actuator: SafeG1Dex3Actuator,
+    spec: InitializationSpec,
+) -> str:
+    """Run a confirmed return transition while preserving feedback-triggered HOLD."""
+
+    try:
+        decision = confirm_return_to_start(actuator, spec)
+        if decision != "continue":
+            return decision
+        # Recheck after confirmation but before enqueueing any motion. A
+        # feedback-HOLD may have arrived while the prompt was open.
+        _wait_for_hand_feedback(actuator)
+    except HandFeedbackOperatorHold as exc:
+        LOGGER.warning(
+            "Dex3 feedback crossed %.2f s during Return-to-Start; transition cancelled "
+            "and robot remains in powered HOLD: %s",
+            ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
+            exc.detail,
+            extra={"terminal_yellow": True},
+        )
+        return "hold"
+    # Do not catch feedback-HOLD after the child has accepted this operation:
+    # initialization motion may be paused internally and later resume. An
+    # exception from that phase must retain the fail-closed release behavior.
+    _run_blocking_motion_with_immediate_release(
+        actuator,
+        lambda: actuator.warmup_pose(spec),
+    )
+    LOGGER.warning(
+        "Returned to startup target %r; remaining in powered HOLD",
+        spec.label,
+    )
+    return "continue"
+
+
 def confirm_initialization(
     actuator: SafeG1Dex3Actuator,
     spec: InitializationSpec,
@@ -1570,7 +1607,7 @@ def _prepare_policy_goal(
     """Reset a goal session and optionally perform its guarded warm-start."""
 
     try:
-        # A goal selected from the 300 ms operator-HOLD terminal is explicit
+        # A goal selected from the 1.25 s operator-HOLD terminal is explicit
         # consent to try again, but no policy-server command may be sent until
         # three distinct paired Dex3 readings have re-established feedback.
         _wait_for_hand_feedback(actuator)
@@ -1606,7 +1643,9 @@ def _prepare_policy_goal(
         return "release"
     except HandFeedbackOperatorHold as exc:
         LOGGER.warning(
-            "Dex3 feedback crossed 300 ms during goal preparation; remaining in powered HOLD: %s",
+            "Dex3 feedback crossed %.2f s during goal preparation; "
+            "remaining in powered HOLD: %s",
+            ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
             exc.detail,
             extra={"terminal_yellow": True},
         )
@@ -1619,6 +1658,20 @@ def _prepare_policy_goal(
     decision = confirm_policy_warm_start(actuator, delta_summary)
     if decision in {"hold", "release"}:
         return decision
+    try:
+        # Catch an already-pending operator HOLD before any Warmup2 motion is
+        # queued. A failure after enqueue must still propagate so the child
+        # cannot resume a paused transition while the parent is back at a menu.
+        _wait_for_hand_feedback(actuator)
+    except HandFeedbackOperatorHold as exc:
+        LOGGER.warning(
+            "Dex3 feedback crossed %.2f s before Warmup2 motion; "
+            "remaining in powered HOLD: %s",
+            ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
+            exc.detail,
+            extra={"terminal_yellow": True},
+        )
+        return "hold"
     try:
         _run_blocking_motion_with_immediate_release(
             actuator,
@@ -1642,13 +1695,6 @@ def _prepare_policy_goal(
             allow_custom_instruction=allow_custom_instruction,
             warmup2_enabled=warmup2_enabled,
         )
-    except HandFeedbackOperatorHold as exc:
-        LOGGER.warning(
-            "Dex3 feedback crossed 300 ms before Warmup2 motion; remaining in powered HOLD: %s",
-            exc.detail,
-            extra={"terminal_yellow": True},
-        )
-        return "hold"
     LOGGER.warning("Warmup2 reached target 0; the inferred chunk was discarded")
     decision = confirm_policy_continue(actuator)
     if decision in {"hold", "release"}:
@@ -1751,7 +1797,8 @@ def _run_active_goal(
             outcome = "release"
         except HandFeedbackOperatorHold as exc:
             LOGGER.warning(
-                "Dex3 feedback crossed 300 ms; goal %r was abandoned in powered HOLD: %s",
+                "Dex3 feedback crossed %.2f s; goal %r was abandoned in powered HOLD: %s",
+                ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
                 task_name,
                 exc.detail,
                 extra={"terminal_yellow": True},
@@ -2022,7 +2069,8 @@ def _run_active_goal_rtc(
             outcome = "release"
         except HandFeedbackOperatorHold as exc:
             LOGGER.warning(
-                "Dex3 feedback crossed 300 ms; RTC goal %r was abandoned in powered HOLD: %s",
+                "Dex3 feedback crossed %.2f s; RTC goal %r was abandoned in powered HOLD: %s",
+                ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
                 task_name,
                 exc.detail,
                 extra={"terminal_yellow": True},
@@ -2149,7 +2197,7 @@ def _run_active_goal_rtc_controlled(
                 # The child discarded the time-indexed plan at pause entry.
                 # Do not consume an in-flight response or request another one;
                 # recovery will surface as a fresh-replan event, while the
-                # 300 ms boundary surfaces as terminal HOLD.
+                # 1.25 s boundary surfaces as terminal HOLD.
                 time.sleep(0.002)
                 continue
 
@@ -2840,20 +2888,12 @@ def run(args: argparse.Namespace) -> None:
                         acknowledge()
                 if next_goal != RETURN_TO_START:
                     break
-                decision = confirm_return_to_start(actuator, return_to_start_spec)
+                decision = _run_return_to_start_from_hold(actuator, return_to_start_spec)
                 if decision == "release":
                     next_goal = None
                     break
                 if decision == "hold":
                     continue
-                _run_blocking_motion_with_immediate_release(
-                    actuator,
-                    lambda: actuator.warmup_pose(return_to_start_spec),
-                )
-                LOGGER.warning(
-                    "Returned to startup target %r; remaining in powered HOLD",
-                    return_to_start_spec.label,
-                )
             if next_goal is None:
                 LOGGER.warning("Operator requested orderly authority release from HOLD")
                 break

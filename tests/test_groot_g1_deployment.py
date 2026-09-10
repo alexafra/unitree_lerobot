@@ -31,6 +31,7 @@ from unitree_lerobot.eval_robot.eval_groot_g1 import (
     _readline_before_authority,
     _readline_while_armed,
     _run_blocking_motion_with_immediate_release,
+    _run_return_to_start_from_hold,
     _select_next_goal_while_holding,
     GOAL_MODE_TOGGLE,
     RETURN_TO_START,
@@ -73,8 +74,6 @@ from unitree_lerobot.eval_robot.groot_contract import (
     validate_measured_state,
 )
 from unitree_lerobot.eval_robot.image_server.rgbd_protocol import (
-    RGBD_PROTOCOL,
-    TeleRgbdFrame,
     pack_rgbd_packet,
     unpack_rgbd_packet,
 )
@@ -90,6 +89,7 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     ARM_RELEASE_RAMP_S,
     CameraImages,
     G1Dex3StateReader,
+    HandFeedbackOperatorHold,
     ImmediateControlEvent,
     INITIALIZATION_ARM_TOLERANCE_RAD,
     INITIALIZATION_HAND_TOLERANCE_RAD,
@@ -195,6 +195,7 @@ class FakeBackend:
         self._arm_target = np.zeros(14)
         self._left_target = np.zeros(7)
         self._right_target = np.zeros(7)
+        self.prearm_takeover_checks = []
 
     def state(self):
         return RobotState(
@@ -208,6 +209,9 @@ class FakeBackend:
 
     def set_weight(self, _weight):
         pass
+
+    def _validate_prearm_takeover_state(self, state):
+        self.prearm_takeover_checks.append(state)
 
     def prepare_measured_hold(self):
         return self.state()
@@ -453,7 +457,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertEqual(JOINT_LIMIT_MARGIN_RAD, 0.015)
         self.assertEqual(HAND_LIMIT_TOLERANCE_RAD, 0.01)
         self.assertEqual(MEASURED_LIMIT_TOLERANCE_RAD, 0.20)
-        self.assertEqual(ARM_RELEASE_RAMP_S, 1.5)
+        self.assertEqual(ARM_RELEASE_RAMP_S, 3.0)
         self.assertEqual(MAX_ARM_DQ_RAD_S, 6.0)
         self.assertEqual(MAX_ARM_TRACKING_ERROR_RAD, 0.35)
         self.assertEqual(MAX_HAND_TRACKING_ERROR_RAD, 2.0)
@@ -2302,6 +2306,43 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 self.assertTrue(readline.call_args.kwargs["confirmation_mode"])
         actuator.hold.assert_called_once_with()
 
+    def test_return_to_start_feedback_hold_cancels_transition_without_release(self):
+        spec = load_initialization_spec("xr-home", task_name="pick-red-cup")
+        detail = {"hands": ("right",), "age_s": 1.01}
+        actuator = mock.Mock()
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+
+        for failure_point in ("confirmation", "pre_motion_feedback"):
+            with (
+                self.subTest(failure_point=failure_point),
+                mock.patch(f"{module}.confirm_return_to_start") as confirm,
+                mock.patch(f"{module}._run_blocking_motion_with_immediate_release") as motion,
+                self.assertLogs("eval_groot_g1", level="WARNING") as captured,
+            ):
+                if failure_point == "confirmation":
+                    confirm.side_effect = HandFeedbackOperatorHold(detail)
+                else:
+                    confirm.return_value = "continue"
+                    actuator.wait_for_hand_feedback.side_effect = HandFeedbackOperatorHold(detail)
+
+                self.assertEqual(_run_return_to_start_from_hold(actuator, spec), "hold")
+                self.assertTrue(any("remains in powered HOLD" in line for line in captured.output))
+                motion.assert_not_called()
+                if failure_point != "confirmation":
+                    actuator.wait_for_hand_feedback.side_effect = None
+
+        with (
+            mock.patch(f"{module}.confirm_return_to_start", return_value="continue"),
+            mock.patch(
+                f"{module}._run_blocking_motion_with_immediate_release",
+                side_effect=HandFeedbackOperatorHold(detail),
+            ),
+            self.assertRaises(HandFeedbackOperatorHold),
+        ):
+            _run_return_to_start_from_hold(actuator, spec)
+
+        actuator.request_immediate_release.assert_not_called()
+
     def test_held_goal_selector_services_heartbeat_and_rejects_unconfirmed_custom_text(self):
         actuator = SimpleNamespace(
             heartbeat=mock.Mock(),
@@ -2722,6 +2763,13 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 max_neighbor_depth_delta_m=0.05,
             ),
         )
+        fusion_config = modality_config(surface_normals=True)  # earlyfusion
+        fusion_config["video"]["channel_fusion"] = [{"key": "ego_view", "channels": [0, 1, 2]}, {"key": "surface_normals_view", "channels": [0, 1, 2]}]  # earlyfusion
+        expected_vision = validate_model_contract(fusion_config).vision_input_contract  # earlyfusion
+        rgb_mean_metadata = {**metadata, "vision_input_contract": {**expected_vision, "patch_embed_init": "rgb_mean"}}  # earlyfusion
+        validate_policy_metadata(rgb_mean_metadata, requires_surface_normals=True, vision_input_contract=expected_vision)  # earlyfusion
+        with self.assertRaisesRegex(DeploymentError, "vision input contract mismatch"):  # earlyfusion
+            validate_policy_metadata({**metadata, "vision_input_contract": {**expected_vision, "patch_embed_init": "unsupported"}}, requires_surface_normals=True, vision_input_contract=expected_vision)  # earlyfusion
         malformed = {
             **metadata,
             "dataset_contract": {
@@ -3311,40 +3359,37 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertTrue(FakeRequester.instance.closed)
         self.assertTrue(manager.closed)
 
-    def test_rgbd_camera_encodes_atomic_aligned_depth_and_requires_a_new_sequence(self):
+    def test_geometry_camera_encodes_legacy_aligned_depth_and_requires_new_frames(self):
         bgr = np.zeros((480, 640, 3), dtype=np.uint8)
         depth = np.full((480, 640), 625, dtype=np.uint16)
         color_ok, color_jpeg = cv2.imencode(".jpg", bgr)
         depth_ok, depth_png = cv2.imencode(".png", depth)
         self.assertTrue(color_ok and depth_ok)
-        frame = TeleRgbdFrame(
-            sequence=9,
-            server_capture_monotonic_ns=1,
-            received_monotonic_ns=time.monotonic_ns(),
-            color_jpeg=color_jpeg.tobytes(),
-            aligned_depth_png=depth_png.tobytes(),
-        )
+        received_ns = time.monotonic_ns()
 
         camera = object.__new__(TeleimagerCamera)
         camera._requires_depth = True
         camera._depth_encoding = DepthEncodingContract(near_m=0.25, far_m=1.0)
+        camera._surface_normal_encoding = None
         camera._depth_scale_m_per_unit = 0.001
-        camera._last_rgbd_sequence = None
+        camera._last_color_received_ns = None
+        camera._last_depth_received_ns = None
         camera._reported_stream_fps = False
         camera._head_subscriber = SimpleNamespace(is_alive=lambda: True)
+        camera._depth_subscriber = SimpleNamespace(is_alive=lambda: True)
 
-        class FakeRgbdClient:
+        class FakeLegacyClient:
             def __init__(self):
-                self.fps_calls = 0
+                self.color_calls = 0
 
-            def get_head_rgbd_frame(self):
-                return frame
+            def get_head_frame(self):
+                self.color_calls += 1
+                return SimpleNamespace(jpg=color_jpeg.tobytes(), fps=0.0 if self.color_calls == 1 else 30.0, received_monotonic_ns=received_ns)
 
-            def get_head_rgbd_fps(self):
-                self.fps_calls += 1
-                return 0.0 if self.fps_calls == 1 else 30.0
+            def get_head_depth_frame(self):
+                return SimpleNamespace(jpg=depth_png.tobytes(), fps=30.0, received_monotonic_ns=received_ns + 1)
 
-        camera._client = FakeRgbdClient()
+        camera._client = FakeLegacyClient()
         camera.config = {
             "head_camera": {
                 "image_shape": [480, 640],
@@ -3355,8 +3400,8 @@ class GrootG1DeploymentTests(unittest.TestCase):
         images = camera.read(timeout_s=0.05)
 
         self.assertIsInstance(images, CameraImages)
-        self.assertEqual(images.sequence, 9)
-        self.assertEqual(camera._client.fps_calls, 2)
+        self.assertIsNone(images.sequence)
+        self.assertEqual(camera._client.color_calls, 2)
         self.assertTrue(camera._reported_stream_fps)
         expected = encode_depth_gray_rgb(
             depth,
@@ -3368,19 +3413,13 @@ class GrootG1DeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(TimeoutError, "not new"):
             camera.read(timeout_s=0.015)
 
-    def test_rgbd_camera_encodes_atomic_aligned_depth_as_surface_normals(self):
+    def test_geometry_camera_encodes_legacy_aligned_depth_as_surface_normals(self):
         bgr = np.zeros((480, 640, 3), dtype=np.uint8)
         depth = np.full((480, 640), 625, dtype=np.uint16)
         color_ok, color_jpeg = cv2.imencode(".jpg", bgr)
         depth_ok, depth_png = cv2.imencode(".png", depth)
         self.assertTrue(color_ok and depth_ok)
-        frame = TeleRgbdFrame(
-            sequence=12,
-            server_capture_monotonic_ns=1,
-            received_monotonic_ns=time.monotonic_ns(),
-            color_jpeg=color_jpeg.tobytes(),
-            aligned_depth_png=depth_png.tobytes(),
-        )
+        received_ns = time.monotonic_ns()
 
         camera = object.__new__(TeleimagerCamera)
         camera._requires_depth = True
@@ -3390,12 +3429,14 @@ class GrootG1DeploymentTests(unittest.TestCase):
             max_neighbor_depth_delta_m=0.05,
         )
         camera._depth_scale_m_per_unit = 0.001
-        camera._last_rgbd_sequence = None
+        camera._last_color_received_ns = None
+        camera._last_depth_received_ns = None
         camera._reported_stream_fps = False
         camera._head_subscriber = SimpleNamespace(is_alive=lambda: True)
+        camera._depth_subscriber = SimpleNamespace(is_alive=lambda: True)
         camera._client = SimpleNamespace(
-            get_head_rgbd_frame=lambda: frame,
-            get_head_rgbd_fps=lambda: 30.0,
+            get_head_frame=lambda: SimpleNamespace(jpg=color_jpeg.tobytes(), fps=30.0, received_monotonic_ns=received_ns),
+            get_head_depth_frame=lambda: SimpleNamespace(jpg=depth_png.tobytes(), fps=30.0, received_monotonic_ns=received_ns + 1),
         )
         camera.config = {
             "head_camera": {
@@ -3415,25 +3456,21 @@ class GrootG1DeploymentTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(images.surface_normals, expected)
 
-    def test_rgbd_camera_fails_closed_on_server_sequence_regression(self):
-        frame = TeleRgbdFrame(
-            sequence=3,
-            server_capture_monotonic_ns=1,
-            received_monotonic_ns=time.monotonic_ns(),
-            color_jpeg=b"unused",
-            aligned_depth_png=b"unused",
-        )
+    def test_geometry_camera_fails_closed_on_receive_timestamp_regression(self):
+        received_ns = time.monotonic_ns()
         camera = object.__new__(TeleimagerCamera)
         camera._requires_depth = True
-        camera._last_rgbd_sequence = 8
+        camera._last_color_received_ns = received_ns + 1
+        camera._last_depth_received_ns = received_ns
         camera._reported_stream_fps = False
         camera._head_subscriber = SimpleNamespace(is_alive=lambda: True)
+        camera._depth_subscriber = SimpleNamespace(is_alive=lambda: True)
         camera._client = SimpleNamespace(
-            get_head_rgbd_frame=lambda: frame,
-            get_head_rgbd_fps=lambda: 30.0,
+            get_head_frame=lambda: SimpleNamespace(jpg=b"unused", fps=30.0, received_monotonic_ns=received_ns),
+            get_head_depth_frame=lambda: SimpleNamespace(jpg=b"unused", fps=30.0, received_monotonic_ns=received_ns + 1),
         )
 
-        with self.assertRaisesRegex(DeploymentError, "sequence regressed"):
+        with self.assertRaisesRegex(DeploymentError, "receive timestamp regressed"):
             camera.read(timeout_s=0.05)
 
     def test_camera_config_request_refuses_local_fallback_on_live_timeout(self):
@@ -3529,7 +3566,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
         self.assertTrue(FakeImageClient.instance.closed)
 
-    def test_rgbd_camera_rejects_missing_atomic_port_before_constructing_client(self):
+    def test_geometry_camera_rejects_missing_aligned_depth_port_before_constructing_client(self):
         live_config = {
             "head_camera": {
                 "enable_zmq": True,
@@ -3538,7 +3575,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 "type": "realsense",
                 "enable_depth": True,
                 "binocular": False,
-                "rgbd_protocol": RGBD_PROTOCOL,
+                "zmq_port": 5555,
                 "depth_scale_m_per_unit": 0.001,
             }
         }
@@ -3559,7 +3596,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 return_value=live_config,
             ),
         ):
-            with self.assertRaisesRegex(DeploymentError, "no valid rgbd_zmq_port"):
+            with self.assertRaisesRegex(DeploymentError, "no valid aligned-depth depth_zmq_port"):
                 TeleimagerCamera("camera-host", DepthEncodingContract(near_m=0.25, far_m=1.0))
 
         self.assertEqual(FakeImageClient.calls, 0)
@@ -3712,27 +3749,62 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertEqual(FakeBackend.instance.publishes, 0)
         self.assertTrue(FakeBackend.instance.closed)
 
-    def test_real_authority_ramp_writes_hands_once_and_acks_after_final_arm_weight(self):
+    def test_real_takeover_uses_full_weight_fixed_pose_then_ramps_gravity(self):
         class SlowAuthorityBackend(FakeBackend):
             instance = None
 
             def __init__(self, simulation, network_interface):
                 super().__init__(simulation, network_interface)
                 type(self).instance = self
+                self.captured_pose = np.linspace(-0.35, 0.35, 14)
+                self.reported_pose = self.captured_pose + 0.01
                 self.hand_writes = 0
                 self.arm_writes = 0
                 self.weights = []
+                self.transmitted_weights = []
+                self.gravity_scales = []
+                self.target_history = []
+
+            def state(self):
+                captured_at = time.monotonic()
+                return RobotState(
+                    captured_at=captured_at,
+                    mode_machine=QUALIFIED_REAL_MODE_MACHINE,
+                    arm=self.reported_pose.copy(),
+                    arm_dq=np.zeros(14),
+                    left_hand=self._left_target.copy(),
+                    right_hand=self._right_target.copy(),
+                    arm_received_at=captured_at,
+                )
+
+            def prepare_measured_hold(self):
+                state = RobotState(
+                    captured_at=time.monotonic(),
+                    mode_machine=QUALIFIED_REAL_MODE_MACHINE,
+                    arm=self.captured_pose.copy(),
+                    arm_dq=np.zeros(14),
+                    left_hand=self._left_target.copy(),
+                    right_hand=self._right_target.copy(),
+                )
+                self.set_target(state.arm, state.left_hand, state.right_hand)
+                return state
 
             def _publish_hands(self):
                 self.hand_writes += 1
 
-            def _publish_arm(self):
+            def _publish_arm(self, *, gravity_scale=1.0, require_prearm_takeover_state=False):
+                if require_prearm_takeover_state:
+                    self._validate_prearm_takeover_state(self.state())
                 self.arm_writes += 1
+                self.transmitted_weights.append(float(self._weight))
+                self.gravity_scales.append(float(gravity_scale))
+                self.target_history.append(self._arm_target.copy())
                 # Deliberately slower than the patched 1 kHz schedule.  The
                 # ramp must skip missed ticks instead of accumulating them.
                 time.sleep(0.004)
 
             def set_weight(self, weight):
+                self._weight = float(weight)
                 self.weights.append(float(weight))
 
         commands = queue.Queue(maxsize=1)
@@ -3742,7 +3814,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
         module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
         with (
             mock.patch(f"{module}._G1Dex3CommandBackend", SlowAuthorityBackend),
-            mock.patch(f"{module}.ARM_AUTHORITY_RAMP_S", 0.03),
+            mock.patch(f"{module}.ARM_GRAVITY_RAMP_S", 0.03),
+            mock.patch(f"{module}.ARM_TAKEOVER_SETTLE_DWELL_S", 0.006),
+            mock.patch(f"{module}.ARM_TAKEOVER_SETTLE_TIMEOUT_S", 0.05),
             mock.patch(f"{module}.PUBLISH_HZ", 1_000.0),
         ):
             thread = threading.Thread(
@@ -3759,9 +3833,18 @@ class GrootG1DeploymentTests(unittest.TestCase):
             self.assertEqual(backend.hand_writes, 1)
             self.assertGreater(backend.arm_writes, 1)
             self.assertLess(backend.arm_writes, 20)
-            self.assertEqual(backend.weights[0], 0.0)
-            self.assertEqual(backend.weights[-1], 1.0)
-            self.assertTrue(all(a < b for a, b in zip(backend.weights, backend.weights[1:])))
+            self.assertEqual(len(backend.prearm_takeover_checks), 2)
+            self.assertEqual(backend.weights, [1.0])
+            self.assertTrue(all(weight == 1.0 for weight in backend.transmitted_weights))
+            self.assertEqual(backend.gravity_scales[0], 0.0)
+            self.assertEqual(backend.gravity_scales[-1], 1.0)
+            self.assertTrue(
+                all(a <= b for a, b in zip(backend.gravity_scales, backend.gravity_scales[1:]))
+            )
+            self.assertTrue(
+                all(np.array_equal(target, backend.captured_pose) for target in backend.target_history)
+            )
+            self.assertFalse(any(np.array_equal(target, np.zeros(14)) for target in backend.target_history))
 
             stop.set()
             thread.join(timeout=1.0)
@@ -3781,7 +3864,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
             def _publish_hands(self):
                 self.hand_writes += 1
 
-            def _publish_arm(self):
+            def _publish_arm(self, *, gravity_scale=1.0, require_prearm_takeover_state=False):
+                if require_prearm_takeover_state:
+                    self._validate_prearm_takeover_state(self.state())
                 self.arm_writes += 1
                 if self.arm_writes == 2:
                     self.stop_event.set()

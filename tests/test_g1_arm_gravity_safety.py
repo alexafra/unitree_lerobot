@@ -27,7 +27,6 @@ from unitree_lerobot.eval_robot.groot_client import DeploymentError
 from unitree_lerobot.eval_robot.groot_contract import ActionChunk
 from unitree_lerobot.eval_robot.robot_control.g1_arm_gravity import (
     G1_ARM_GRAVITY_JOINT_NAMES,
-    G1_ARM_GRAVITY_TORQUE_ENVELOPE_NM,
     G1_ARM_GRAVITY_URDF_SHA256,
     G1ArmGravityCompensator,
     default_g1_gravity_urdf_path,
@@ -677,32 +676,183 @@ class G1ArmGravityBackendIntegrationTests(unittest.TestCase):
             for command in message.motor_cmd:
                 self.assertEqual((command.tau, command.kp, command.kd), (-88.0, 123.0, 45.0))
 
-    def test_authority_acquisition_computes_gravity_on_every_arm_write(self):
+    def test_authority_acquisition_takes_full_weight_before_ramping_gravity(self):
         backend = self._backend(simulation=False)
-        backend._configure_messages(
-            RobotState(
-                captured_at=time.monotonic(),
+        captured_pose = np.linspace(-0.35, 0.35, 14)
+        reported_pose = captured_pose + 0.01
+
+        def fresh_state():
+            captured_at = time.monotonic()
+            return RobotState(
+                captured_at=captured_at,
                 mode_machine=QUALIFIED_REAL_MODE_MACHINE,
-                arm=np.zeros(14),
+                arm=reported_pose.copy(),
                 arm_dq=np.zeros(14),
                 left_hand=backend._left_target.copy(),
                 right_hand=backend._right_target.copy(),
+                arm_received_at=captured_at,
             )
-        )
+
+        backend.reader = SimpleNamespace(latest=fresh_state)
+        backend.set_target(captured_pose, backend._left_target, backend._right_target)
+        backend._configure_messages(fresh_state())
         module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
         heartbeat = SimpleNamespace(value=time.monotonic(), get_lock=lambda: threading.Lock())
+        gravity_scales = []
+        transmitted = []
+        original_publish_arm = backend._publish_arm
+
+        def publish_arm(*, gravity_scale=1.0, require_prearm_takeover_state=False):
+            original_publish_arm(
+                gravity_scale=gravity_scale,
+                require_prearm_takeover_state=require_prearm_takeover_state,
+            )
+            gravity_scales.append(float(gravity_scale))
+            transmitted.append(
+                {
+                    "weight": float(backend._arm_message.motor_cmd[29].q),
+                    "q": np.array(
+                        [backend._arm_message.motor_cmd[index].q for index in backend._arm_indices]
+                    ),
+                    "tau": np.array(
+                        [backend._arm_message.motor_cmd[index].tau for index in backend._arm_indices]
+                    ),
+                }
+            )
+
         with (
-            mock.patch(f"{module}.ARM_AUTHORITY_RAMP_S", 0.004),
+            mock.patch.object(backend, "_publish_arm", side_effect=publish_arm),
+            mock.patch(f"{module}.ARM_GRAVITY_RAMP_S", 0.004),
+            mock.patch(f"{module}.ARM_TAKEOVER_SETTLE_DWELL_S", 0.006),
+            mock.patch(f"{module}.ARM_TAKEOVER_SETTLE_TIMEOUT_S", 0.05),
             mock.patch(f"{module}.PUBLISH_HZ", 1_000.0),
         ):
             completed = _ramp_real_arm_authority(backend, threading.Event(), heartbeat)
 
         self.assertTrue(completed)
         self.assertGreater(len(backend._arm_publisher.writes), 1)
+        self.assertEqual(gravity_scales[0], 0.0)
+        self.assertEqual(gravity_scales[-1], 1.0)
+        self.assertTrue(all(a <= b for a, b in zip(gravity_scales, gravity_scales[1:])))
         self.assertEqual(len(backend._arm_gravity.inputs), len(backend._arm_publisher.writes))
+        self.assertTrue(all(np.array_equal(q, captured_pose) for q in backend._arm_gravity.inputs))
+        self.assertTrue(all(sample["weight"] == 1.0 for sample in transmitted))
+        self.assertTrue(all(np.array_equal(sample["q"], captured_pose) for sample in transmitted))
+        self.assertTrue(np.array_equal(transmitted[0]["tau"], np.zeros(14)))
+        full_gravity_tau = captured_pose + np.arange(14, dtype=np.float64) + 0.25
+        self.assertTrue(np.allclose(transmitted[-1]["tau"], full_gravity_tau))
         self.assertEqual(len(backend._left_publisher.writes), 1)
         self.assertEqual(len(backend._right_publisher.writes), 1)
         self.assertEqual(backend._weight, 1.0)
+
+    def test_arm_publish_rejects_invalid_gravity_scale_before_write(self):
+        backend = self._backend(simulation=False)
+        writes_before = len(backend._arm_publisher.writes)
+        for scale in (-0.01, 1.01, float("nan"), True):
+            with self.subTest(scale=scale), self.assertRaisesRegex(
+                DeploymentError, "gravity_scale"
+            ):
+                backend._publish_arm(gravity_scale=scale)
+        self.assertEqual(len(backend._arm_publisher.writes), writes_before)
+
+    def test_authority_takeover_rejects_pose_drift_before_first_write(self):
+        backend = self._backend(simulation=False)
+        captured_pose = np.linspace(-0.35, 0.35, 14)
+        backend.set_target(captured_pose, backend._left_target, backend._right_target)
+
+        def displaced_state():
+            captured_at = time.monotonic()
+            arm = captured_pose.copy()
+            arm[5] += 0.36
+            return RobotState(
+                captured_at=captured_at,
+                mode_machine=QUALIFIED_REAL_MODE_MACHINE,
+                arm=arm,
+                arm_dq=np.zeros(14),
+                left_hand=backend._left_target.copy(),
+                right_hand=backend._right_target.copy(),
+                arm_received_at=captured_at,
+            )
+
+        backend.reader = SimpleNamespace(latest=displaced_state)
+        heartbeat = SimpleNamespace(value=time.monotonic(), get_lock=lambda: threading.Lock())
+        with self.assertRaisesRegex(DeploymentError, "PREARM_MAX_POSITION_DRIFT_RAD"):
+            _ramp_real_arm_authority(backend, threading.Event(), heartbeat)
+
+        self.assertEqual(len(backend._arm_publisher.writes), 0)
+        self.assertFalse(backend._has_published)
+
+    def test_authority_takeover_rejects_stale_or_moving_state_before_first_write(self):
+        module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+        cases = (
+            ("stale", 0.0, 0.06, "PREARM_STATE_MAX_AGE_S"),
+            ("moving", 0.11, 0.0, "PREARM_MAX_ARM_DQ_RAD_S"),
+        )
+        for name, velocity, age_s, expected in cases:
+            with self.subTest(name=name):
+                backend = self._backend(simulation=False)
+                captured_pose = np.linspace(-0.35, 0.35, 14)
+                backend.set_target(captured_pose, backend._left_target, backend._right_target)
+
+                def guarded_state():
+                    captured_at = time.monotonic() - age_s
+                    arm_dq = np.zeros(14)
+                    arm_dq[5] = velocity
+                    return RobotState(
+                        captured_at=captured_at,
+                        mode_machine=QUALIFIED_REAL_MODE_MACHINE,
+                        arm=captured_pose.copy(),
+                        arm_dq=arm_dq,
+                        left_hand=backend._left_target.copy(),
+                        right_hand=backend._right_target.copy(),
+                        arm_received_at=captured_at,
+                    )
+
+                backend.reader = SimpleNamespace(latest=guarded_state)
+                heartbeat = SimpleNamespace(
+                    value=time.monotonic(),
+                    get_lock=lambda: threading.Lock(),
+                )
+                with (
+                    mock.patch(f"{module}.PREARM_STATE_MAX_AGE_S", 0.05),
+                    self.assertRaisesRegex(DeploymentError, expected),
+                ):
+                    _ramp_real_arm_authority(backend, threading.Event(), heartbeat)
+
+                self.assertEqual(len(backend._arm_publisher.writes), 0)
+                self.assertFalse(backend._has_published)
+
+    def test_authority_takeover_rechecks_exact_state_used_before_first_write(self):
+        backend = self._backend(simulation=False)
+        captured_pose = np.linspace(-0.35, 0.35, 14)
+        backend.set_target(captured_pose, backend._left_target, backend._right_target)
+        state_reads = 0
+
+        def state_that_moves_between_guards():
+            nonlocal state_reads
+            state_reads += 1
+            captured_at = time.monotonic()
+            arm_dq = np.zeros(14)
+            if state_reads >= 2:
+                arm_dq[5] = 0.11
+            return RobotState(
+                captured_at=captured_at,
+                mode_machine=QUALIFIED_REAL_MODE_MACHINE,
+                arm=captured_pose.copy(),
+                arm_dq=arm_dq,
+                left_hand=backend._left_target.copy(),
+                right_hand=backend._right_target.copy(),
+                arm_received_at=captured_at,
+            )
+
+        backend.reader = SimpleNamespace(latest=state_that_moves_between_guards)
+        heartbeat = SimpleNamespace(value=time.monotonic(), get_lock=lambda: threading.Lock())
+        with self.assertRaisesRegex(DeploymentError, "PREARM_MAX_ARM_DQ_RAD_S"):
+            _ramp_real_arm_authority(backend, threading.Event(), heartbeat)
+
+        self.assertEqual(state_reads, 2)
+        self.assertEqual(len(backend._arm_publisher.writes), 0)
+        self.assertFalse(backend._has_published)
 
     def test_authority_release_reuses_last_successful_q_tau_without_gravity_compute(self):
         backend = self._backend(simulation=False)

@@ -30,7 +30,6 @@ from unitree_lerobot.eval_robot.run_logging import (
     diagnostic_json_path,
     write_json,
 )
-from unitree_lerobot.eval_robot.image_server.rgbd_protocol import RGBD_PROTOCOL
 from unitree_lerobot.eval_robot.groot_contract import (
     ActionChunk,
     ARM_DOF,
@@ -67,11 +66,14 @@ from unitree_lerobot.utils.surface_normal_encoding import encode_surface_normals
 LOGGER = logging.getLogger(__name__)
 
 STATE_MAX_AGE_S = 0.25
-ACTUATOR_ARM_STATE_MAX_AGE_S = 0.075
+ACTUATOR_ARM_STATE_MAX_AGE_S = 0.100
 ACTUATOR_HAND_STATE_PAUSE_AGE_S = 0.100
-ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S = 0.300
+ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S = 1.250
 ACTUATOR_HAND_STATE_MAX_AGE_S = 3.0
 ACTUATOR_HAND_RECOVERY_SAMPLES = 3
+# Parent waits that overlap an active plan need enough room for the permitted
+# feedback pause plus the three-sample recovery/stable-publisher gates.
+ACTUATOR_HAND_RECOVERY_WAIT_GRACE_S = ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S + 0.25
 # Backward-compatible name for tests/internal imports that predate the explicit
 # pause/operator-HOLD split.
 ACTUATOR_HAND_STATE_WARNING_AGE_S = ACTUATOR_HAND_STATE_PAUSE_AGE_S
@@ -80,10 +82,17 @@ ACTUATOR_HAND_STATE_WARNING_AGE_S = ACTUATOR_HAND_STATE_PAUSE_AGE_S
 ACTUATOR_STATE_MAX_AGE_S = ACTUATOR_ARM_STATE_MAX_AGE_S
 HEARTBEAT_TIMEOUT_S = 1.0 #SAFETYCHANGE was 1
 CHUNK_MAX_AGE_S = 0.25
-ARM_AUTHORITY_RAMP_S = 1.5
-# CHANGEDSAFETY: original local adapter default was 1.0 s; current is 1.5 s.
+# Take arm_sdk authority in one matched-pose, zero-feed-forward write.  The
+# robot may retain an earlier arm_sdk weight after an unconfirmed shutdown, so
+# beginning a new process at weight zero is not a safe or idempotent handoff.
+# Once the matched-pose hold owns the arm, introduce gravity feed-forward
+# independently so authority and model torque never step at the same instant.
+ARM_GRAVITY_RAMP_S = 1.5
+ARM_TAKEOVER_SETTLE_TIMEOUT_S = 3.0
+ARM_TAKEOVER_SETTLE_DWELL_S = 0.50
+# CHANGEDSAFETY: original local adapter default was 1.0 s; current is 3.0 s.
 # This is the orderly arm_sdk authority ramp-down duration.
-ARM_RELEASE_RAMP_S = 1.5
+ARM_RELEASE_RAMP_S = 3.0
 ACTUATOR_RELEASE_SOFT_TIMEOUT_S = ARM_RELEASE_RAMP_S + 2.0
 ACTUATOR_RELEASE_HARD_TIMEOUT_S = ARM_RELEASE_RAMP_S + 5.0
 PUBLISH_HZ = 100.0
@@ -196,7 +205,7 @@ class HandFeedbackReplan(DeploymentError):
 
 
 class HandFeedbackOperatorHold(DeploymentError):
-    """The 300 ms Dex3 boundary revoked automatic task resume."""
+    """The 1.25 s Dex3 boundary revoked automatic task resume."""
 
     def __init__(self, detail: Any):
         super().__init__(f"Dex3 feedback crossed the operator-HOLD boundary: {detail}")
@@ -1515,10 +1524,10 @@ def decode_color_0_rgb(frame: Any, camera_config: dict[str, Any]) -> np.ndarray:
 def _decode_depth_png_u16(encoded_png: bytes) -> np.ndarray:
     depth = cv2.imdecode(np.frombuffer(encoded_png, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     if depth is None:
-        raise DeploymentError("RGBD packet contains an undecodable aligned-depth PNG")
+        raise DeploymentError("TeleImager returned an undecodable aligned-depth PNG")
     if depth.dtype != np.uint16 or depth.ndim != 2:
         raise DeploymentError(
-            f"RGBD aligned depth must decode to an HxW uint16 image; got shape={depth.shape}, dtype={depth.dtype}"
+            f"Aligned depth must decode to an HxW uint16 image; got shape={depth.shape}, dtype={depth.dtype}"
         )
     return depth
 
@@ -1561,7 +1570,7 @@ def _validate_live_head_config(
     config: dict[str, Any],
     *,
     requires_depth: bool,
-) -> tuple[int, float | None]:
+) -> tuple[int, int | None, float | None]:
     head = config.get("head_camera")
     if not isinstance(head, dict):
         raise DeploymentError("TeleImager configuration has no head_camera object")
@@ -1577,7 +1586,14 @@ def _validate_live_head_config(
             f"the training contract requires {CONTROL_HZ:g} FPS"
         )
 
-    port_key = "zmq_port"
+    try:
+        port = int(head["zmq_port"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DeploymentError("TeleImager has no valid zmq_port") from exc
+    if not 1 <= port <= 65535:
+        raise DeploymentError(f"TeleImager reported invalid zmq_port {port!r}")
+
+    depth_port: int | None = None
     depth_scale: float | None = None
     if requires_depth:
         if head.get("image_shape") != EXPECTED_DEPTH_VIEW_SHAPE[:2]:
@@ -1591,28 +1607,23 @@ def _validate_live_head_config(
             raise DeploymentError("Geometry checkpoint requires TeleImager aligned depth")
         if head.get("binocular", False):
             raise DeploymentError("Geometry checkpoint does not support a binocular head-camera layout")
-        if head.get("rgbd_protocol") != RGBD_PROTOCOL:
-            raise DeploymentError(
-                f"Geometry checkpoint requires rgbd_protocol={RGBD_PROTOCOL!r}; got {head.get('rgbd_protocol')!r}"
-            )
-        port_key = "rgbd_zmq_port"
+        try:
+            depth_port = int(head["depth_zmq_port"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DeploymentError("TeleImager has no valid aligned-depth depth_zmq_port") from exc
+        if not 1 <= depth_port <= 65535:
+            raise DeploymentError(f"TeleImager reported invalid depth_zmq_port {depth_port!r}")
         try:
             depth_scale = float(head["depth_scale_m_per_unit"])
         except (KeyError, TypeError, ValueError) as exc:
             raise DeploymentError("TeleImager has no valid live RealSense depth scale") from exc
         if not np.isfinite(depth_scale) or depth_scale <= 0.0:
             raise DeploymentError(f"TeleImager reported invalid depth scale {depth_scale!r}")
-    try:
-        port = int(head[port_key])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise DeploymentError(f"TeleImager has no valid {port_key}") from exc
-    if not 1 <= port <= 65535:
-        raise DeploymentError(f"TeleImager reported invalid {port_key} {port!r}")
-    return port, depth_scale
+    return port, depth_port, depth_scale
 
 
 class TeleimagerCamera:
-    """TeleImager client for colour or client-encoded atomic RGBD geometry."""
+    """TeleImager client for colour or client-encoded legacy aligned-depth geometry."""
 
     def __init__(
         self,
@@ -1628,9 +1639,10 @@ class TeleimagerCamera:
         self._depth_encoding = depth_encoding
         self._surface_normal_encoding = surface_normal_encoding
         self._requires_depth = depth_encoding is not None or surface_normal_encoding is not None
-        self._last_rgbd_sequence: int | None = None
+        self._last_color_received_ns: int | None = None
+        self._last_depth_received_ns: int | None = None
         live_config = request_live_camera_config(host)
-        stream_port, depth_scale = _validate_live_head_config(
+        stream_port, depth_port, depth_scale = _validate_live_head_config(
             live_config,
             requires_depth=self._requires_depth,
         )
@@ -1640,7 +1652,7 @@ class TeleimagerCamera:
             self._client = ImageClient(
                 host=host,
                 request_bgr=False,
-                request_rgbd=self._requires_depth,
+                request_depth=self._requires_depth,
             )
         except Exception:
             self.close()
@@ -1652,17 +1664,35 @@ class TeleimagerCamera:
         try:
             stream_key = (host, stream_port)
             self._head_subscriber = self._client._subscriber_manager._subscriber_threads[stream_key]
+            self._depth_subscriber = (
+                self._client._subscriber_manager._subscriber_threads[(host, depth_port)]
+                if depth_port is not None
+                else None
+            )
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             self.close()
             raise DeploymentError("Could not verify the live TeleImager head subscriber") from exc
         if not self._head_subscriber.is_alive():
             self.close()
             raise DeploymentError("TeleImager head subscriber stopped during startup")
+        if self._depth_subscriber is not None and not self._depth_subscriber.is_alive():
+            self.close()
+            raise DeploymentError("TeleImager aligned-depth subscriber stopped during startup")
         self._reported_stream_fps = False
+        if self._requires_depth:
+            LOGGER.warning(
+                "Using legacy independent TeleImager RGB and aligned-depth streams on ports %d and %d, "
+                "matching the training data collection transport",
+                stream_port,
+                depth_port,
+            )
 
     def _assert_subscriber_alive(self) -> None:
         if not self._head_subscriber.is_alive():
             raise DeploymentError("TeleImager head subscriber stopped")
+        depth_subscriber = getattr(self, "_depth_subscriber", None)
+        if depth_subscriber is not None and not depth_subscriber.is_alive():
+            raise DeploymentError("TeleImager aligned-depth subscriber stopped")
 
     def read_rgb(self, timeout_s: float = 3.0) -> np.ndarray:
         if getattr(self, "_requires_depth", False):
@@ -1689,40 +1719,57 @@ class TeleimagerCamera:
                 time.sleep(0.01)
         raise TimeoutError(f"Timed out waiting for a fresh TeleImager frame ({last_error})")
 
-    def _read_rgbd(self, timeout_s: float) -> CameraImages:
+    def _read_geometry(self, timeout_s: float) -> CameraImages:
         deadline = time.monotonic() + timeout_s
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             try:
                 self._assert_subscriber_alive()
-                frame = self._client.get_head_rgbd_frame()
-                if frame is None:
-                    raise TimeoutError("TeleImager RGBD transport has no fresh packet")
-                try:
-                    measured_fps = float(self._client.get_head_rgbd_fps())
-                except (TypeError, ValueError) as exc:
-                    raise TimeoutError("TeleImager RGBD stream FPS is not numeric") from exc
-                if not np.isfinite(measured_fps) or measured_fps <= 0.0:
-                    raise TimeoutError("TeleImager RGBD stream has not established a live rolling FPS")
-                if frame.received_monotonic_ns is None:
-                    raise DeploymentError("TeleImager RGBD packet has no local receive timestamp")
-                age_s = (time.monotonic_ns() - frame.received_monotonic_ns) / 1_000_000_000.0
-                if age_s < 0.0 or age_s > RGBD_MAX_RECEIVE_AGE_S:
-                    raise TimeoutError(
-                        f"TeleImager RGBD packet is stale ({age_s:.3f}s old); "
-                        f"RGBD_MAX_RECEIVE_AGE_S={RGBD_MAX_RECEIVE_AGE_S:.3f}s"
-                    )
-                if self._last_rgbd_sequence is not None:
-                    if frame.sequence < self._last_rgbd_sequence:
-                        raise DeploymentError(
-                            "TeleImager RGBD sequence regressed from "
-                            f"{self._last_rgbd_sequence} to {frame.sequence}; restart the policy runner"
+                color_frame = self._client.get_head_frame()
+                depth_frame = self._client.get_head_depth_frame()
+                frames = (("RGB", color_frame), ("aligned-depth", depth_frame))
+                measured_fps: dict[str, float] = {}
+                received_ns: dict[str, int] = {}
+                now_ns = time.monotonic_ns()
+                for name, frame in frames:
+                    try:
+                        measured_fps[name] = float(getattr(frame, "fps", 0.0))
+                    except (TypeError, ValueError) as exc:
+                        raise TimeoutError(f"TeleImager {name} stream FPS is not numeric") from exc
+                    if not np.isfinite(measured_fps[name]) or measured_fps[name] <= 0.0:
+                        raise TimeoutError(
+                            f"TeleImager {name} stream has not established a live rolling FPS"
                         )
-                    if frame.sequence == self._last_rgbd_sequence:
-                        raise TimeoutError(f"TeleImager RGBD sequence {frame.sequence} is not new")
+                    timestamp = getattr(frame, "received_monotonic_ns", None)
+                    if timestamp is None:
+                        raise DeploymentError(
+                            f"TeleImager {name} frame has no local receive timestamp"
+                        )
+                    received_ns[name] = int(timestamp)
+                    age_s = (now_ns - received_ns[name]) / 1_000_000_000.0
+                    if age_s < 0.0 or age_s > RGBD_MAX_RECEIVE_AGE_S:
+                        raise TimeoutError(
+                            f"TeleImager {name} frame is stale ({age_s:.3f}s old); "
+                            f"RGBD_MAX_RECEIVE_AGE_S={RGBD_MAX_RECEIVE_AGE_S:.3f}s"
+                        )
 
-                rgb = _decode_color_jpeg_rgb(frame.color_jpeg, self.config)
-                depth_u16 = _decode_depth_png_u16(frame.aligned_depth_png)
+                previous = {
+                    "RGB": self._last_color_received_ns,
+                    "aligned-depth": self._last_depth_received_ns,
+                }
+                for name in ("RGB", "aligned-depth"):
+                    if previous[name] is not None and received_ns[name] < previous[name]:
+                        raise DeploymentError(
+                            f"TeleImager {name} receive timestamp regressed; restart the policy runner"
+                        )
+                    if previous[name] == received_ns[name]:
+                        raise TimeoutError(f"TeleImager {name} frame is not new")
+
+                rgb = decode_color_0_rgb(color_frame, self.config)
+                depth_bytes = getattr(depth_frame, "jpg", None)
+                if not depth_bytes:
+                    raise TimeoutError("TeleImager aligned-depth stream has no fresh PNG")
+                depth_u16 = _decode_depth_png_u16(depth_bytes)
                 if list(depth_u16.shape) != EXPECTED_DEPTH_VIEW_SHAPE[:2]:
                     raise DeploymentError(
                         f"Aligned depth shape {depth_u16.shape} does not match the training contract "
@@ -1750,29 +1797,33 @@ class TeleimagerCamera:
                             ),
                         )
                     else:
-                        raise DeploymentError("RGBD camera has no selected geometry encoding")
+                        raise DeploymentError("Geometry camera has no selected encoding")
                 except ValueError as exc:
                     raise DeploymentError(f"Could not encode aligned depth geometry: {exc}") from exc
-                self._last_rgbd_sequence = frame.sequence
+                self._last_color_received_ns = received_ns["RGB"]
+                self._last_depth_received_ns = received_ns["aligned-depth"]
                 if not self._reported_stream_fps:
-                    LOGGER.info("TeleImager atomic RGBD stream is live at %.1f measured FPS", measured_fps)
+                    LOGGER.info(
+                        "TeleImager legacy streams are live: RGB %.1f FPS, aligned depth %.1f FPS",
+                        measured_fps["RGB"],
+                        measured_fps["aligned-depth"],
+                    )
                     self._reported_stream_fps = True
                 return CameraImages(
                     rgb=rgb,
                     depth_gray=depth_gray,
                     surface_normals=surface_normals,
-                    sequence=frame.sequence,
                 )
             except TimeoutError as exc:
                 last_error = exc
                 time.sleep(0.005)
             except (TypeError, ValueError) as exc:
-                raise DeploymentError(f"Invalid TeleImager RGBD packet: {exc}") from exc
-        raise TimeoutError(f"Timed out waiting for a fresh TeleImager RGBD frame ({last_error})")
+                raise DeploymentError(f"Invalid TeleImager geometry frame: {exc}") from exc
+        raise TimeoutError(f"Timed out waiting for fresh TeleImager geometry ({last_error})")
 
     def read(self, timeout_s: float = 3.0) -> CameraImages:
         if self._requires_depth:
-            return self._read_rgbd(timeout_s)
+            return self._read_geometry(timeout_s)
         return CameraImages(rgb=self.read_rgb(timeout_s=timeout_s))
 
     def close(self) -> None:
@@ -1924,6 +1975,37 @@ class _G1Dex3CommandBackend:
     def state(self) -> RobotState:
         return self._validate_runtime_state(self.reader.latest())
 
+    def _validate_prearm_takeover_state(self, state: RobotState) -> None:
+        """Apply the existing pre-arm limits to a prospective takeover sample."""
+
+        state_age = time.monotonic() - state.captured_at
+        if not np.isfinite(state_age) or not 0.0 <= state_age <= PREARM_STATE_MAX_AGE_S:
+            raise DeploymentError(
+                f"Robot state age before arm takeover is {state_age:.3f}s; "
+                f"PREARM_STATE_MAX_AGE_S={PREARM_STATE_MAX_AGE_S:.3f}s"
+            )
+        arm_dq_joint = int(np.argmax(np.abs(state.arm_dq)))
+        arm_dq = float(state.arm_dq[arm_dq_joint])
+        if abs(arm_dq) > PREARM_MAX_ARM_DQ_RAD_S:
+            raise DeploymentError(
+                f"Arm is not stationary before takeover at joint {arm_dq_joint} "
+                f"({ARM_JOINT_NAMES[arm_dq_joint]}): {arm_dq:+.3f} rad/s; "
+                f"PREARM_MAX_ARM_DQ_RAD_S={PREARM_MAX_ARM_DQ_RAD_S:.3f} rad/s"
+            )
+        drift_group, drift_joint, drift_name, drift = _largest_named_value(
+            (
+                ("arm", state.arm - self._arm_target, ARM_JOINT_NAMES),
+                ("left hand", state.left_hand - self._left_target, LEFT_HAND_JOINT_NAMES),
+                ("right hand", state.right_hand - self._right_target, RIGHT_HAND_JOINT_NAMES),
+            )
+        )
+        if abs(drift) > PREARM_MAX_POSITION_DRIFT_RAD:
+            raise DeploymentError(
+                f"Pre-takeover {drift_group} position drift at joint {drift_joint} "
+                f"({drift_name}) is {drift:+.4f} rad; "
+                f"PREARM_MAX_POSITION_DRIFT_RAD={PREARM_MAX_POSITION_DRIFT_RAD:.4f} rad"
+            )
+
     def prepare_measured_hold(self) -> RobotState:
         state = self._validate_runtime_state(self.reader.read(timeout_s=0.5))
         if not self.simulation:
@@ -1981,7 +2063,12 @@ class _G1Dex3CommandBackend:
         self._left_hand_publish_history.clear()
         self._right_hand_publish_history.clear()
 
-    def _write_arm_message(self, *, require_qualified_state: bool) -> None:
+    def _write_arm_message(
+        self,
+        *,
+        require_qualified_state: bool,
+        require_prearm_takeover_state: bool = False,
+    ) -> None:
         """CRC and write the already-populated arm message once."""
 
         timing_enabled = getattr(self, "_authority_ramp_timing_enabled", False)
@@ -1996,7 +2083,9 @@ class _G1Dex3CommandBackend:
             if require_qualified_state:
                 started_ns = time.monotonic_ns()
                 try:
-                    self._validate_runtime_state(self.reader.latest())
+                    state = self._validate_runtime_state(self.reader.latest())
+                    if require_prearm_takeover_state:
+                        self._validate_prearm_takeover_state(state)
                 finally:
                     if timing_enabled:
                         timing["arm_state_check"] = (time.monotonic_ns() - started_ns) / 1e6
@@ -2019,7 +2108,13 @@ class _G1Dex3CommandBackend:
             )
         self._has_published = True
 
-    def _publish_arm(self, require_qualified_state: bool = True) -> None:
+    def _publish_arm(
+        self,
+        require_qualified_state: bool = True,
+        *,
+        gravity_scale: float = 1.0,
+        require_prearm_takeover_state: bool = False,
+    ) -> None:
         # Reproduce XR teleoperation's Pinocchio RNEA feed-forward for the final
         # outgoing q, including initialization, warmup, HOLD, authority ramps,
         # and simulation.  compute() checks finiteness, joint order, and a
@@ -2027,16 +2122,33 @@ class _G1Dex3CommandBackend:
         # Allocate both cache candidates before touching the message or calling
         # DDS.  After a successful Write, publishing the cache is only two
         # reference assignments and cannot fail due to an array allocation.
+        if (
+            isinstance(gravity_scale, bool)
+            or not isinstance(gravity_scale, (int, float, np.integer, np.floating))
+            or not np.isfinite(float(gravity_scale))
+            or not 0.0 <= float(gravity_scale) <= 1.0
+        ):
+            raise DeploymentError(
+                f"gravity_scale must be finite and inside [0, 1], got {gravity_scale!r}"
+            )
+        gravity_scale = float(gravity_scale)
         candidate_q = self._arm_target.copy()
         if self._arm_gravity is None:
-            gravity_tau = np.zeros(ARM_DOF, dtype=np.float64)
+            full_gravity_tau = np.zeros(ARM_DOF, dtype=np.float64)
         else:
-            gravity_tau = self._arm_gravity.compute(candidate_q)
+            # Validate the dynamics result and torque envelope before the first
+            # full-authority Write even when that packet intentionally sends
+            # zero feed-forward torque.
+            full_gravity_tau = self._arm_gravity.compute(candidate_q)
+        gravity_tau = gravity_scale * full_gravity_tau
         for offset, index in enumerate(self._arm_indices):
             command = self._arm_message.motor_cmd[index]
             command.q = float(candidate_q[offset])
             command.tau = float(gravity_tau[offset])
-        self._write_arm_message(require_qualified_state=require_qualified_state)
+        self._write_arm_message(
+            require_qualified_state=require_qualified_state,
+            require_prearm_takeover_state=require_prearm_takeover_state,
+        )
         # Cache only after Write succeeds.  Cleanup can then shed arm_sdk
         # authority even when the dynamics computation that triggered a fault
         # is no longer usable.  The cached pair is exactly what DDS accepted.
@@ -2170,7 +2282,12 @@ class _G1Dex3CommandBackend:
         failures = []
         start_weight = self._weight
         period = 1.0 / PUBLISH_HZ
-        duration = max(float(ARM_RELEASE_RAMP_S), period)
+        # Preserve one constant weight-slope across both normal full-authority
+        # shutdowns and faults during acquisition.  A fault after only a tiny
+        # amount of authority was acquired must not keep a suspect command
+        # alive for the entire full-weight release duration.
+        full_weight_duration = max(float(ARM_RELEASE_RAMP_S), period)
+        duration = max(full_weight_duration * start_weight, period)
         ramp_started = time.monotonic()
         next_write_at = ramp_started
         arm_writes = 0
@@ -2178,9 +2295,22 @@ class _G1Dex3CommandBackend:
         max_arm_cycle_s = 0.0
         last_successful_weight = start_weight
         # Release does not depend on policy, camera, fresh state, or IK.
-        LOGGER.info("Arm authority release started at weight %.4f", start_weight)
+        LOGGER.info(
+            "Arm authority release started at weight %.4f: scheduled ramp %.3fs "
+            "(full-weight ramp %.3fs)",
+            start_weight,
+            duration,
+            full_weight_duration,
+        )
         if phase_callback is not None:
-            phase_callback("arm_release_begin", {"start_weight": start_weight})
+            phase_callback(
+                "arm_release_begin",
+                {
+                    "start_weight": start_weight,
+                    "scheduled_ramp_s": duration,
+                    "full_weight_ramp_s": full_weight_duration,
+                },
+            )
         while True:
             now = time.monotonic()
             if now < next_write_at:
@@ -2442,6 +2572,25 @@ def _tracking_errors(backend: _G1Dex3CommandBackend, state: RobotState) -> tuple
     return arm_error, hand_error
 
 
+def _enforce_arm_tracking(
+    backend: _G1Dex3CommandBackend,
+    state: RobotState,
+    *,
+    context: str,
+) -> None:
+    """Reject motion away from the fixed outgoing arm target."""
+
+    _, arm_joint, arm_name, arm_delta = _largest_named_value(
+        (("arm", state.arm - backend._arm_target, ARM_JOINT_NAMES),)
+    )
+    if abs(arm_delta) > MAX_ARM_TRACKING_ERROR_RAD:
+        raise DeploymentError(
+            f"Arm tracking error during {context} at joint {arm_joint} ({arm_name}) is "
+            f"{arm_delta:+.3f} rad (measured minus target); "
+            f"MAX_ARM_TRACKING_ERROR_RAD={MAX_ARM_TRACKING_ERROR_RAD:.3f} rad"
+        )
+
+
 def _enforce_tracking(
     backend: _G1Dex3CommandBackend,
     state: RobotState,
@@ -2452,15 +2601,7 @@ def _enforce_tracking(
     desired_left: np.ndarray | None = None,
     desired_right: np.ndarray | None = None,
 ) -> None:
-    _, arm_joint, arm_name, arm_delta = _largest_named_value(
-        (("arm", state.arm - backend._arm_target, ARM_JOINT_NAMES),)
-    )
-    if abs(arm_delta) > MAX_ARM_TRACKING_ERROR_RAD:
-        raise DeploymentError(
-            f"Arm tracking error at joint {arm_joint} ({arm_name}) is {arm_delta:+.3f} rad "
-            f"(measured minus target); MAX_ARM_TRACKING_ERROR_RAD="
-            f"{MAX_ARM_TRACKING_ERROR_RAD:.3f} rad"
-        )
+    _enforce_arm_tracking(backend, state, context=context)
     if hand_watchdog is not None and hand_watchdog.enforce(
         backend,
         state,
@@ -2861,50 +3002,69 @@ def _ramp_real_arm_authority(
     stop_event: Any,
     heartbeat: Any,
 ) -> bool:
-    """Publish a measured hold while gradually acquiring ``arm_sdk`` authority.
+    """Acquire ``arm_sdk`` at measured q, then ramp only gravity feed-forward.
 
     Dex3 absolute targets do not need to be rewritten for every arm authority
     step.  Writing each hand at every step made the nominal 1.5-second ramp
     perform 450 serial DDS writes and allowed DDS latency to push arming past
-    the parent's timeout.  First publish the measured arm hold at zero weight,
-    then send the measured hand hold once and ramp only the arm command.  The
+    the parent's timeout.  First publish the measured arm hold at full weight
+    and zero feed-forward torque, then send the measured hand hold once and
+    ramp only the arm gravity term.  The
     initial arm write also establishes the cleanup invariant before any hand
     write: a subsequent cancellation/fault must run arm release and Dex3
-    ``stopMotors``.  Arm weight follows elapsed wall time and missed 100 Hz
-    ticks are skipped instead of accumulating an extra sleep after slow writes.
+    ``stopMotors``.  The first arm packet uses weight one, the captured measured
+    pose and zero feed-forward torque.  This is a bumpless takeover whether the
+    robot applied a previous process's release or retained its old arm_sdk
+    weight.  The captured pose remains fixed while gravity feed-forward rises
+    from zero to its normal value; XR-zero remains a separate, subsequently
+    confirmed bounded initialization path.  Missed 100 Hz ticks are skipped
+    instead of accumulating an extra sleep after slow writes.
 
     ``False`` is an orderly cancellation requested through ``stop_event``;
     heartbeat expiry remains a fault with a distinct diagnostic.
     """
 
     if stop_event.is_set():
-        LOGGER.info("Arm authority ramp cancelled before the first DDS write")
+        LOGGER.info("Arm takeover cancelled before the first DDS write")
         return False
     if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
-        raise DeploymentError("Parent heartbeat expired before arm authority ramp")
+        raise DeploymentError("Parent heartbeat expired before arm takeover")
 
-    backend.set_weight(0.0)
+    # Reapply the existing pre-arm contract immediately before the first
+    # full-authority write. The robot can move, or feedback can age, after the
+    # dwell's final sample; a failed final guard must produce no command.
+    backend._validate_prearm_takeover_state(backend.state())
+    if stop_event.is_set():
+        LOGGER.info("Arm takeover cancelled after the final state guard")
+        return False
+    if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
+        raise DeploymentError("Parent heartbeat expired after the final arm takeover state guard")
+
+    backend.set_weight(1.0)
     authority_started = time.monotonic()
     initial_arm_write_started = authority_started
-    backend._publish_arm()
+    backend._publish_arm(
+        gravity_scale=0.0,
+        require_prearm_takeover_state=True,
+    )
     initial_arm_write_s = time.monotonic() - initial_arm_write_started
     if stop_event.is_set():
-        LOGGER.info("Arm authority ramp cancelled after the zero-weight arm hold write")
+        LOGGER.info("Arm takeover cancelled after the matched-pose zero-torque write")
         return False
     if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
-        raise DeploymentError("Parent heartbeat expired after zero-weight arm hold write")
+        raise DeploymentError("Parent heartbeat expired after matched-pose zero-torque write")
 
     hand_write_started = time.monotonic()
     backend._publish_hands()
     hand_write_s = time.monotonic() - hand_write_started
     if stop_event.is_set():
-        LOGGER.info("Arm authority ramp cancelled after the measured hand hold write")
+        LOGGER.info("Arm takeover cancelled after the measured hand hold write")
         return False
     if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
         raise DeploymentError("Parent heartbeat expired after measured hand hold write")
 
     period = 1.0 / PUBLISH_HZ
-    duration = max(float(ARM_AUTHORITY_RAMP_S), period)
+    duration = max(float(ARM_GRAVITY_RAMP_S), period)
     ramp_started = time.monotonic()
     next_write_at = ramp_started
     arm_writes = 0
@@ -2913,26 +3073,26 @@ def _ramp_real_arm_authority(
 
     while True:
         if stop_event.is_set():
-            LOGGER.info("Arm authority ramp cancelled after %d arm writes", arm_writes)
+            LOGGER.info("Arm gravity ramp cancelled after %d arm writes", arm_writes)
             return False
         if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
-            raise DeploymentError("Parent heartbeat expired while ramping arm authority")
+            raise DeploymentError("Parent heartbeat expired while ramping arm gravity feed-forward")
 
         now = time.monotonic()
         if now < next_write_at and stop_event.wait(next_write_at - now):
-            LOGGER.info("Arm authority ramp cancelled after %d arm writes", arm_writes)
+            LOGGER.info("Arm gravity ramp cancelled after %d arm writes", arm_writes)
             return False
         if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
-            raise DeploymentError("Parent heartbeat expired while ramping arm authority")
+            raise DeploymentError("Parent heartbeat expired while ramping arm gravity feed-forward")
 
         cycle_started = time.monotonic()
-        measured = backend.state()
-        # Keep the exact hand targets that were written above.  Only the arm
-        # target tracks measured q while authority weight rises.
-        backend.set_target(measured.arm, backend._left_target, backend._right_target)
-        weight = min(1.0, (cycle_started - ramp_started + period) / duration)
-        backend.set_weight(weight)
-        backend._publish_arm()
+        # Validate fresh/mode/velocity state on every takeover cycle, but keep
+        # q fixed at the measured pose captured before the first Write.  Chasing
+        # measured q would hide motion instead of holding the handoff point.
+        state = backend.state()
+        _enforce_arm_tracking(backend, state, context="matched-pose gravity ramp")
+        gravity_scale = min(1.0, (cycle_started - ramp_started + period) / duration)
+        backend._publish_arm(gravity_scale=gravity_scale)
         cycle_completed = time.monotonic()
         arm_writes += 1
         max_arm_cycle_s = max(max_arm_cycle_s, cycle_completed - cycle_started)
@@ -2940,11 +3100,11 @@ def _ramp_real_arm_authority(
         # Cleanup requests are not heartbeat faults.  Check the stop event
         # first, including after a potentially blocking DDS Write.
         if stop_event.is_set():
-            LOGGER.info("Arm authority ramp cancelled after %d arm writes", arm_writes)
+            LOGGER.info("Arm gravity ramp cancelled after %d arm writes", arm_writes)
             return False
         if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
-            raise DeploymentError("Parent heartbeat expired while ramping arm authority")
-        if weight >= 1.0:
+            raise DeploymentError("Parent heartbeat expired while ramping arm gravity feed-forward")
+        if gravity_scale >= 1.0:
             break
 
         next_write_at += period
@@ -2953,13 +3113,89 @@ def _ramp_real_arm_authority(
             skipped_ticks += missed
             next_write_at += missed * period
 
+    # Do not report the actuator as armed merely because the torque blend
+    # finished.  Continue holding the captured pose at full gravity torque and
+    # require fresh, low-velocity state to settle before the parent can offer
+    # the XR-zero transition.  This check occurs after the zero-torque phase,
+    # so its tight stationary limits do not turn expected initial PD sag into
+    # an immediate fault.
+    ramp_completed_at = time.monotonic()
+    settle_started = ramp_completed_at
+    settle_deadline = settle_started + ARM_TAKEOVER_SETTLE_TIMEOUT_S
+    stationary_since: float | None = None
+    stationary_reference: np.ndarray | None = None
+    distinct_samples = 0
+    last_arm_received_at = float("-inf")
+    last_arm_error = float("inf")
+    last_arm_dq = float("inf")
+    while not stop_event.is_set() and time.monotonic() < settle_deadline:
+        loop_started = time.monotonic()
+        if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
+            raise DeploymentError("Parent heartbeat expired while verifying arm takeover")
+        state = backend.state()
+        _enforce_arm_tracking(backend, state, context="matched-pose takeover settle")
+        now = time.monotonic()
+        arm_received_at = (
+            state.captured_at if state.arm_received_at is None else state.arm_received_at
+        )
+        if now - arm_received_at > ACTUATOR_ARM_STATE_MAX_AGE_S:
+            raise DeploymentError("Arm state is not fresh enough to verify arm takeover")
+        last_arm_error = float(np.max(np.abs(state.arm - backend._arm_target)))
+        last_arm_dq = float(np.max(np.abs(state.arm_dq)))
+        stationary = (
+            last_arm_error <= INITIALIZATION_ARM_TOLERANCE_RAD
+            and last_arm_dq <= INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S
+        )
+        if stationary:
+            if stationary_since is None:
+                stationary_since = now
+                stationary_reference = state.arm.copy()
+                distinct_samples = 0
+                last_arm_received_at = float("-inf")
+            assert stationary_reference is not None
+            if (
+                float(np.max(np.abs(state.arm - stationary_reference)))
+                > INITIALIZATION_MAX_POSITION_DRIFT_RAD
+            ):
+                stationary_since = now
+                stationary_reference = state.arm.copy()
+                distinct_samples = 0
+                last_arm_received_at = float("-inf")
+            if arm_received_at > last_arm_received_at:
+                distinct_samples += 1
+                last_arm_received_at = arm_received_at
+            if (
+                now - stationary_since >= ARM_TAKEOVER_SETTLE_DWELL_S
+                and distinct_samples >= INITIALIZATION_MIN_DISTINCT_SAMPLES
+            ):
+                break
+        else:
+            stationary_since = None
+            stationary_reference = None
+            distinct_samples = 0
+            last_arm_received_at = float("-inf")
+        backend._publish_arm(gravity_scale=1.0)
+        elapsed = time.monotonic() - loop_started
+        stop_event.wait(max(0.0, period - elapsed))
+    else:
+        if stop_event.is_set():
+            LOGGER.info("Arm takeover cancelled during the stationary verification dwell")
+            return False
+        raise DeploymentError(
+            "Arm did not settle after matched-pose takeover: "
+            f"arm error={last_arm_error:.3f} rad, max arm dq={last_arm_dq:.3f} rad/s, "
+            f"required dwell={ARM_TAKEOVER_SETTLE_DWELL_S:.3f}s"
+        )
+
     completed_at = time.monotonic()
     LOGGER.info(
-        "Arm authority acquisition completed in %.3fs: weight ramp=%.3fs, "
-        "zero-weight arm write=%.3fs, hand hold write=%.3fs, arm writes=%d, "
+        "Arm authority acquisition completed in %.3fs: gravity ramp=%.3fs, "
+        "stationary verification=%.3fs, "
+        "matched-pose zero-torque arm write=%.3fs, hand hold write=%.3fs, arm writes=%d, "
         "skipped 100 Hz ticks=%d, max arm cycle=%.3fs",
         completed_at - authority_started,
-        completed_at - ramp_started,
+        ramp_completed_at - ramp_started,
+        completed_at - settle_started,
         initial_arm_write_s,
         hand_write_s,
         arm_writes,
@@ -3077,7 +3313,7 @@ def _actuator_main(
                 "authority_ramp_timing",
                 {"event": "prearm_begin", "elapsed_ms": 0.0},
             )
-        ramp_reference = backend.prepare_measured_hold()
+        backend.prepare_measured_hold()
         if authority_ramp_diagnostics:
             _status(
                 status_queue,
@@ -3408,7 +3644,7 @@ def _actuator_main(
                 continue
 
             if freshness.recovered:
-                # Arm feedback remained under its hard 75 ms gate.  Capture
+                # Arm feedback remained under its hard 100 ms gate.  Capture
                 # its current pose while preserving the exact frozen Dex3
                 # targets; the discarded plan is never resumed.
                 _enforce_tracking(
@@ -4471,6 +4707,7 @@ class SafeG1Dex3Actuator:
         self._pending_sequence: int | None = None
         self._rtc_active = False
         self._rtc_terminal: tuple[str, Any] | None = None
+        self._rtc_fenced_through_sequence = 0
         self._last_replan_detail: dict[str, Any] | None = None
         self._command_conditioning = command_conditioning
         self._gravity_feedforward = gravity_feedforward
@@ -4497,7 +4734,10 @@ class SafeG1Dex3Actuator:
         if kind == "hand_state_pause":
             self._hand_state_paused = True
             self._last_hand_state_event = value
-            LOGGER.warning("Actuator paused for short Dex3 feedback loss: %s", value)
+            LOGGER.warning(
+                "DDS drop — waiting for reconnection",
+                extra={"terminal_yellow": True},
+            )
             return True
         if kind == "hand_state_recovery_progress":
             self._last_hand_state_event = value
@@ -4509,8 +4749,26 @@ class SafeG1Dex3Actuator:
             )
             return True
         if kind == "hand_state_operator_hold":
+            pending_sequence = getattr(self, "_pending_sequence", None)
+            if isinstance(pending_sequence, int) and not isinstance(pending_sequence, bool):
+                self._rtc_fenced_through_sequence = max(
+                    int(getattr(self, "_rtc_fenced_through_sequence", 0)),
+                    pending_sequence,
+                )
+            # The child has already discarded the time-indexed plan and is
+            # publishing a powered HOLD by the time this reliable status is
+            # observed. Mirror that terminal transition atomically in the
+            # parent. Otherwise a later goal can be rejected as though the
+            # abandoned plan were still active.
+            self._hand_state_paused = True
             self._hand_operator_hold_pending = True
             self._last_hand_state_event = value
+            self._holding = True
+            self._warm_started = False
+            self._chunk_in_flight = False
+            self._pending_sequence = None
+            self._rtc_active = False
+            self._rtc_terminal = None
             LOGGER.warning(
                 "Dex3 feedback remained stale through the operator-HOLD deadline: %s",
                 value,
@@ -4536,6 +4794,78 @@ class SafeG1Dex3Actuator:
             LOGGER.info("Discarded obsolete RTC control message after scheduler replan: %s", value)
             return True
         return False
+
+    def _rtc_terminal_status_is_fenced(self, kind: str, value: Any) -> bool:
+        """Return whether a delayed RTC terminal belongs to an abandoned plan."""
+
+        if kind not in {"rtc_completed", "rtc_underrun", "rtc_rejected"}:
+            return False
+        if not isinstance(value, dict):
+            return False
+        sequence = value.get("sequence")
+        if isinstance(sequence, bool) or not isinstance(sequence, int):
+            return False
+        fenced_through = int(getattr(self, "_rtc_fenced_through_sequence", 0))
+        if sequence > fenced_through:
+            return False
+        LOGGER.info(
+            "Discarded delayed %s for fenced RTC sequence %d (fenced through %d)",
+            kind,
+            sequence,
+            fenced_through,
+        )
+        return True
+
+    def _accept_rtc_terminal_status(self, kind: str, value: Any) -> tuple[str, Any] | None:
+        """Reconcile one RTC terminal status without touching a newer plan."""
+
+        if self._rtc_terminal_status_is_fenced(kind, value):
+            return None
+        sequence = None
+        if isinstance(value, dict):
+            candidate = value.get("sequence")
+            if isinstance(candidate, int) and not isinstance(candidate, bool):
+                sequence = candidate
+        target_sequence = (
+            self._pending_sequence
+            if getattr(self, "_rtc_active", False) and getattr(self, "_chunk_in_flight", False)
+            else None
+        )
+        if sequence is not None:
+            if target_sequence is None:
+                if sequence <= self._sequence:
+                    LOGGER.info(
+                        "Discarded delayed %s for inactive RTC sequence %d",
+                        kind,
+                        sequence,
+                    )
+                    return None
+                raise DeploymentError(
+                    f"Unexpected {kind} sequence {sequence}; no RTC plan is active"
+                )
+            if sequence < target_sequence:
+                LOGGER.info(
+                    "Discarded delayed %s for RTC sequence %d; active sequence is %d",
+                    kind,
+                    sequence,
+                    target_sequence,
+                )
+                return None
+            if sequence > target_sequence:
+                raise DeploymentError(
+                    f"{kind} sequence {sequence} does not match active RTC sequence "
+                    f"{target_sequence}"
+                )
+        outcome = "complete" if kind == "rtc_completed" else "hold"
+        event = (outcome, value)
+        self._rtc_terminal = event
+        self._chunk_in_flight = False
+        self._pending_sequence = None
+        self._rtc_active = False
+        self._holding = True
+        if outcome == "hold":
+            self._warm_started = False
+        return event
 
     def _accept_replan_status(
         self,
@@ -4597,6 +4927,16 @@ class SafeG1Dex3Actuator:
 
         pending = bool(getattr(self, "_hand_operator_hold_pending", False))
         self._hand_operator_hold_pending = False
+        if pending:
+            # Keep acknowledgment idempotently aligned with the child HOLD.
+            # It grants permission to prepare a fresh goal; it never revives
+            # the abandoned sequence.
+            self._holding = True
+            self._warm_started = False
+            self._chunk_in_flight = False
+            self._pending_sequence = None
+            self._rtc_active = False
+            self._rtc_terminal = None
         return pending
 
     def wait_for_hand_feedback(self) -> None:
@@ -4619,6 +4959,8 @@ class SafeG1Dex3Actuator:
 
     def _wait_status(self, expected: str, timeout_s: float, payload: Any = None) -> Any:
         deadline = time.monotonic() + timeout_s
+        if getattr(self, "_hand_state_paused", False):
+            deadline += ACTUATOR_HAND_RECOVERY_WAIT_GRACE_S
         while time.monotonic() < deadline:
             immediate = self.immediate_control_requested()
             if immediate is not None and expected != "urgent_holding":
@@ -4641,6 +4983,8 @@ class SafeG1Dex3Actuator:
                 continue
             if kind in {"hand_state_pause", "hand_state_recovered"}:
                 self._record_auxiliary_status(kind, value)
+                if kind == "hand_state_pause":
+                    deadline += ACTUATOR_HAND_RECOVERY_WAIT_GRACE_S
                 if kind == expected and (payload is None or value == payload):
                     return value
                 continue
@@ -4663,20 +5007,11 @@ class SafeG1Dex3Actuator:
                 if self._immediate_release_requested.is_set():
                     raise ImmediateControlEvent("release")
                 raise DeploymentError("Actuator stopped before the requested operation completed")
-            if kind in {"rtc_underrun", "rtc_rejected"} and kind != expected and expected != "urgent_holding":
-                self._rtc_terminal = ("hold", value)
-                self._chunk_in_flight = False
-                self._pending_sequence = None
-                self._rtc_active = False
-                self._holding = True
-                raise RtcTerminalEvent("hold", value)
-            if kind == "rtc_completed" and kind != expected and expected != "urgent_holding":
-                self._rtc_terminal = ("complete", value)
-                self._chunk_in_flight = False
-                self._pending_sequence = None
-                self._rtc_active = False
-                self._holding = True
-                raise RtcTerminalEvent("complete", value)
+            if kind in {"rtc_completed", "rtc_underrun", "rtc_rejected"} and expected != "urgent_holding":
+                event = self._accept_rtc_terminal_status(kind, value)
+                if event is not None:
+                    raise RtcTerminalEvent(*event)
+                continue
             if kind == expected and (payload is None or value == payload):
                 return value
         if expected == "armed" and self._authority_ramp_diagnostics:
@@ -4704,7 +5039,7 @@ class SafeG1Dex3Actuator:
         self.heartbeat()
         self._command_queue.put(("arm",), timeout=0.2)
         if timeout_s is None:
-            timeout_s = ARM_AUTHORITY_RAMP_S + 3.0
+            timeout_s = ARM_GRAVITY_RAMP_S + ARM_TAKEOVER_SETTLE_TIMEOUT_S + 2.0
         try:
             self._wait_status("armed", timeout_s=timeout_s)
         except TimeoutError:
@@ -4756,10 +5091,8 @@ class SafeG1Dex3Actuator:
                     self._stopped_acknowledged = True
                     if issue is None:
                         issue = "stopped"
-                elif kind == "rtc_completed":
-                    self._rtc_terminal = ("complete", value)
-                elif kind in {"rtc_underrun", "rtc_rejected"}:
-                    self._rtc_terminal = ("hold", value)
+                elif kind in {"rtc_completed", "rtc_underrun", "rtc_rejected"}:
+                    self._accept_rtc_terminal_status(kind, value)
                 elif kind == "replan_required":
                     detail = self._accept_replan_status(value)
                     if detail is not None:
@@ -5028,6 +5361,8 @@ class SafeG1Dex3Actuator:
             while True:
                 kind, value = self._status_queue.get_nowait()
                 if self._record_auxiliary_status(kind, value):
+                    if kind == "hand_state_operator_hold":
+                        event = ("hold", value)
                     continue
                 if kind == "fault":
                     raise DeploymentError(f"Actuator fault: {value}")
@@ -5045,13 +5380,16 @@ class SafeG1Dex3Actuator:
                     if self._immediate_release_requested.is_set():
                         raise ImmediateControlEvent("release")
                     raise DeploymentError("Actuator stopped during RTC")
-                if kind == "rtc_completed":
-                    event = ("complete", value)
-                elif kind in {"rtc_underrun", "rtc_rejected"}:
-                    event = ("hold", value)
+                if kind in {"rtc_completed", "rtc_underrun", "rtc_rejected"}:
+                    accepted = self._accept_rtc_terminal_status(kind, value)
+                    if accepted is not None:
+                        event = accepted
         except queue.Empty:
             pass
         if event is not None:
+            # poll_rtc_event() is the consumer of this terminal event. Do not
+            # leave the helper's cache armed and return the same event twice.
+            self._rtc_terminal = None
             self._chunk_in_flight = False
             self._pending_sequence = None
             self._rtc_active = False
@@ -5128,6 +5466,8 @@ class SafeG1Dex3Actuator:
         if not self._chunk_in_flight or sequence != self._pending_sequence:
             raise DeploymentError(f"Action chunk {sequence} is not the pending sequence")
         deadline = time.monotonic() + timeout_s
+        if getattr(self, "_hand_state_paused", False):
+            deadline += ACTUATOR_HAND_RECOVERY_WAIT_GRACE_S
         while time.monotonic() < deadline:
             immediate = self.immediate_control_requested()
             if immediate == "release":
@@ -5143,6 +5483,10 @@ class SafeG1Dex3Actuator:
                     raise DeploymentError("Actuator process exited unexpectedly")
                 continue
             if self._record_auxiliary_status(kind, value):
+                if kind == "hand_state_operator_hold":
+                    return "hold"
+                if kind == "hand_state_pause":
+                    deadline += ACTUATOR_HAND_RECOVERY_WAIT_GRACE_S
                 continue
             if kind == "fault":
                 raise DeploymentError(f"Actuator fault: {value}")
@@ -5163,7 +5507,7 @@ class SafeG1Dex3Actuator:
                     return "release"
                 raise DeploymentError("Actuator stopped before the action chunk completed")
             if kind == "holding" and value == sequence:
-                # The 300 ms feedback boundary enters operator HOLD
+                # The 1.25 s feedback boundary enters operator HOLD
                 # immediately. A later explicit goal remains independently
                 # blocked until the three-reading recovery gate completes.
                 self._hand_state_paused = False
@@ -5179,11 +5523,15 @@ class SafeG1Dex3Actuator:
                 self._pending_sequence = None
                 return "complete"
             if kind in {"rtc_underrun", "rtc_rejected"}:
-                self._rtc_terminal = ("hold", value)
-                raise RtcTerminalEvent("hold", value)
+                event = self._accept_rtc_terminal_status(kind, value)
+                if event is not None:
+                    raise RtcTerminalEvent(*event)
+                continue
             if kind == "rtc_completed":
-                self._rtc_terminal = ("complete", value)
-                raise RtcTerminalEvent("complete", value)
+                event = self._accept_rtc_terminal_status(kind, value)
+                if event is not None:
+                    raise RtcTerminalEvent(*event)
+                continue
         raise TimeoutError(f"Timed out waiting for action chunk {sequence}")
 
     def hold(self) -> None:

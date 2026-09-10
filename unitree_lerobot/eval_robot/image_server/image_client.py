@@ -708,6 +708,7 @@ class ImageClient:
         request_port=60000,
         request_bgr: bool = False,
         request_rgbd: bool = False,
+        request_depth: bool = False,
     ):
         """
         Args:
@@ -716,11 +717,15 @@ class ImageClient:
             request_bgr:      Whether to request BGR decoding for subscribers
             request_rgbd:     Subscribe to the atomic head RGBD stream instead of
                               the legacy head-colour stream
+            request_depth:    Subscribe to the legacy aligned-depth stream
         """
+        if request_rgbd and request_depth:
+            raise ValueError("request_rgbd and request_depth are mutually exclusive")
         self._host = host
         self._request_port = request_port
         self._request_bgr = request_bgr
         self._request_rgbd = request_rgbd
+        self._request_depth = request_depth
         self._last_rgbd_fps = 0.0
         self._closed = False
         self._requester = None
@@ -734,6 +739,9 @@ class ImageClient:
                 raise RuntimeError("Failed to get camera configuration.")
 
             head_config = self._cam_config['head_camera']
+            depth_port = head_config.get('depth_zmq_port')
+            if self._request_depth and depth_port is None:
+                raise RuntimeError("Head camera has no depth_zmq_port")
             if self._request_rgbd:
                 rgbd_port = head_config.get('rgbd_zmq_port')
                 if rgbd_port is None:
@@ -741,6 +749,8 @@ class ImageClient:
                 self._subscriber_manager.subscribe(self._host, rgbd_port, request_bgr=False)
             elif head_config['enable_zmq']:
                 self._subscriber_manager.subscribe(self._host, head_config['zmq_port'], request_bgr=self._request_bgr)
+                if self._request_depth:
+                    self._subscriber_manager.subscribe(self._host, depth_port, request_bgr=False)
 
             if self._cam_config['left_wrist_camera']['enable_zmq']:
                 self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
@@ -764,6 +774,14 @@ class ImageClient:
         if self._request_rgbd:
             raise RuntimeError("This ImageClient requested RGBD; use get_head_rgbd_frame()")
         return self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'], request_bgr=self._request_bgr)
+
+    def get_head_depth_frame(self) -> TeleImage:
+        if not self._request_depth:
+            raise RuntimeError("This ImageClient did not request the aligned-depth stream")
+        port = self._cam_config['head_camera'].get('depth_zmq_port')
+        if port is None:
+            raise RuntimeError("Head camera has no depth_zmq_port")
+        return self._subscriber_manager.subscribe(self._host, port, request_bgr=False)
 
     def get_head_rgbd_frame(self) -> Optional[TeleRgbdFrame]:
         if not self._request_rgbd:

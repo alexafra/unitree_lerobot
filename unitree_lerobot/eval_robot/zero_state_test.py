@@ -63,7 +63,7 @@ ZERO_STATE_JOINTS_RAD = TRAINING_START_JOINTS_RAD
 
 MAX_ZERO_STATE_ARM_SPEED_RAD_S = 0.25
 MAX_ZERO_STATE_HAND_SPEED_RAD_S = 0.50
-REQUIRED_RELEASE_RAMP_S = 1.5
+REQUIRED_RELEASE_RAMP_S = 3.0
 HOLD_POLL_S = 0.02
 
 
@@ -204,8 +204,10 @@ def run(args: argparse.Namespace) -> None:
         "place the same numeric joint coordinates at a different physical pose. Keep the "
         "workspace clear and hold the physical emergency stop. Stop every other arm/hand "
         "publisher.\n"
-        "q/Q requests orderly release immediately. The 1.5-second interval is the nominal "
-        "arm-only authority ramp; the hands retain their target until stopMotors afterward, "
+        "q/Q requests orderly release immediately. Startup takes full arm authority at the "
+        "measured pose with zero feed-forward torque, then blends gravity compensation over "
+        "1.5 seconds. A full-authority release ramps down over 3 seconds; the hands retain "
+        "their target until stopMotors afterward, "
         "and a blocked DDS write can extend the total time. This is not an electrical "
         "emergency stop."
     )

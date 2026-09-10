@@ -1,3 +1,25 @@
+# CURRENT REVIEWED STACK-CUPS PAIR — 2026-09-10
+# Start the server on the GPU machine from Isaac-GR00T.
+cd /home/alex/Development/Isaac-GR00T
+export HF_HOME=/home/alex/.cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export HF_HUB_DISABLE_TELEMETRY=1
+export GROOT_HF_LOCAL_FIRST=1
+export GROOT_PATCH_MISTRAL=1
+unset HF_TOKEN HUGGING_FACE_HUB_TOKEN
+
+CUDA_VISIBLE_DEVICES=0 NO_ALBUMENTATIONS_UPDATE=1 uv run --no-sync python -m \
+gr00t.eval.run_gr00t_server \
+  --model-path "/home/alex/Development/Models/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_30k_rightonly_1408_stack_0908_2026-09-09T021219+0800/checkpoint-20000" \
+  --embodiment-tag NEW_EMBODIMENT \
+  --deployment-dataset-path "/home/alex/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08_plus_pick_three_cups_right_only_1408_plus_stack_cups_09_08/train" \
+  --device cuda:0 \
+  --host 127.0.0.1 \
+  --port 5555
+
+# If the GPU server is remote, run this tunnel on the robot-control workstation.
 ssh -N \
   -o ExitOnForwardFailure=yes \
   -o ServerAliveInterval=10 \
@@ -5,16 +27,31 @@ ssh -N \
   -L 127.0.0.1:5555:127.0.0.1:5555 \
   alex@192.168.0.159
 
+# Start with one chunk to qualify the new authority handoff. After that passes,
+# change only --max-chunks deliberately for a full stacking attempt. Warmup2 is
+# enabled below; replace --warmup2 with --no-warmup2 to skip it. The separate
+# --no-future-goal-warmup2 keeps later goal changes from invoking it.
+cd /home/alex/Development/unitree_lerobot
+python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+  --actuate \
+  --allow-unqualified-real \
+  --task stack-three-cups \
+  --policy-host 127.0.0.1 \
+  --policy-port 5555 \
+  --image-host 192.168.123.164 \
+  --network-interface enp132s0 \
+  --initialization xr-home \
+  --no-warmup1 \
+  --warmup2 \
+  --no-future-goal-warmup2 \
+  --return-to-start \
+  --inference-mode rtc \
+  --execution-horizon 8 \
+  --max-chunks 1 \
+  --command-conditioning xr
 
-CUDA_VISIBLE_DEVICES=0 uv run --no-sync python -m \
-gr00t.eval.run_gr00t_server \
-    --model-path "$HOME/Development/Models/c_only_batch_32_acc_1_chunk_32_20k_1008_1/checkpoint-20000" \
-    --embodiment-tag NEW_EMBODIMENT \
-    --deployment-dataset-path \
-    "$HOME/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08/train" \
-    --device cuda:0 \
-    --host 127.0.0.1 \
-    --port 5555
+
+# HISTORICAL COMMANDS BELOW — DO NOT COPY AS THE CURRENT STACKING PAIR.
 
 
 

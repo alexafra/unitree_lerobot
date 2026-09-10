@@ -32,7 +32,9 @@ TASKS = {
     "pick-wooden-block": "pick up the wooden block.",
     "down-wooden-block": "put down the wooden block.",
     "pick-cerealbox": "pick up the cereal box.",
-    "down-cerealbox": "put down the cereal box."
+    "down-cerealbox": "put down the cereal box.",
+    "stack-three-cups": "stack the three red cups."
+
 }
 
 COLOUR_VIDEO_KEYS = ("ego_view",)
@@ -378,7 +380,16 @@ def validate_policy_metadata(
         raise DeploymentError("A checkpoint cannot request depth_gray_view and surface_normals_view together")
     if vision_input_contract is not None:  # earlyfusion
         actual_vision = metadata.get("vision_input_contract")  # earlyfusion
-        if actual_vision != vision_input_contract:  # earlyfusion
+        compatible_6ch_init = (  # earlyfusion
+            isinstance(actual_vision, dict)  # earlyfusion
+            and actual_vision.get("input_channels") == 6  # earlyfusion
+            and vision_input_contract.get("input_channels") == 6  # earlyfusion
+            and actual_vision.get("patch_embed_init") in {"zeros", "rgb_mean"}  # earlyfusion
+            and vision_input_contract.get("patch_embed_init") in {"zeros", "rgb_mean"}  # earlyfusion
+            and {key: value for key, value in actual_vision.items() if key != "patch_embed_init"}  # earlyfusion
+            == {key: value for key, value in vision_input_contract.items() if key != "patch_embed_init"}  # earlyfusion
+        )  # earlyfusion
+        if actual_vision != vision_input_contract and not compatible_6ch_init:  # earlyfusion
             raise DeploymentError(f"GR00T vision input contract mismatch: got {actual_vision!r}, expected {vision_input_contract!r}")  # earlyfusion
     if requires_surface_normals:
         return _validate_surface_normal_metadata(contract)

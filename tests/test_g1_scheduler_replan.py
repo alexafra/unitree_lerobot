@@ -21,6 +21,7 @@ from unitree_lerobot.eval_robot.eval_groot_g1 import (
 )
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     CONTROL_HZ,
+    HandFeedbackOperatorHold,
     SafeG1Dex3Actuator,
 )
 from unitree_lerobot.eval_robot.groot_contract import load_initialization_spec
@@ -342,7 +343,14 @@ class ChildSchedulerReplanTest(unittest.TestCase):
             child.commands.put(("urgent_hold_barrier",), timeout=0.2)
             self.assertEqual(child.assert_status("urgent_holding"), 1)
             child.backend.stale_hands = False
-            child.assert_status("hand_state_recovered")
+            progress = []
+            while True:
+                kind, value = child.statuses.get(timeout=1.0)
+                if kind == "hand_state_recovered":
+                    break
+                self.assertEqual(kind, "hand_state_recovery_progress")
+                progress.append(value["fresh_samples"])
+            self.assertEqual(progress, [1, 2, 3])
 
             # The superseded automatic replan must not reappear. A normal
             # warm-start command proves the child is logically in HOLD.
@@ -362,7 +370,13 @@ class ChildSchedulerReplanTest(unittest.TestCase):
 
 class ParentReplanTest(unittest.TestCase):
     @staticmethod
-    def _parent_handle_with_status(kind: str, payload: dict, *, rtc: bool) -> SafeG1Dex3Actuator:
+    def _parent_handle_with_status(
+        kind: str,
+        payload: dict,
+        *,
+        rtc: bool,
+        sequence: int | None = None,
+    ) -> SafeG1Dex3Actuator:
         class _AliveProcess:
             @staticmethod
             def is_alive() -> bool:
@@ -372,8 +386,9 @@ class ParentReplanTest(unittest.TestCase):
         actuator._initialized = True
         actuator._holding = False
         actuator._chunk_in_flight = True
-        actuator._pending_sequence = int(payload["sequence"])
-        actuator._sequence = int(payload["sequence"])
+        pending_sequence = int(payload["sequence"] if sequence is None else sequence)
+        actuator._pending_sequence = pending_sequence
+        actuator._sequence = pending_sequence
         actuator._rtc_active = rtc
         actuator._rtc_terminal = None
         actuator._control_lock = threading.Lock()
@@ -406,6 +421,100 @@ class ParentReplanTest(unittest.TestCase):
         self.assertFalse(rtc._rtc_active)
         self.assertIsNone(rtc._pending_sequence)
         self.assertFalse(rtc._holding)
+
+    def test_feedback_operator_hold_fences_old_rtc_and_accepts_fresh_goal(self) -> None:
+        sequence = 741
+        payload = {
+            "context": f"active sequence={sequence} next_action_index=0 rtc=False holding=False",
+            "hands": ("right",),
+            "age_s": 1.01,
+        }
+        actuator = self._parent_handle_with_status(
+            "hand_state_operator_hold",
+            payload,
+            rtc=True,
+            sequence=sequence,
+        )
+        actuator._warm_started = True
+
+        with self.assertRaises(HandFeedbackOperatorHold):
+            actuator._wait_status("rtc_snapshot", timeout_s=0.2)
+
+        self.assertTrue(actuator._holding)
+        self.assertFalse(actuator._warm_started)
+        self.assertFalse(actuator._chunk_in_flight)
+        self.assertIsNone(actuator._pending_sequence)
+        self.assertFalse(actuator._rtc_active)
+        self.assertTrue(actuator._hand_state_paused)
+        self.assertTrue(actuator._hand_operator_hold_pending)
+        self.assertEqual(actuator._rtc_fenced_through_sequence, sequence)
+
+        # This is the exact FIFO tail left behind in the real failure: the
+        # child reports terminal RTC rejection after the parent has already
+        # surfaced operator HOLD. It must not resurrect/corrupt plan state.
+        actuator._status_queue.put(
+            (
+                "rtc_rejected",
+                {"reason": "hand_state_operator_hold", "sequence": sequence, "rtc": True},
+            )
+        )
+        actuator._status_queue.put(
+            (
+                "hand_state_recovered",
+                {"fresh_samples": 3, "required_samples": 3, "pause_s": 0.92},
+            )
+        )
+        actuator.assert_healthy()
+        self.assertFalse(actuator._hand_state_paused)
+        self.assertTrue(actuator.acknowledge_hand_operator_hold())
+        self.assertFalse(actuator.acknowledge_hand_operator_hold())
+
+        with mock.patch.object(actuator, "_wait_status", return_value=sequence + 1):
+            next_sequence = actuator.start_rtc(_plan(32), action_budget=16)
+        self.assertEqual(next_sequence, sequence + 1)
+        self.assertTrue(actuator._rtc_active)
+        self.assertTrue(actuator._chunk_in_flight)
+        self.assertEqual(actuator._pending_sequence, sequence + 1)
+
+        # Even if the old rejection is delayed until after the new plan starts,
+        # its sequence fence prevents it from terminating the replacement.
+        actuator._status_queue.put(
+            (
+                "rtc_rejected",
+                {"reason": "hand_state_operator_hold", "sequence": sequence, "rtc": True},
+            )
+        )
+        self.assertIsNone(actuator.poll_rtc_event())
+        self.assertTrue(actuator._rtc_active)
+        self.assertTrue(actuator._chunk_in_flight)
+        self.assertEqual(actuator._pending_sequence, sequence + 1)
+
+    def test_polling_operator_hold_returns_hold_and_discards_paired_rtc_rejection(self) -> None:
+        sequence = 17
+        payload = {
+            "context": f"active sequence={sequence} next_action_index=0 rtc=False holding=False",
+            "hands": ("right",),
+            "age_s": 1.01,
+        }
+        actuator = self._parent_handle_with_status(
+            "hand_state_operator_hold",
+            payload,
+            rtc=True,
+            sequence=sequence,
+        )
+        actuator._status_queue.put(
+            (
+                "rtc_rejected",
+                {"reason": "hand_state_operator_hold", "sequence": sequence, "rtc": True},
+            )
+        )
+
+        self.assertEqual(actuator.poll_rtc_event(), ("hold", payload))
+        self.assertTrue(actuator._holding)
+        self.assertFalse(actuator._rtc_active)
+        self.assertFalse(actuator._chunk_in_flight)
+        self.assertIsNone(actuator._pending_sequence)
+        self.assertIsNone(actuator.poll_rtc_event())
 
     def test_sync_parent_refetches_immediately_and_logs_opt_in_yellow_warning(self) -> None:
         first_plan = _plan(2)
