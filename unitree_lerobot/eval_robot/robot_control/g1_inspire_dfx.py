@@ -1,4 +1,4 @@
-"""Read-only Unitree G1 Inspire DFX state adapter.
+"""Guarded Unitree G1 Inspire DFX state and command adapters.
 
 The official DFX bridge publishes both hands in one ``MotorStates_`` message:
 right motors at wire indices 0..5 and left motors at 6..11.  DDS callback
@@ -6,8 +6,9 @@ freshness alone is insufficient because the bridge republishes cached positions
 when an internal hand read fails.  Its per-motor ``lost`` counters are therefore
 used to advance each hand's accepted timestamp independently.
 
-This module intentionally contains no command publisher.  Guarded Inspire DFX
-actuation is not qualified yet.
+The command adapter is intentionally small: it validates both canonical hands,
+maps them to DFX's right-first wire order, and performs one combined DDS write.
+It never writes during construction and has no synthetic motor-stop command.
 """
 
 from __future__ import annotations
@@ -20,6 +21,9 @@ from typing import Any
 
 import numpy as np
 
+from unitree_lerobot.eval_robot.g1_end_effectors import (
+    UNQUALIFIED_INSPIRE_DFX_COMMAND_MAX_STEP,
+)
 from unitree_lerobot.eval_robot.groot_client import DeploymentError
 from unitree_lerobot.eval_robot.groot_contract import ARM_DOF, validate_measured_state
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import RobotState, STATE_MAX_AGE_S
@@ -30,6 +34,10 @@ DFX_TOTAL_MOTORS = 12
 DFX_RIGHT_SLICE = slice(0, 6)
 DFX_LEFT_SLICE = slice(6, 12)
 UINT32_MAX = (1 << 32) - 1
+# Compatibility alias for the first shadow-client API. The canonical name
+# above makes explicit that 0.2 is teleop-derived, not a manufacturer limit.
+INSPIRE_DFX_COMMAND_MAX_STEP = UNQUALIFIED_INSPIRE_DFX_COMMAND_MAX_STEP
+INSPIRE_DFX_WRITE_TIMEOUT_S = 0.5
 
 
 def _motor_sequence(message: Any) -> Any:
@@ -61,6 +69,151 @@ def _side_values(motors: Any, indices: slice) -> tuple[np.ndarray, tuple[int, ..
         q_values.append(q)
         lost_values.append(lost)
     return np.asarray(q_values, dtype=np.float64), tuple(lost_values)
+
+
+def _command_values(values: Any, *, side: str) -> np.ndarray:
+    """Return one exact normalized six-axis command without coercing strings/bools."""
+
+    raw = np.asarray(values)
+    if raw.shape != (DFX_MOTORS_PER_HAND,) or raw.dtype.kind not in "iuf":
+        raise DeploymentError(
+            f"Inspire DFX {side} command must be a numeric ({DFX_MOTORS_PER_HAND},) vector"
+        )
+    result = np.ascontiguousarray(raw, dtype=np.float64)
+    if not np.all(np.isfinite(result)):
+        raise DeploymentError(f"Inspire DFX {side} command contains NaN or infinity")
+    bad = np.flatnonzero((result < 0.0) | (result > 1.0))
+    if bad.size:
+        joint = int(bad[0])
+        raise DeploymentError(
+            f"Inspire DFX {side} command joint {joint} is {result[joint]:.6f}; "
+            "normalized_open_fraction must remain inside [0, 1]"
+        )
+    return result
+
+
+class InspireDfxCommandWriter:
+    """One atomic combined DFX writer with a teleop-derived 0.2 backstop."""
+
+    def __init__(self, initial_left: Any, initial_right: Any) -> None:
+        from unitree_sdk2py.core.channel import ChannelPublisher
+        from unitree_sdk2py.idl.default import unitree_go_msg_dds__MotorCmd_
+        from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_
+
+        self._last_left = _command_values(initial_left, side="left").copy()
+        self._last_right = _command_values(initial_right, side="right").copy()
+        publisher = ChannelPublisher("rt/inspire/cmd", MotorCmds_)
+        try:
+            publisher.Init()
+            message = MotorCmds_()
+            message.cmds = [
+                unitree_go_msg_dds__MotorCmd_() for _ in range(DFX_TOTAL_MOTORS)
+            ]
+        except BaseException:
+            with contextlib.suppress(Exception):
+                publisher.Close()
+            raise
+        self._publisher = publisher
+        self._message = message
+        self._closed = False
+        self._has_written = False
+
+    @property
+    def has_written(self) -> bool:
+        """Whether this writer has successfully acquired the DFX command lease."""
+
+        return self._has_written
+
+    def reseed_before_first_write(self, left: Any, right: Any) -> None:
+        """Move the step-check origin to the final measured pre-arm hold."""
+
+        if self._closed:
+            raise DeploymentError("Inspire DFX command writer is closed")
+        if self._has_written:
+            raise DeploymentError("Inspire DFX command writer cannot be reseeded after a write")
+        candidate_left = _command_values(left, side="left")
+        candidate_right = _command_values(right, side="right")
+        self._last_left = candidate_left.copy()
+        self._last_right = candidate_right.copy()
+
+    def write(self, left: Any, right: Any) -> tuple[float, np.ndarray, np.ndarray]:
+        """Publish both hands once and return the shared completion timestamp."""
+
+        if self._closed:
+            raise DeploymentError("Inspire DFX command writer is closed")
+        candidate_left = _command_values(left, side="left")
+        candidate_right = _command_values(right, side="right")
+        for side, candidate, previous in (
+            ("left", candidate_left, self._last_left),
+            ("right", candidate_right, self._last_right),
+        ):
+            bad = np.flatnonzero(np.abs(candidate - previous) > INSPIRE_DFX_COMMAND_MAX_STEP + 1e-12)
+            if bad.size:
+                joint = int(bad[0])
+                raise DeploymentError(
+                    f"Inspire DFX {side} command step at joint {joint} is "
+                    f"{candidate[joint] - previous[joint]:+.6f}; "
+                    f"INSPIRE_DFX_COMMAND_MAX_STEP={INSPIRE_DFX_COMMAND_MAX_STEP:.3f}"
+                )
+
+        # Allocate every array needed by our post-Write state transition before
+        # touching DDS. Once Write returns True, only non-allocating reference
+        # assignments mark the physically accepted command as authoritative.
+        cached_left = candidate_left.copy()
+        cached_right = candidate_right.copy()
+        returned_left = candidate_left.copy()
+        returned_right = candidate_right.copy()
+
+        # DFX wire order is right 0..5 followed by left 6..11. Both candidates
+        # have already passed every check before the reusable message changes.
+        for index, value in enumerate(candidate_right):
+            self._message.cmds[index].q = float(value)
+        for offset, value in enumerate(candidate_left, start=DFX_MOTORS_PER_HAND):
+            self._message.cmds[offset].q = float(value)
+        write_ok = self._publisher.Write(self._message, timeout=INSPIRE_DFX_WRITE_TIMEOUT_S)
+        if write_ok is not True:
+            raise DeploymentError(
+                "Inspire DFX combined DDS Write failed; "
+                f"INSPIRE_DFX_WRITE_TIMEOUT_S={INSPIRE_DFX_WRITE_TIMEOUT_S:.3f}s"
+            )
+        self._last_left = cached_left
+        self._last_right = cached_right
+        self._has_written = True
+        completed_at = time.monotonic()
+        return completed_at, returned_left, returned_right
+
+    def refresh_last_successful(self) -> tuple[float, np.ndarray, np.ndarray]:
+        """Refresh only the command that DDS most recently accepted.
+
+        Release uses this instead of the backend's current target. If a newer
+        policy target failed before its hand Write, cleanup must not turn that
+        failed target into a new movement while authority is being released.
+        """
+
+        if self._closed:
+            raise DeploymentError("Inspire DFX command writer is closed")
+        if not self._has_written:
+            raise DeploymentError("Inspire DFX command lease has not been acquired")
+        returned_left = self._last_left.copy()
+        returned_right = self._last_right.copy()
+        for index, value in enumerate(self._last_right):
+            self._message.cmds[index].q = float(value)
+        for offset, value in enumerate(self._last_left, start=DFX_MOTORS_PER_HAND):
+            self._message.cmds[offset].q = float(value)
+        write_ok = self._publisher.Write(self._message, timeout=INSPIRE_DFX_WRITE_TIMEOUT_S)
+        if write_ok is not True:
+            raise DeploymentError(
+                "Inspire DFX lease-refresh DDS Write failed; "
+                f"INSPIRE_DFX_WRITE_TIMEOUT_S={INSPIRE_DFX_WRITE_TIMEOUT_S:.3f}s"
+            )
+        completed_at = time.monotonic()
+        return completed_at, returned_left, returned_right
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._publisher.Close()
+        self._closed = True
 
 
 class G1InspireDfxStateReader:
@@ -105,12 +258,19 @@ class G1InspireDfxStateReader:
             "left": {"baselines": 0, "accepted": 0, "drop_events": 0, "lost_increments": 0, "resets": 0},
             "right": {"baselines": 0, "accepted": 0, "drop_events": 0, "lost_increments": 0, "resets": 0},
         }
-        self._subscribers = {
-            "arm": ChannelSubscriber("rt/lowstate", LowState_),
-            "hands": ChannelSubscriber("rt/inspire/state", MotorStates_),
-        }
-        self._subscribers["arm"].Init(handler=self._on_arm)
-        self._subscribers["hands"].Init(handler=self._on_hands)
+        self._subscribers: dict[str, Any] = {}
+        try:
+            self._subscribers["arm"] = ChannelSubscriber("rt/lowstate", LowState_)
+            self._subscribers["hands"] = ChannelSubscriber(
+                "rt/inspire/state", MotorStates_
+            )
+            self._subscribers["arm"].Init(handler=self._on_arm)
+            self._subscribers["hands"].Init(handler=self._on_hands)
+        except BaseException:
+            for subscriber in self._subscribers.values():
+                with contextlib.suppress(Exception):
+                    subscriber.Close()
+            raise
 
     def _on_arm(self, message: Any) -> None:
         if message is None:

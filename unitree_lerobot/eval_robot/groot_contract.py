@@ -704,20 +704,70 @@ def _json_object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, A
     return result
 
 
-def validate_initialization_spec(spec: InitializationSpec) -> None:
+def validate_initialization_spec(
+    spec: InitializationSpec,
+    *,
+    allow_policy_warm_start: bool = False,
+) -> None:
     profile = _end_effector_profile(spec.end_effector)
-    if profile.name != "dex3":
-        if spec.mode != "measured" or spec.moves:
-            raise DeploymentError(
-                "Inspire DFX has no qualified live initialization/home contract; "
-                "only measured read-only initialization is accepted"
-            )
     if spec.mode not in INITIALIZATION_MODES:
         raise DeploymentError(f"Unsupported initialization mode {spec.mode!r}")
     if not isinstance(spec.label, str) or not spec.label.strip() or len(spec.label) > 120:
         raise DeploymentError("Initialization label must be a non-empty string of at most 120 characters")
     if spec.mode == "measured" and any(target is not None for target in (spec.arm, spec.left_hand, spec.right_hand)):
         raise DeploymentError("Measured initialization must preserve every measured target")
+    if profile.name != "dex3":
+        if spec.mode == "measured":
+            return
+        if not allow_policy_warm_start or spec.mode != "pose-file":
+            raise DeploymentError(
+                "Inspire DFX has no fixed initialization/home contract; only measured "
+                "initialization and the internal validated policy Warmup2 transition are accepted"
+            )
+        if spec.arm is None or spec.left_hand is None or spec.right_hand is None:
+            raise DeploymentError("Inspire DFX policy Warmup2 requires explicit arm and both-hand targets")
+        inspire_targets = (
+            ("arm", spec.arm, ARM_DOF, ARM_LOWER, ARM_UPPER, ARM_JOINT_NAMES, JOINT_LIMIT_MARGIN_RAD, "rad"),
+            (
+                "left hand",
+                spec.left_hand,
+                profile.hand_dof,
+                profile.left_lower,
+                profile.left_upper,
+                profile.left_joint_names,
+                0.0,
+                profile.value_unit,
+            ),
+            (
+                "right hand",
+                spec.right_hand,
+                profile.hand_dof,
+                profile.right_lower,
+                profile.right_upper,
+                profile.right_joint_names,
+                0.0,
+                profile.value_unit,
+            ),
+        )
+        for name, target, size, lower, upper, names, margin, unit in inspire_targets:
+            values = np.asarray(target)
+            if values.shape != (size,) or values.dtype.kind not in "iuf" or not np.all(np.isfinite(values)):
+                raise DeploymentError(
+                    f"Initialization {name} target is not a finite {size}-element numeric vector"
+                )
+            _check_limits(
+                name,
+                values.astype(np.float64, copy=False)[None],
+                lower,
+                upper,
+                joint_names=names,
+                lower_constant="ARM_LOWER" if name == "arm" else f"{name.upper().replace(' ', '_')}_LOWER",
+                upper_constant="ARM_UPPER" if name == "arm" else f"{name.upper().replace(' ', '_')}_UPPER",
+                margin=margin,
+                margin_constant="JOINT_LIMIT_MARGIN_RAD" if name == "arm" else None,
+                unit=unit,
+            )
+        return
     if spec.mode == "xr-home":
         expected_sizes = (ARM_DOF, HAND_DOF, HAND_DOF)
         for name, target, size in zip(

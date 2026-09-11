@@ -633,20 +633,20 @@ def validate_args(args: argparse.Namespace) -> None:
     if end_effector not in {"dex3", "inspire-dfx"}:
         raise DeploymentError("--end-effector must be dex3 or inspire-dfx")
     if end_effector == "inspire-dfx":
-        if args.actuate:
-            raise DeploymentError(
-                "Inspire DFX is currently shadow/read-only only: live actuation is fail-closed "
-                "until its motion envelope, gravity payload, and command-loss behavior are qualified"
-            )
         if args.sim:
             raise DeploymentError("Inspire DFX simulation is not qualified in this guarded client")
-        if getattr(args, "gravity_feedforward", True):
+        if getattr(args, "initialization", "measured") != "measured":
             raise DeploymentError(
-                "Inspire DFX cannot use the Dex3-payload gravity model; pass --no-gravity-feedforward"
+                "Inspire DFX actuation starts from freshly measured state; use --initialization measured"
             )
         if bool(getattr(args, "warmup1", False)):
             raise DeploymentError(
                 "Inspire DFX has no reviewed training-frame Warmup1 pose; pass --no-warmup1"
+            )
+        if args.actuate and getattr(args, "command_conditioning", "xr") != "xr":
+            raise DeploymentError(
+                "Inspire DFX actuation requires --command-conditioning xr so the authorized "
+                "0.2 normalized per-write hand limit is enforced"
             )
     if args.execution_horizon < 1:
         raise DeploymentError("--execution-horizon must be at least 1")
@@ -666,7 +666,7 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.actuate and not args.sim and not args.allow_unqualified_real:
         raise DeploymentError(
-            "Real actuation is fail-closed until robot-side publisher-loss and Dex3 stop "
+            "Real actuation is fail-closed until robot-side publisher-loss and hand stop/lease "
             "behavior are qualified. Use shadow/IsaacLab first; --allow-unqualified-real is "
             "an expert override, not a safety guarantee."
         )
@@ -720,7 +720,13 @@ def validate_args(args: argparse.Namespace) -> None:
         raise DeploymentError("--voice-listen-host cannot be empty")
 
 
-def confirm_actuation(simulation: bool, task_name: str, instruction: str) -> None:
+def confirm_actuation(
+    simulation: bool,
+    task_name: str,
+    instruction: str,
+    *,
+    end_effector: str = "dex3",
+) -> None:
     if not sys.stdin.isatty():
         raise DeploymentError("Actuation requires an interactive TTY so immediate s/q operator keys are available")
     if simulation:
@@ -736,10 +742,18 @@ def confirm_actuation(simulation: bool, task_name: str, instruction: str) -> Non
             "supported workspace, correct DDS interface, and an operator holding the "
             "physical emergency stop. Stop XR teleoperation and every other arm/hand publisher."
         )
-        print(
-            "WARNING: DDS Write and robot-side Dex3/publisher-loss failover are not proven "
-            "time-bounded by this client. This is an explicitly unqualified hardware test."
-        )
+        if end_effector == "inspire-dfx":
+            print(
+                "WARNING: Inspire DFX has no motor-stop command or acknowledgement. On release, "
+                "the client first ramps arm authority down, then stops hand writes and relies on "
+                "the DFX command lease expiring. The 0.2 normalized hand slew and existing "
+                "g1_body29_hand14 gravity model are explicitly unqualified lab choices."
+            )
+        else:
+            print(
+                "WARNING: DDS Write and robot-side Dex3/publisher-loss failover are not proven "
+                "time-bounded by this client. This is an explicitly unqualified hardware test."
+            )
         print(f"Task {task_name!r}: {instruction}")
         required = "ACTUATE"
     response = _confirm_before_authority(
@@ -1248,7 +1262,7 @@ def _run_return_to_start_from_hold(
         _wait_for_hand_feedback(actuator)
     except HandFeedbackOperatorHold as exc:
         LOGGER.warning(
-            "Dex3 feedback crossed %.2f s during Return-to-Start; transition cancelled "
+            "Hand feedback crossed %.2f s during Return-to-Start; transition cancelled "
             "and robot remains in powered HOLD: %s",
             ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
             exc.detail,
@@ -1499,7 +1513,7 @@ def infer_chunk(
             allow_custom_instruction,
         )
         if actuator is not None and _hand_pause_generation(actuator) != pause_generation:
-            LOGGER.warning("Discarded observation captured across a Dex3 feedback pause; recapturing")
+            LOGGER.warning("Discarded observation captured across a hand-feedback pause; recapturing")
             continue
         started = time.monotonic()
         try:
@@ -1513,7 +1527,7 @@ def infer_chunk(
             _wait_for_hand_feedback(actuator)
             if _hand_pause_generation(actuator) != pause_generation:
                 LOGGER.warning(
-                    "Discarded policy response computed across a Dex3 feedback pause; "
+                    "Discarded policy response computed across a hand-feedback pause; "
                     "resetting and inferring from a fresh observation"
                 )
                 policy.reset()
@@ -1566,7 +1580,7 @@ def infer_plan(
             allow_custom_instruction,
         )
         if actuator is not None and _hand_pause_generation(actuator) != pause_generation:
-            LOGGER.warning("Discarded observation captured across a Dex3 feedback pause; recapturing")
+            LOGGER.warning("Discarded observation captured across a hand-feedback pause; recapturing")
             continue
         started = time.monotonic()
         try:
@@ -1580,7 +1594,7 @@ def infer_plan(
             _wait_for_hand_feedback(actuator)
             if _hand_pause_generation(actuator) != pause_generation:
                 LOGGER.warning(
-                    "Discarded policy response computed across a Dex3 feedback pause; "
+                    "Discarded policy response computed across a hand-feedback pause; "
                     "resetting and inferring from a fresh observation"
                 )
                 policy.reset()
@@ -1670,7 +1684,7 @@ def _prepare_policy_goal(
         return "release"
     except HandFeedbackOperatorHold as exc:
         LOGGER.warning(
-            "Dex3 feedback crossed %.2f s during goal preparation; "
+            "Hand feedback crossed %.2f s during goal preparation; "
             "remaining in powered HOLD: %s",
             ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
             exc.detail,
@@ -1692,7 +1706,7 @@ def _prepare_policy_goal(
         _wait_for_hand_feedback(actuator)
     except HandFeedbackOperatorHold as exc:
         LOGGER.warning(
-            "Dex3 feedback crossed %.2f s before Warmup2 motion; "
+            "Hand feedback crossed %.2f s before Warmup2 motion; "
             "remaining in powered HOLD: %s",
             ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
             exc.detail,
@@ -1706,7 +1720,7 @@ def _prepare_policy_goal(
         )
     except HandFeedbackReplan as exc:
         LOGGER.warning(
-            "Warmup2 policy target was invalidated by a Dex3 feedback pause; "
+            "Warmup2 policy target was invalidated by a hand-feedback pause; "
             "re-observing the same goal: %s",
             exc.detail,
             extra={"terminal_yellow": True},
@@ -1824,7 +1838,7 @@ def _run_active_goal(
             outcome = "release"
         except HandFeedbackOperatorHold as exc:
             LOGGER.warning(
-                "Dex3 feedback crossed %.2f s; goal %r was abandoned in powered HOLD: %s",
+                "Hand feedback crossed %.2f s; goal %r was abandoned in powered HOLD: %s",
                 ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
                 task_name,
                 exc.detail,
@@ -1904,7 +1918,7 @@ def _run_active_goal_controlled(
             sequence = actuator.submit(chunk)
         except HandFeedbackReplan as exc:
             LOGGER.warning(
-                "Policy chunk was invalidated at installation by a Dex3 feedback pause; "
+                "Policy chunk was invalidated at installation by a hand-feedback pause; "
                 "re-observing goal %r: %s",
                 task_name,
                 exc.detail,
@@ -1928,7 +1942,7 @@ def _run_active_goal_controlled(
                 detail = {}
             if detail.get("reason") == "hand_state_recovered":
                 LOGGER.warning(
-                    "AUTOMATIC REPLAN after transient Dex3 feedback recovery during goal %r: "
+                    "AUTOMATIC REPLAN after transient hand-feedback recovery during goal %r: "
                     "pause=%.3fs, safety readings=%s/3; discarded %s old actions and "
                     "refetching from a fresh observation",
                     task_name,
@@ -2059,7 +2073,7 @@ def _run_active_goal_rtc(
                 remaining_action_budget = max(0, remaining_action_budget - max(0, consumed))
                 if detail.get("reason") == "hand_state_recovered":
                     LOGGER.warning(
-                        "AUTOMATIC RTC REPLAN after transient Dex3 feedback recovery during goal %r: "
+                        "AUTOMATIC RTC REPLAN after transient hand-feedback recovery during goal %r: "
                         "pause=%.3fs, safety readings=%s/3; discarded %s old actions and "
                         "refetching a fresh plan (remaining action budget=%d)",
                         task_name,
@@ -2096,7 +2110,7 @@ def _run_active_goal_rtc(
             outcome = "release"
         except HandFeedbackOperatorHold as exc:
             LOGGER.warning(
-                "Dex3 feedback crossed %.2f s; RTC goal %r was abandoned in powered HOLD: %s",
+                "Hand feedback crossed %.2f s; RTC goal %r was abandoned in powered HOLD: %s",
                 ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
                 task_name,
                 exc.detail,
@@ -2661,8 +2675,8 @@ def run(args: argparse.Namespace) -> None:
         )
         if end_effector == "inspire-dfx":
             LOGGER.info(
-                "Inspire DFX shadow contract enabled: native normalized 6-DoF hand values; "
-                "no command publisher or live conditioner exists"
+                "Inspire DFX contract enabled: native normalized 6-DoF hand values; "
+                "XR conditioning limits each final hand write to 0.2 normalized units"
             )
         elif getattr(args, "command_conditioning", "xr") == "xr":
             LOGGER.info(
@@ -2796,7 +2810,17 @@ def run(args: argparse.Namespace) -> None:
                 )
             return
 
-        confirm_actuation(args.sim, task_name, instruction)
+        if end_effector == "dex3":
+            # Preserve the legacy call shape for downstream wrappers and test
+            # doubles. Only Inspire needs the extended risk confirmation.
+            confirm_actuation(args.sim, task_name, instruction)
+        else:
+            confirm_actuation(
+                args.sim,
+                task_name,
+                instruction,
+                end_effector=end_effector,
+            )
         actuator_args = (
             args.sim,
             args.network_interface,
@@ -2808,6 +2832,8 @@ def run(args: argparse.Namespace) -> None:
         actuator_kwargs = {}
         if hasattr(args, "gravity_feedforward"):
             actuator_kwargs["gravity_feedforward"] = args.gravity_feedforward
+        if end_effector != "dex3":
+            actuator_kwargs["end_effector"] = end_effector
         run_log_dir = getattr(args, "_run_log_dir", None)
         if run_log_dir is None:
             # Keep direct library callers and existing test doubles compatible.
@@ -2986,7 +3012,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--end-effector",
         choices=("dex3", "inspire-dfx"),
         default="dex3",
-        help="Hand data/transport contract (default: dex3); Inspire DFX is currently shadow-only",
+        help="Hand data/transport contract (default: dex3); Inspire DFX real use requires the expert override",
     )
     goal_group = parser.add_mutually_exclusive_group()
     goal_group.add_argument("--task", choices=tuple(TASKS), help="Trained task ID; omit for a menu")
@@ -3156,7 +3182,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-unqualified-real",
         action="store_true",
-        help="Expert override for unqualified real DDS/Dex3 failover; has no effect with --sim",
+        help=(
+            "Expert override for unqualified real hand failover and, with Inspire DFX, the "
+            "authorized 0.2 normalized slew, lease-only shutdown, and teleop-parity gravity model"
+        ),
     )
     parser.add_argument(
         "--confirm-sim-network-isolated",

@@ -24,12 +24,12 @@ import cv2
 import numpy as np
 import zmq
 
-from unitree_lerobot.eval_robot.groot_client import DeploymentError
-from unitree_lerobot.eval_robot.run_logging import (
-    configure_process_logging,
-    diagnostic_json_path,
-    write_json,
+from unitree_lerobot.eval_robot.g1_end_effectors import (
+    DEX3_PROFILE,
+    EndEffectorProfile,
+    get_end_effector_profile,
 )
+from unitree_lerobot.eval_robot.groot_client import DeploymentError
 from unitree_lerobot.eval_robot.groot_contract import (
     ActionChunk,
     ARM_DOF,
@@ -42,7 +42,6 @@ from unitree_lerobot.eval_robot.groot_contract import (
     EXPECTED_EGO_VIEW_SHAPE,
     HAND_LIMIT_TOLERANCE_RAD,
     InitializationSpec,
-    HAND_DOF,
     JOINT_LIMIT_MARGIN_RAD,
     LEFT_HAND_LOWER,
     LEFT_HAND_JOINT_NAMES,
@@ -59,6 +58,11 @@ from unitree_lerobot.eval_robot.groot_contract import (
     validate_measured_state,
 )
 from unitree_lerobot.eval_robot.robot_control.g1_arm_gravity import G1ArmGravityCompensator
+from unitree_lerobot.eval_robot.run_logging import (
+    configure_process_logging,
+    diagnostic_json_path,
+    write_json,
+)
 from unitree_lerobot.utils.depth_encoding import encode_depth_gray_rgb
 from unitree_lerobot.utils.surface_normal_encoding import encode_surface_normals_rgb
 
@@ -197,18 +201,18 @@ class RtcTerminalEvent(DeploymentError):
 
 
 class HandFeedbackReplan(DeploymentError):
-    """A policy result was invalidated by a newer Dex3 feedback-pause epoch."""
+    """A policy result was invalidated by a newer hand-feedback pause epoch."""
 
     def __init__(self, detail: Any):
-        super().__init__(f"Dex3 feedback pause invalidated the policy result: {detail}")
+        super().__init__(f"Hand feedback pause invalidated the policy result: {detail}")
         self.detail = detail
 
 
 class HandFeedbackOperatorHold(DeploymentError):
-    """The 1.25 s Dex3 boundary revoked automatic task resume."""
+    """The 1.25 s hand-feedback boundary revoked automatic task resume."""
 
     def __init__(self, detail: Any):
-        super().__init__(f"Dex3 feedback crossed the operator-HOLD boundary: {detail}")
+        super().__init__(f"Hand feedback crossed the operator-HOLD boundary: {detail}")
         self.detail = detail
 
 
@@ -265,6 +269,8 @@ class HandStateFreshnessGate:
         self._operator_hold_active = False
         self._last_left_at = 0.0
         self._last_right_at = 0.0
+        self._last_left_lost: tuple[int, ...] | None = None
+        self._last_right_lost: tuple[int, ...] | None = None
 
     @property
     def active(self) -> bool:
@@ -277,6 +283,9 @@ class HandStateFreshnessGate:
         self._operator_hold_active = False
         self._last_left_at = 0.0
         self._last_right_at = 0.0
+        # Preserve DFX counter baselines across recovery. Clearing them here
+        # would silently miss the first new counter increment after every
+        # pause. Dex3 reports ``None`` and is unaffected.
 
     def check(self, state: RobotState, *, now: float | None = None) -> HandFreshnessResult:
         checked_at = time.monotonic() if now is None else float(now)
@@ -286,8 +295,22 @@ class HandStateFreshnessGate:
             "left": max(0.0, checked_at - float(left_at)),
             "right": max(0.0, checked_at - float(right_at)),
         }
+        lost_changed: set[str] = set()
+        for side, current in (
+            ("left", state.left_hand_lost),
+            ("right", state.right_hand_lost),
+        ):
+            attribute = f"_last_{side}_lost"
+            previous = getattr(self, attribute)
+            if current is not None:
+                current = tuple(int(value) for value in current)
+                if previous is not None and current != previous:
+                    lost_changed.add(side)
+                setattr(self, attribute, current)
         stale_hands = tuple(
-            name for name, age_s in ages.items() if age_s > ACTUATOR_HAND_STATE_PAUSE_AGE_S
+            name
+            for name, age_s in ages.items()
+            if age_s > ACTUATOR_HAND_STATE_PAUSE_AGE_S or name in lost_changed
         )
         max_age_s = max(ages.values())
         if stale_hands:
@@ -295,9 +318,13 @@ class HandStateFreshnessGate:
             if entered:
                 self._active = True
                 self._started_at = checked_at
+            pause_s = checked_at - self._started_at
             operator_hold_entered = (
                 not self._operator_hold_active
-                and max_age_s > ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S
+                and (
+                    max_age_s > ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S
+                    or pause_s >= ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S
+                )
             )
             if operator_hold_entered:
                 self._operator_hold_active = True
@@ -308,6 +335,7 @@ class HandStateFreshnessGate:
                 ready=False,
                 entered=entered,
                 operator_hold_entered=operator_hold_entered,
+                pause_s=pause_s,
                 stale_hands=stale_hands,
                 max_age_s=max_age_s,
             )
@@ -315,11 +343,26 @@ class HandStateFreshnessGate:
         if not self._active:
             return HandFreshnessResult(ready=True, max_age_s=max_age_s)
 
+        pause_s = checked_at - self._started_at
+        if (
+            not self._operator_hold_active
+            and pause_s >= ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S
+        ):
+            self._operator_hold_active = True
+            return HandFreshnessResult(
+                ready=False,
+                operator_hold_entered=True,
+                pause_s=pause_s,
+                max_age_s=max_age_s,
+                fresh_samples=self._fresh_samples,
+            )
+
         # Count actual paired DDS updates, not repeated 100 Hz reads of one
         # cached sample.
         if float(left_at) <= self._last_left_at or float(right_at) <= self._last_right_at:
             return HandFreshnessResult(
                 ready=False,
+                pause_s=pause_s,
                 max_age_s=max_age_s,
                 fresh_samples=self._fresh_samples,
             )
@@ -330,11 +373,11 @@ class HandStateFreshnessGate:
             return HandFreshnessResult(
                 ready=False,
                 recovery_progressed=True,
+                pause_s=pause_s,
                 max_age_s=max_age_s,
                 fresh_samples=self._fresh_samples,
             )
 
-        pause_s = checked_at - self._started_at
         fresh_samples = self._fresh_samples
         self.reset()
         return HandFreshnessResult(
@@ -821,11 +864,17 @@ class PublishedHandTarget:
 class HandTrackingWatchdog:
     """Time-align hand feedback to successful DDS targets and track warnings."""
 
-    def __init__(self, *, emit_logs: bool = True) -> None:
+    def __init__(
+        self,
+        profile: EndEffectorProfile = DEX3_PROFILE,
+        *,
+        emit_logs: bool = True,
+    ) -> None:
+        self._profile = profile
         self._emit_logs = bool(emit_logs)
         self._last_sample_at = np.full(2, -np.inf, dtype=np.float64)
-        self._violation_since = np.full((2, HAND_DOF), np.nan, dtype=np.float64)
-        self._warning_active = np.zeros((2, HAND_DOF), dtype=bool)
+        self._violation_since = np.full((2, profile.hand_dof), np.nan, dtype=np.float64)
+        self._warning_active = np.zeros((2, profile.hand_dof), dtype=bool)
 
     def reset(self, backend: Any | None = None) -> None:
         self._last_sample_at.fill(-np.inf)
@@ -868,6 +917,12 @@ class HandTrackingWatchdog:
     ) -> bool:
         """Check each newly received hand sample; return whether history was used."""
 
+        # Inspire DFX exposes no qualified position-tracking envelope. Its lost
+        # counters and receipt-age gate remain hard; tracking error is recorded
+        # in timing diagnostics but is not promoted to an invented stop limit.
+        if self._profile.tracking_hard is None:
+            return True
+
         histories = (
             getattr(backend, "_left_hand_publish_history", None),
             getattr(backend, "_right_hand_publish_history", None),
@@ -881,14 +936,14 @@ class HandTrackingWatchdog:
                 "left hand",
                 np.asarray(state.left_hand, dtype=np.float64),
                 state.left_hand_received_at,
-                LEFT_HAND_JOINT_NAMES,
+                self._profile.left_joint_names,
                 desired_left,
             ),
             (
                 "right hand",
                 np.asarray(state.right_hand, dtype=np.float64),
                 state.right_hand_received_at,
-                RIGHT_HAND_JOINT_NAMES,
+                self._profile.right_joint_names,
                 desired_right,
             ),
         )
@@ -910,7 +965,8 @@ class HandTrackingWatchdog:
             errors = measured - aligned.target
             joint = int(np.argmax(np.abs(errors)))
             error = float(errors[joint])
-            if abs(error) > MAX_HAND_TRACKING_ERROR_RAD:
+            assert self._profile.tracking_hard is not None
+            if abs(error) > self._profile.tracking_hard:
                 latest = history[-1]
                 latest_target = float(latest.target[joint])
                 latest_error = float(measured[joint] - latest_target)
@@ -921,7 +977,7 @@ class HandTrackingWatchdog:
                 raise DeploymentError(
                     f"{hand_name.title()} time-aligned tracking error at joint {joint} "
                     f"({joint_names[joint]}) is {error:+.3f} rad (measured minus aligned target); "
-                    f"MAX_HAND_TRACKING_ERROR_RAD={MAX_HAND_TRACKING_ERROR_RAD:.3f} rad; "
+                    f"tracking_hard={self._profile.tracking_hard:.3f} {self._profile.value_unit}; "
                     f"measured_q={float(measured[joint]):+.4f}, "
                     f"aligned_target_q={float(aligned.target[joint]):+.4f}, "
                     f"latest_published_q={latest_target:+.4f}, latest_error={latest_error:+.4f}, "
@@ -933,7 +989,9 @@ class HandTrackingWatchdog:
 
             magnitudes = np.abs(errors)
             for joint_index, magnitude in enumerate(magnitudes):
-                if magnitude >= HAND_TRACKING_WARNING_RAD:
+                assert self._profile.tracking_warning is not None
+                assert self._profile.tracking_clear is not None
+                if magnitude >= self._profile.tracking_warning:
                     since = self._violation_since[hand_index, joint_index]
                     if np.isnan(since):
                         self._violation_since[hand_index, joint_index] = sample_at
@@ -945,23 +1003,26 @@ class HandTrackingWatchdog:
                         if self._emit_logs:
                             LOGGER.warning(
                                 "%s tracking error persisted for %.3fs at joint %d (%s): "
-                                "%+.3f rad measured-minus-aligned-target; warning threshold=%.3f rad; %s",
+                                "%+.3f %s measured-minus-aligned-target; warning threshold=%.3f %s; %s",
                                 hand_name.title(),
                                 sample_at - since,
                                 joint_index,
                                 joint_names[joint_index],
                                 float(errors[joint_index]),
-                                HAND_TRACKING_WARNING_RAD,
+                                self._profile.value_unit,
+                                self._profile.tracking_warning,
+                                self._profile.value_unit,
                                 context,
                             )
-                elif magnitude <= HAND_TRACKING_WARNING_CLEAR_RAD:
+                elif magnitude <= self._profile.tracking_clear:
                     if self._warning_active[hand_index, joint_index] and self._emit_logs:
                         LOGGER.info(
-                            "%s tracking warning recovered at joint %d (%s): %+.3f rad",
+                            "%s tracking warning recovered at joint %d (%s): %+.3f %s",
                             hand_name.title(),
                             joint_index,
                             joint_names[joint_index],
                             float(errors[joint_index]),
+                            self._profile.value_unit,
                         )
                     self._violation_since[hand_index, joint_index] = np.nan
                     self._warning_active[hand_index, joint_index] = False
@@ -977,7 +1038,10 @@ class XrPolicyOutputConditioner:
     not by normal synchronous chunks or RTC replacements.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, profile: EndEffectorProfile = DEX3_PROFILE) -> None:
+        if profile.conditioned_step is None:
+            raise DeploymentError(f"{profile.name} has no configured conditioned hand step")
+        self._profile = profile
         self._desired_arm: np.ndarray | None = None
         self._desired_left: np.ndarray | None = None
         self._desired_right: np.ndarray | None = None
@@ -985,7 +1049,11 @@ class XrPolicyOutputConditioner:
 
     def reset(self, arm: np.ndarray, left: np.ndarray, right: np.ndarray) -> None:
         arrays = tuple(np.asarray(value, dtype=np.float64) for value in (arm, left, right))
-        if tuple(value.shape for value in arrays) != ((ARM_DOF,), (HAND_DOF,), (HAND_DOF,)):
+        if tuple(value.shape for value in arrays) != (
+            (ARM_DOF,),
+            (self._profile.hand_dof,),
+            (self._profile.hand_dof,),
+        ):
             raise DeploymentError("XR policy-output conditioner reset target has the wrong shape")
         if not all(np.all(np.isfinite(value)) for value in arrays):
             raise DeploymentError("XR policy-output conditioner reset target is not finite")
@@ -999,6 +1067,7 @@ class XrPolicyOutputConditioner:
             arm=np.asarray(arm, dtype=np.float64)[None],
             left_hand=np.asarray(left, dtype=np.float64)[None],
             right_hand=np.asarray(right, dtype=np.float64)[None],
+            end_effector=self._profile.name,
         )
         validate_action_chunk_limits(target)
         self._desired_arm = target.arm[0].copy()
@@ -1041,10 +1110,10 @@ class XrPolicyOutputConditioner:
         # command-step limiter remains authoritative.
         arm_lower = ARM_LOWER + JOINT_LIMIT_MARGIN_RAD
         arm_upper = ARM_UPPER - JOINT_LIMIT_MARGIN_RAD
-        left_lower = LEFT_HAND_LOWER - HAND_LIMIT_TOLERANCE_RAD
-        left_upper = LEFT_HAND_UPPER + HAND_LIMIT_TOLERANCE_RAD
-        right_lower = RIGHT_HAND_LOWER - HAND_LIMIT_TOLERANCE_RAD
-        right_upper = RIGHT_HAND_UPPER + HAND_LIMIT_TOLERANCE_RAD
+        left_lower = self._profile.left_lower - self._profile.limit_tolerance
+        left_upper = self._profile.left_upper + self._profile.limit_tolerance
+        right_lower = self._profile.right_lower - self._profile.limit_tolerance
+        right_upper = self._profile.right_upper + self._profile.limit_tolerance
         arm = np.clip(arm, arm_lower, arm_upper)
         left = np.clip(
             left,
@@ -1070,13 +1139,13 @@ class XrPolicyOutputConditioner:
         left_delta = left - current_left
         left_scale = max(
             1.0,
-            float(np.max(np.abs(left_delta) / MAX_CONDITIONED_HAND_STEP_RAD)),
+            float(np.max(np.abs(left_delta) / self._profile.conditioned_step)),
         )
         left = current_left + left_delta / left_scale
         right_delta = right - current_right
         right_scale = max(
             1.0,
-            float(np.max(np.abs(right_delta) / MAX_CONDITIONED_HAND_STEP_RAD)),
+            float(np.max(np.abs(right_delta) / self._profile.conditioned_step)),
         )
         right = current_right + right_delta / right_scale
         # A group-wide slew scale can otherwise leave a different joint just
@@ -1091,14 +1160,17 @@ class XrPolicyOutputConditioner:
             arm=np.ascontiguousarray(arm[None]),
             left_hand=np.ascontiguousarray(left[None]),
             right_hand=np.ascontiguousarray(right[None]),
+            end_effector=self._profile.name,
         )
         # This is the final outgoing command.  It must satisfy both absolute
         # limits and target-to-target step ceilings before DDS sees it.
         validate_action_chunk(result, current_arm, current_left, current_right)
         arm_recovery = np.maximum.reduce((arm_lower - current_arm, current_arm - arm_upper, np.zeros(ARM_DOF)))
-        left_recovery = np.maximum.reduce((left_lower - current_left, current_left - left_upper, np.zeros(HAND_DOF)))
+        left_recovery = np.maximum.reduce(
+            (left_lower - current_left, current_left - left_upper, np.zeros(self._profile.hand_dof))
+        )
         right_recovery = np.maximum.reduce(
-            (right_lower - current_right, current_right - right_upper, np.zeros(HAND_DOF))
+            (right_lower - current_right, current_right - right_upper, np.zeros(self._profile.hand_dof))
         )
         if np.any(np.abs(result.arm[0] - current_arm) > np.maximum(MAX_CONDITIONED_ARM_STEP_RAD, arm_recovery) + 1e-12):
             raise DeploymentError(
@@ -1107,15 +1179,16 @@ class XrPolicyOutputConditioner:
             )
         if np.any(
             np.abs(result.left_hand[0] - current_left)
-            > np.maximum(MAX_CONDITIONED_HAND_STEP_RAD, left_recovery) + 1e-12
+            > np.maximum(self._profile.conditioned_step, left_recovery) + 1e-12
         ) or np.any(
             np.abs(result.right_hand[0] - current_right)
-            > np.maximum(MAX_CONDITIONED_HAND_STEP_RAD, right_recovery) + 1e-12
+            > np.maximum(self._profile.conditioned_step, right_recovery) + 1e-12
         ):
             raise DeploymentError(
                 "XR conditioned hand command exceeded its 100 Hz slew ceiling; "
-                "MAX_CONDITIONED_HAND_STEP_RAD="
-                f"{np.array2string(MAX_CONDITIONED_HAND_STEP_RAD, precision=4)} rad"
+                "conditioned_hand_step="
+                f"{np.array2string(self._profile.conditioned_step, precision=4)} "
+                f"{self._profile.value_unit}"
             )
         return result
 
@@ -1242,6 +1315,7 @@ def _validate_moving_initialization_chunk(
         arm=chunk.arm,
         left_hand=np.clip(chunk.left_hand, left_lower, left_upper),
         right_hand=np.clip(chunk.right_hand, right_lower, right_upper),
+        end_effector=chunk.end_effector,
     )
     validate_action_chunk(strict_chunk, current_arm, current_left, current_right)
     _validate_initialization_hand_recovery(
@@ -1262,11 +1336,23 @@ def _validate_moving_initialization_chunk(
     )
 
 
-def build_initialization_chunk(state: RobotState, spec: InitializationSpec) -> ActionChunk:
+def build_initialization_chunk(
+    state: RobotState,
+    spec: InitializationSpec,
+    *,
+    allow_policy_warm_start: bool = False,
+) -> ActionChunk:
     """Resolve measured targets and create a bounded smooth joint-space path."""
 
-    validate_initialization_spec(spec)
-    validate_measured_state(state.arm, state.arm_dq, state.left_hand, state.right_hand)
+    validate_initialization_spec(spec, allow_policy_warm_start=allow_policy_warm_start)
+    profile = get_end_effector_profile(spec.end_effector)
+    validate_measured_state(
+        state.arm,
+        state.arm_dq,
+        state.left_hand,
+        state.right_hand,
+        end_effector=profile.name,
+    )
     current = (
         np.asarray(state.arm, dtype=np.float64),
         np.asarray(state.left_hand, dtype=np.float64),
@@ -1280,7 +1366,60 @@ def build_initialization_chunk(state: RobotState, spec: InitializationSpec) -> A
             arm=np.ascontiguousarray(current[0][None]).copy(),
             left_hand=np.ascontiguousarray(current[1][None]).copy(),
             right_hand=np.ascontiguousarray(current[2][None]).copy(),
+            end_effector=profile.name,
         )
+
+    if profile.name != "dex3":
+        # This path is reachable only from the internal Warmup2 transition,
+        # after a same-profile policy chunk passed hard range validation.
+        assert spec.arm is not None and spec.left_hand is not None and spec.right_hand is not None
+        assert profile.conditioned_step is not None
+        targets = (
+            np.asarray(spec.arm, dtype=np.float64).copy(),
+            np.asarray(spec.left_hand, dtype=np.float64).copy(),
+            np.asarray(spec.right_hand, dtype=np.float64).copy(),
+        )
+        max_steps = (
+            np.full(ARM_DOF, INITIALIZATION_MAX_ARM_STEP_RAD, dtype=np.float64),
+            profile.conditioned_step,
+            profile.conditioned_step,
+        )
+        movement = any(np.any(target != measured) for measured, target in zip(current, targets, strict=True))
+        steps = max(
+            1,
+            *(
+                int(np.ceil(1.5 * float(np.max(np.abs(target - measured) / max_step))))
+                for measured, target, max_step in zip(current, targets, max_steps, strict=True)
+            ),
+        )
+        if movement:
+            steps = max(steps, round(INITIALIZATION_MIN_MOVE_S * PUBLISH_HZ))
+        while True:
+            paths = tuple(
+                _smooth_initialization_path(measured, target, steps)
+                for measured, target in zip(current, targets, strict=True)
+            )
+            actual_steps = tuple(
+                np.max(np.abs(np.diff(np.vstack((measured, path)), axis=0)), axis=0)
+                for measured, path in zip(current, paths, strict=True)
+            )
+            if all(np.all(actual <= limit + 1e-12) for actual, limit in zip(actual_steps, max_steps, strict=True)):
+                break
+            steps += 1
+        duration_s = steps / PUBLISH_HZ
+        if duration_s > INITIALIZATION_MAX_DURATION_S:
+            raise DeploymentError(
+                f"Inspire DFX Warmup2 path needs {duration_s:.1f}s; "
+                f"INITIALIZATION_MAX_DURATION_S={INITIALIZATION_MAX_DURATION_S:.1f}s"
+            )
+        chunk = ActionChunk(
+            arm=np.ascontiguousarray(paths[0]),
+            left_hand=np.ascontiguousarray(paths[1]),
+            right_hand=np.ascontiguousarray(paths[2]),
+            end_effector=profile.name,
+        )
+        validate_action_chunk(chunk, *current)
+        return chunk
 
     left_lower, left_upper = _strict_hand_target_bounds(LEFT_HAND_LOWER, LEFT_HAND_UPPER)
     right_lower, right_upper = _strict_hand_target_bounds(RIGHT_HAND_LOWER, RIGHT_HAND_UPPER)
@@ -1333,6 +1472,7 @@ def build_initialization_chunk(state: RobotState, spec: InitializationSpec) -> A
         arm=np.ascontiguousarray(paths[0]),
         left_hand=np.ascontiguousarray(paths[1]),
         right_hand=np.ascontiguousarray(paths[2]),
+        end_effector=profile.name,
     )
     _validate_moving_initialization_chunk(chunk, *current)
     return chunk
@@ -1843,7 +1983,7 @@ TeleimagerColourCamera = TeleimagerCamera
 
 
 class _G1Dex3CommandBackend:
-    """DDS publishers used only inside the actuator child process."""
+    """Profile-selected DDS publishers used only in the actuator child."""
 
     _supports_cleanup_phases = True
 
@@ -1852,9 +1992,20 @@ class _G1Dex3CommandBackend:
         simulation: bool,
         network_interface: str | None,
         gravity_feedforward: bool = True,
+        *,
+        end_effector: str = "dex3",
     ):
         if not isinstance(gravity_feedforward, bool):
             raise DeploymentError("gravity_feedforward must be a bool")
+        try:
+            self.profile = get_end_effector_profile(end_effector)
+        except ValueError as exc:
+            raise DeploymentError(str(exc)) from exc
+        if simulation and not self.profile.supports_simulation:
+            raise DeploymentError(f"{self.profile.name} simulation is not qualified")
+        if gravity_feedforward and not self.profile.supports_gravity_feedforward:
+            raise DeploymentError(f"{self.profile.name} does not support gravity feed-forward")
+        self.end_effector = self.profile.name
         # CHANGEDSAFETY: the original deployment adapter published zero arm
         # feed-forward torque.  Unitree XR instead publishes static RNEA torque
         # on every command; restore that demonstrated controller contract.
@@ -1874,50 +2025,80 @@ class _G1Dex3CommandBackend:
             )
         initialize_dds(simulation, network_interface)
         self.simulation = simulation
-        self.reader = G1Dex3StateReader(
-            simulation=simulation,
-            max_age_s=ACTUATOR_ARM_STATE_MAX_AGE_S,
-            hand_max_age_s=ACTUATOR_HAND_STATE_MAX_AGE_S,
-            max_age_constant="ACTUATOR_ARM_STATE_MAX_AGE_S",
-            hand_max_age_constant="ACTUATOR_HAND_STATE_MAX_AGE_S",
-        )
-        initial = self.reader.read(timeout_s=5.0)
-        if not simulation and initial.mode_machine != QUALIFIED_REAL_MODE_MACHINE:
-            raise DeploymentError(
-                f"Real G1 mode_machine is {initial.mode_machine}; this adapter is qualified only "
-                f"for mode {QUALIFIED_REAL_MODE_MACHINE} "
-                "(g1_29dof_lock_waist_with_hand_rev_1_0)"
-            )
+        self.reader: Any | None = None
+        self._arm_publisher: Any | None = None
+        self._left_publisher: Any | None = None
+        self._right_publisher: Any | None = None
+        self._hand_writer: Any | None = None
+        try:
+            reader_kwargs = {
+                "simulation": simulation,
+                "max_age_s": ACTUATOR_ARM_STATE_MAX_AGE_S,
+                "hand_max_age_s": ACTUATOR_HAND_STATE_MAX_AGE_S,
+                "max_age_constant": "ACTUATOR_ARM_STATE_MAX_AGE_S",
+                "hand_max_age_constant": "ACTUATOR_HAND_STATE_MAX_AGE_S",
+            }
+            if self.profile.name == "dex3":
+                self.reader = G1Dex3StateReader(**reader_kwargs)
+            else:
+                # Lazy import avoids the state adapter's deliberate RobotState
+                # dependency forming a module-import cycle.
+                from unitree_lerobot.eval_robot.robot_control.g1_inspire_dfx import (
+                    G1InspireDfxStateReader,
+                )
+
+                self.reader = G1InspireDfxStateReader(**reader_kwargs)
+            initial = self.reader.read(timeout_s=5.0)
+            if not simulation and initial.mode_machine != QUALIFIED_REAL_MODE_MACHINE:
+                raise DeploymentError(
+                    f"Real G1 mode_machine is {initial.mode_machine}; this adapter is qualified only "
+                    f"for mode {QUALIFIED_REAL_MODE_MACHINE} "
+                    "(g1_29dof_lock_waist_with_hand_rev_1_0)"
+                )
+            self._initialize_command_resources(initial)
+        except BaseException:
+            self._close_constructed_resources(suppress_errors=True)
+            raise
+
+    def _initialize_command_resources(self, initial: RobotState) -> None:
+        """Build every command resource without sending a DDS sample."""
 
         from unitree_lerobot.eval_robot.robot_control.robot_arm import G1_29_JointArmIndex
-        from unitree_lerobot.eval_robot.robot_control.robot_hand_unitree import (
-            Dex3_1_Left_JointIndex,
-            Dex3_1_Right_JointIndex,
-        )
         from unitree_sdk2py.core.channel import ChannelPublisher
-        from unitree_sdk2py.idl.default import (
-            unitree_hg_msg_dds__HandCmd_,
-            unitree_hg_msg_dds__LowCmd_,
-        )
-        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, LowCmd_
+        from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
         from unitree_sdk2py.utils.crc import CRC
 
         self._arm_indices = tuple(int(index) for index in G1_29_JointArmIndex)
-        self._left_indices = tuple(int(index) for index in Dex3_1_Left_JointIndex)
-        self._right_indices = tuple(int(index) for index in Dex3_1_Right_JointIndex)
-        arm_topic = "rt/lowcmd" if simulation else "rt/arm_sdk"
+        arm_topic = "rt/lowcmd" if self.simulation else "rt/arm_sdk"
 
-        # Construct every resource before the first Write.  A partial constructor
-        # failure therefore cannot acquire arm authority or move a hand.
+        # Construct every resource before the first Write. Partial failures are
+        # unwound by __init__; no constructor path can acquire command authority.
         self._arm_publisher = ChannelPublisher(arm_topic, LowCmd_)
-        self._left_publisher = ChannelPublisher("rt/dex3/left/cmd", HandCmd_)
-        self._right_publisher = ChannelPublisher("rt/dex3/right/cmd", HandCmd_)
         self._arm_publisher.Init()
-        self._left_publisher.Init()
-        self._right_publisher.Init()
         self._arm_message = unitree_hg_msg_dds__LowCmd_()
-        self._left_message = unitree_hg_msg_dds__HandCmd_()
-        self._right_message = unitree_hg_msg_dds__HandCmd_()
+        if self.profile.name == "dex3":
+            from unitree_lerobot.eval_robot.robot_control.robot_hand_unitree import (
+                Dex3_1_Left_JointIndex,
+                Dex3_1_Right_JointIndex,
+            )
+            from unitree_sdk2py.idl.default import unitree_hg_msg_dds__HandCmd_
+            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_
+
+            self._left_indices = tuple(int(index) for index in Dex3_1_Left_JointIndex)
+            self._right_indices = tuple(int(index) for index in Dex3_1_Right_JointIndex)
+            self._left_publisher = ChannelPublisher(self.profile.left_command_topic, HandCmd_)
+            self._right_publisher = ChannelPublisher(self.profile.right_command_topic, HandCmd_)
+            self._left_publisher.Init()
+            self._right_publisher.Init()
+            self._left_message = unitree_hg_msg_dds__HandCmd_()
+            self._right_message = unitree_hg_msg_dds__HandCmd_()
+        else:
+            from unitree_lerobot.eval_robot.robot_control.g1_inspire_dfx import (
+                InspireDfxCommandWriter,
+            )
+
+            self._hand_writer = InspireDfxCommandWriter(initial.left_hand, initial.right_hand)
         self._crc = CRC()
         self._weight = 0.0
         self._released = False
@@ -1935,6 +2116,28 @@ class _G1Dex3CommandBackend:
         self._right_hand_publish_history: deque[PublishedHandTarget] = deque(maxlen=HAND_COMMAND_HISTORY_SIZE)
         self._configure_messages(initial)
 
+    def _close_constructed_resources(self, *, suppress_errors: bool) -> None:
+        failures: list[str] = []
+        resources = (
+            ("Inspire DFX command writer", "_hand_writer", "close"),
+            ("right hand publisher", "_right_publisher", "Close"),
+            ("left hand publisher", "_left_publisher", "Close"),
+            ("arm publisher", "_arm_publisher", "Close"),
+            ("state reader", "reader", "close"),
+        )
+        for label, attribute, method_name in resources:
+            resource = getattr(self, attribute, None)
+            if resource is None:
+                continue
+            try:
+                getattr(resource, method_name)()
+            except BaseException as exc:
+                failures.append(f"{label}: {type(exc).__name__}: {exc}")
+            else:
+                setattr(self, attribute, None)
+        if failures and not suppress_errors:
+            raise DeploymentError("Resource cleanup failed: " + "; ".join(failures))
+
     def _configure_messages(self, initial: RobotState) -> None:
         self._arm_message.mode_pr = 0
         self._arm_message.mode_machine = initial.mode_machine
@@ -1948,6 +2151,8 @@ class _G1Dex3CommandBackend:
             command.kp = 40.0 if offset in wrist_offsets else 80.0
             command.kd = 1.5 if offset in wrist_offsets else 3.0
 
+        if getattr(self, "profile", DEX3_PROFILE).name != "dex3":
+            return
         for message, indices in (
             (self._left_message, self._left_indices),
             (self._right_message, self._right_indices),
@@ -1979,6 +2184,24 @@ class _G1Dex3CommandBackend:
     def state(self) -> RobotState:
         return self._validate_runtime_state(self.reader.latest())
 
+    def _tracked_drift_groups(
+        self,
+        state: RobotState,
+        reference_arm: np.ndarray,
+        reference_left: np.ndarray,
+        reference_right: np.ndarray,
+    ) -> tuple[tuple[str, np.ndarray, tuple[str, ...]], ...]:
+        groups = [("arm", state.arm - reference_arm, ARM_JOINT_NAMES)]
+        profile = getattr(self, "profile", DEX3_PROFILE)
+        if profile.tracking_hard is not None:
+            groups.extend(
+                (
+                    ("left hand", state.left_hand - reference_left, profile.left_joint_names),
+                    ("right hand", state.right_hand - reference_right, profile.right_joint_names),
+                )
+            )
+        return tuple(groups)
+
     def _validate_prearm_takeover_state(self, state: RobotState) -> None:
         """Apply the existing pre-arm limits to a prospective takeover sample."""
 
@@ -1997,10 +2220,11 @@ class _G1Dex3CommandBackend:
                 f"PREARM_MAX_ARM_DQ_RAD_S={PREARM_MAX_ARM_DQ_RAD_S:.3f} rad/s"
             )
         drift_group, drift_joint, drift_name, drift = _largest_named_value(
-            (
-                ("arm", state.arm - self._arm_target, ARM_JOINT_NAMES),
-                ("left hand", state.left_hand - self._left_target, LEFT_HAND_JOINT_NAMES),
-                ("right hand", state.right_hand - self._right_target, RIGHT_HAND_JOINT_NAMES),
+            self._tracked_drift_groups(
+                state,
+                self._arm_target,
+                self._left_target,
+                self._right_target,
             )
         )
         if abs(drift) > PREARM_MAX_POSITION_DRIFT_RAD:
@@ -2033,10 +2257,11 @@ class _G1Dex3CommandBackend:
                         f"PREARM_MAX_ARM_DQ_RAD_S={PREARM_MAX_ARM_DQ_RAD_S:.3f} rad/s"
                     )
                 group, joint, joint_name, drift = _largest_named_value(
-                    (
-                        ("arm", state.arm - reference.arm, ARM_JOINT_NAMES),
-                        ("left hand", state.left_hand - reference.left_hand, LEFT_HAND_JOINT_NAMES),
-                        ("right hand", state.right_hand - reference.right_hand, RIGHT_HAND_JOINT_NAMES),
+                    self._tracked_drift_groups(
+                        state,
+                        reference.arm,
+                        reference.left_hand,
+                        reference.right_hand,
                     )
                 )
                 if abs(drift) > PREARM_MAX_POSITION_DRIFT_RAD:
@@ -2066,6 +2291,41 @@ class _G1Dex3CommandBackend:
     def reset_hand_publish_history(self) -> None:
         self._left_hand_publish_history.clear()
         self._right_hand_publish_history.clear()
+
+    def _reseed_inspire_hands_before_first_write(self, state: RobotState) -> None:
+        """Use the final measured pre-arm sample as DFX's first held target."""
+
+        if self.profile.name != "inspire-dfx":
+            return
+        if self._hand_writer is None:
+            raise DeploymentError("Inspire DFX command writer was not constructed")
+        # Hand drift is deliberately not part of the arm stationary dwell.
+        # Sample it again at the final no-write guard so the first lease packet
+        # holds current measured q instead of pulling toward constructor-time q.
+        self._left_target = state.left_hand.copy()
+        self._right_target = state.right_hand.copy()
+        self._hand_writer.reseed_before_first_write(
+            self._left_target,
+            self._right_target,
+        )
+
+    def _inspire_hand_lease_active(self) -> bool:
+        writer = getattr(self, "_hand_writer", None)
+        return bool(writer is not None and writer.has_written)
+
+    def _refresh_last_successful_hands_for_release(self) -> None:
+        """Refresh the accepted DFX hold without promoting a failed new target."""
+
+        writer = getattr(self, "_hand_writer", None)
+        if writer is None:
+            raise DeploymentError("Inspire DFX command writer was not constructed")
+        completed_at, written_left, written_right = writer.refresh_last_successful()
+        self._left_hand_publish_history.append(
+            PublishedHandTarget(completed_at, written_left)
+        )
+        self._right_hand_publish_history.append(
+            PublishedHandTarget(completed_at, written_right)
+        )
 
     def _write_arm_message(
         self,
@@ -2175,6 +2435,32 @@ class _G1Dex3CommandBackend:
         # appended independently only after the corresponding Write succeeds.
         left_target = self._left_target.copy()
         right_target = self._right_target.copy()
+        profile = getattr(self, "profile", DEX3_PROFILE)
+        if profile.name == "inspire-dfx":
+            if self._hand_writer is None:
+                raise DeploymentError("Inspire DFX command writer was not constructed")
+            timing_enabled = getattr(self, "_authority_ramp_timing_enabled", False)
+            timing = getattr(self, "_last_publish_timing_ms", {})
+            started_ns = time.monotonic_ns()
+            try:
+                completed_at, written_left, written_right = self._hand_writer.write(
+                    left_target,
+                    right_target,
+                )
+            finally:
+                if timing_enabled:
+                    elapsed_ms = (time.monotonic_ns() - started_ns) / 1e6
+                    timing["hands_write"] = elapsed_ms
+                    # Existing diagnostics expose per-side fields. DFX uses
+                    # one atomic combined write, so both intentionally carry
+                    # the same measured duration.
+                    timing["left_write"] = elapsed_ms
+                    timing["right_write"] = elapsed_ms
+            # The combined DFX write is atomic, so both histories use exactly
+            # one completion timestamp and appear only after success.
+            self._left_hand_publish_history.append(PublishedHandTarget(completed_at, written_left))
+            self._right_hand_publish_history.append(PublishedHandTarget(completed_at, written_right))
+            return
         left_command = left_target
         right_command = right_target
         if self.simulation:
@@ -2210,7 +2496,26 @@ class _G1Dex3CommandBackend:
         self._right_hand_publish_history.append(PublishedHandTarget(completed_at=time.monotonic(), target=right_target))
 
     def _stop_hands(self, phase_callback: Any | None = None) -> None:
-        """Send Unitree's documented Dex3 ``stopMotors`` command once per hand."""
+        """Stop Dex3 motors or relinquish the Inspire DFX command lease."""
+
+        profile = getattr(self, "profile", DEX3_PROFILE)
+        if profile.name == "inspire-dfx":
+            if phase_callback is not None:
+                phase_callback("inspire_dfx_lease_relinquish_begin", {})
+            started = time.monotonic()
+            if self._hand_writer is not None:
+                self._hand_writer.close()
+            elapsed = time.monotonic() - started
+            if phase_callback is not None:
+                phase_callback(
+                    "inspire_dfx_lease_relinquish_end",
+                    {"elapsed_s": elapsed, "motor_stop_acknowledged": False},
+                )
+            LOGGER.warning(
+                "Inspire DFX command lease relinquished after arm authority release; "
+                "no hand motor-stop command or acknowledgement exists"
+            )
+            return
 
         for message, indices in (
             (self._left_message, self._left_indices),
@@ -2286,6 +2591,10 @@ class _G1Dex3CommandBackend:
         failures = []
         start_weight = self._weight
         period = 1.0 / PUBLISH_HZ
+        profile = getattr(self, "profile", DEX3_PROFILE)
+        refresh_hand_lease = (
+            profile.name == "inspire-dfx" and self._inspire_hand_lease_active()
+        )
         # Preserve one constant weight-slope across both normal full-authority
         # shutdowns and faults during acquisition.  A fault after only a tiny
         # amount of authority was acquired must not keep a suspect command
@@ -2333,6 +2642,15 @@ class _G1Dex3CommandBackend:
                     f"DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
                 )
                 break
+            if refresh_hand_lease:
+                try:
+                    # Keep the unchanged held-hand lease valid until after
+                    # this successful arm-authority step. A hand failure must
+                    # never interrupt the higher-priority arm release.
+                    self._refresh_last_successful_hands_for_release()
+                except Exception as exc:
+                    failures.append(f"Inspire DFX lease refresh during arm release failed: {exc}")
+                    refresh_hand_lease = False
             cycle_completed = time.monotonic()
             arm_writes += 1
             last_successful_weight = self._weight
@@ -2352,6 +2670,14 @@ class _G1Dex3CommandBackend:
                 self._publish_last_arm_for_release()
                 arm_writes += 1
                 last_successful_weight = 0.0
+                if refresh_hand_lease:
+                    try:
+                        self._refresh_last_successful_hands_for_release()
+                    except Exception as exc:
+                        failures.append(
+                            f"Inspire DFX final lease refresh during arm release failed: {exc}"
+                        )
+                        refresh_hand_lease = False
             except Exception as exc:
                 failures.append(
                     f"final zero-weight arm_sdk Write failed: {exc}; "
@@ -2377,26 +2703,23 @@ class _G1Dex3CommandBackend:
                     "last_successful_weight": last_successful_weight,
                 },
             )
-        # Do this after the arm release so a blocked hand DDS Write cannot
+        # Do this after the arm release so a blocked hand operation cannot
         # prevent the higher-priority arm_sdk weight ramp from being attempted.
         hand_stop_started = time.monotonic()
         try:
             self._stop_hands(phase_callback)
         except Exception as exc:
-            failures.append(f"Dex3 stopMotors failed: {exc}")
-        LOGGER.info("Dex3 stopMotors phase finished in %.3fs", time.monotonic() - hand_stop_started)
+            operation = "Dex3 stopMotors" if profile.name == "dex3" else "Inspire DFX lease relinquish"
+            failures.append(f"{operation} failed: {exc}")
+        if profile.name == "dex3":
+            LOGGER.info("Dex3 stopMotors phase finished in %.3fs", time.monotonic() - hand_stop_started)
+        else:
+            LOGGER.info("Inspire DFX lease-relinquish phase finished in %.3fs", time.monotonic() - hand_stop_started)
         if failures:
             raise DeploymentError("; ".join(failures))
 
     def close(self) -> None:
-        self.reader.close()
-        for publisher in (
-            self._arm_publisher,
-            self._left_publisher,
-            self._right_publisher,
-        ):
-            with contextlib.suppress(Exception):
-                publisher.Close()
+        self._close_constructed_resources(suppress_errors=False)
 
 
 def _heartbeat_age(heartbeat: Any) -> float:
@@ -2424,7 +2747,7 @@ def _policy_generation_matches(expected: Any, generation: Any | None) -> bool:
     if expected is None:
         return True
     if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
-        raise DeploymentError("Policy command has an invalid Dex3 pause generation")
+        raise DeploymentError("Policy command has an invalid hand-feedback pause generation")
     return expected == _hand_pause_generation_value(generation)
 
 
@@ -2606,6 +2929,11 @@ def _enforce_tracking(
     desired_right: np.ndarray | None = None,
 ) -> None:
     _enforce_arm_tracking(backend, state, context=context)
+    profile = getattr(backend, "profile", DEX3_PROFILE)
+    if profile.tracking_hard is None:
+        # DFX lost counters and freshness remain hard. There is no qualified
+        # normalized-position tracking threshold to enforce for Inspire.
+        return
     if hand_watchdog is not None and hand_watchdog.enforce(
         backend,
         state,
@@ -2620,26 +2948,33 @@ def _enforce_tracking(
     # backends that do not expose successful-publish history.
     hand_group, hand_joint, hand_name, hand_delta = _largest_named_value(
         (
-            ("left hand", state.left_hand - backend._left_target, LEFT_HAND_JOINT_NAMES),
-            ("right hand", state.right_hand - backend._right_target, RIGHT_HAND_JOINT_NAMES),
+            ("left hand", state.left_hand - backend._left_target, profile.left_joint_names),
+            ("right hand", state.right_hand - backend._right_target, profile.right_joint_names),
         )
     )
-    if abs(hand_delta) > MAX_HAND_TRACKING_ERROR_RAD:
+    if abs(hand_delta) > profile.tracking_hard:
         raise DeploymentError(
             f"{hand_group.title()} tracking error at joint {hand_joint} ({hand_name}) is "
-            f"{hand_delta:+.3f} rad (measured minus target); MAX_HAND_TRACKING_ERROR_RAD="
-            f"{MAX_HAND_TRACKING_ERROR_RAD:.3f} rad"
+            f"{hand_delta:+.3f} {profile.value_unit} (measured minus target); "
+            f"tracking_hard={profile.tracking_hard:.3f} {profile.value_unit}"
         )
 
 
-def _position_drift(state: RobotState, reference: RobotState) -> float:
-    return float(
-        max(
-            np.max(np.abs(state.arm - reference.arm)),
-            np.max(np.abs(state.left_hand - reference.left_hand)),
-            np.max(np.abs(state.right_hand - reference.right_hand)),
+def _position_drift(
+    state: RobotState,
+    reference: RobotState,
+    *,
+    include_hands: bool = True,
+) -> float:
+    values = [np.max(np.abs(state.arm - reference.arm))]
+    if include_hands:
+        values.extend(
+            (
+                np.max(np.abs(state.left_hand - reference.left_hand)),
+                np.max(np.abs(state.right_hand - reference.right_hand)),
+            )
         )
-    )
+    return float(max(values))
 
 
 def _wait_for_initialization_start(
@@ -2659,6 +2994,8 @@ def _wait_for_initialization_start(
     distinct_samples = 0
     last_capture = float("-inf")
     latest: RobotState | None = None
+    profile = getattr(backend, "profile", DEX3_PROFILE)
+    require_hand_tracking = profile.tracking_hard is not None
     while not stop_event.is_set() and time.monotonic() < deadline:
         loop_started = time.monotonic()
         if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
@@ -2711,7 +3048,7 @@ def _wait_for_initialization_start(
         stationary = (
             (backend.simulation or float(np.max(np.abs(latest.arm_dq))) <= INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S)
             and arm_error <= INITIALIZATION_ARM_TOLERANCE_RAD
-            and hand_error <= INITIALIZATION_HAND_TOLERANCE_RAD
+            and (not require_hand_tracking or hand_error <= INITIALIZATION_HAND_TOLERANCE_RAD)
         )
         if stationary:
             if stationary_since is None:
@@ -2720,7 +3057,11 @@ def _wait_for_initialization_start(
                 distinct_samples = 0
                 last_capture = float("-inf")
             assert stationary_reference is not None
-            if _position_drift(latest, stationary_reference) > INITIALIZATION_MAX_POSITION_DRIFT_RAD:
+            if _position_drift(
+                latest,
+                stationary_reference,
+                include_hands=require_hand_tracking,
+            ) > INITIALIZATION_MAX_POSITION_DRIFT_RAD:
                 stationary_since = now
                 stationary_reference = latest
                 distinct_samples = 0
@@ -2749,7 +3090,8 @@ def _wait_for_initialization_start(
     arm_error, hand_error = _tracking_errors(backend, latest)
     raise DeploymentError(
         "Robot did not become stationary at the held target before initialization: "
-        f"arm error={arm_error:.3f} rad, hand error={hand_error:.3f} rad, "
+        f"arm error={arm_error:.3f} rad, hand error={hand_error:.3f} {profile.value_unit} "
+        f"(hand convergence required={require_hand_tracking}), "
         f"max arm dq={float(np.max(np.abs(latest.arm_dq))):.3f} rad/s"
     )
 
@@ -2775,6 +3117,8 @@ def _execute_initialization(
     converged_reference: RobotState | None = None
     distinct_converged_samples = 0
     last_converged_capture = float("-inf")
+    profile = getattr(backend, "profile", DEX3_PROFILE)
+    require_hand_tracking = profile.tracking_hard is not None
 
     while not stop_event.is_set():
         loop_started = time.monotonic()
@@ -2837,7 +3181,7 @@ def _execute_initialization(
             arm_error, hand_error = _tracking_errors(backend, state)
             in_tolerance = (
                 arm_error <= INITIALIZATION_ARM_TOLERANCE_RAD
-                and hand_error <= INITIALIZATION_HAND_TOLERANCE_RAD
+                and (not require_hand_tracking or hand_error <= INITIALIZATION_HAND_TOLERANCE_RAD)
                 and (backend.simulation or float(np.max(np.abs(state.arm_dq))) <= INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S)
             )
             if in_tolerance:
@@ -2847,7 +3191,11 @@ def _execute_initialization(
                     distinct_converged_samples = 0
                     last_converged_capture = float("-inf")
                 assert converged_reference is not None
-                if _position_drift(state, converged_reference) > INITIALIZATION_MAX_POSITION_DRIFT_RAD:
+                if _position_drift(
+                    state,
+                    converged_reference,
+                    include_hands=require_hand_tracking,
+                ) > INITIALIZATION_MAX_POSITION_DRIFT_RAD:
                     converged_since = now
                     converged_reference = state
                     distinct_converged_samples = 0
@@ -2874,12 +3222,12 @@ def _execute_initialization(
                         (
                             "left hand",
                             state.left_hand - backend._left_target,
-                            LEFT_HAND_JOINT_NAMES,
+                            profile.left_joint_names,
                         ),
                         (
                             "right hand",
                             state.right_hand - backend._right_target,
-                            RIGHT_HAND_JOINT_NAMES,
+                            profile.right_joint_names,
                         ),
                     )
                 )
@@ -2893,7 +3241,7 @@ def _execute_initialization(
                         f"INITIALIZATION_ARM_TOLERANCE_RAD="
                         f"{INITIALIZATION_ARM_TOLERANCE_RAD:.3f} rad"
                     )
-                if hand_error > INITIALIZATION_HAND_TOLERANCE_RAD:
+                if require_hand_tracking and hand_error > INITIALIZATION_HAND_TOLERANCE_RAD:
                     failed_gates.append(
                         f"hand error={hand_error:.3f} rad at {hand_group} joint {hand_joint} "
                         f"({hand_name}), measured minus target={hand_delta:+.3f} rad > "
@@ -2926,8 +3274,9 @@ def _execute_initialization(
                     f"measured minus target={arm_delta:+.3f} rad; "
                     f"max arm dq={abs(arm_dq):.3f} rad/s at joint {arm_dq_joint} "
                     f"({ARM_JOINT_NAMES[arm_dq_joint]}); "
-                    f"hand error={hand_error:.3f} rad at {hand_group} joint {hand_joint} "
-                    f"({hand_name}), measured minus target={hand_delta:+.3f} rad"
+                    f"hand error={hand_error:.3f} {profile.value_unit} at {hand_group} joint {hand_joint} "
+                    f"({hand_name}), measured minus target={hand_delta:+.3f} {profile.value_unit}; "
+                    f"hand convergence required={require_hand_tracking}"
                 )
 
         backend.publish()
@@ -3005,18 +3354,22 @@ def _ramp_real_arm_authority(
     backend: _G1Dex3CommandBackend,
     stop_event: Any,
     heartbeat: Any,
+    hand_freshness_gate: HandStateFreshnessGate | None = None,
 ) -> bool:
     """Acquire ``arm_sdk`` at measured q, then ramp only gravity feed-forward.
 
     Dex3 absolute targets do not need to be rewritten for every arm authority
-    step.  Writing each hand at every step made the nominal 1.5-second ramp
+    step. Writing each Dex3 hand at every step made the nominal 1.5-second ramp
     perform 450 serial DDS writes and allowed DDS latency to push arming past
     the parent's timeout.  First publish the measured arm hold at full weight
     and zero feed-forward torque, then send the measured hand hold once and
     ramp only the arm gravity term.  The
     initial arm write also establishes the cleanup invariant before any hand
     write: a subsequent cancellation/fault must run arm release and Dex3
-    ``stopMotors``.  The first arm packet uses weight one, the captured measured
+    ``stopMotors``. Inspire DFX is different: after the same required first-arm
+    then first-hand ordering, its unchanged combined hand target is refreshed
+    after every arm write so the bridge's roughly one-second command lease
+    cannot expire during arming. The first arm packet uses weight one, the captured measured
     pose and zero feed-forward torque.  This is a bumpless takeover whether the
     robot applied a previous process's release or retained its old arm_sdk
     weight.  The captured pose remains fixed while gravity feed-forward rises
@@ -3037,7 +3390,19 @@ def _ramp_real_arm_authority(
     # Reapply the existing pre-arm contract immediately before the first
     # full-authority write. The robot can move, or feedback can age, after the
     # dwell's final sample; a failed final guard must produce no command.
-    backend._validate_prearm_takeover_state(backend.state())
+    takeover_state = backend.state()
+    backend._validate_prearm_takeover_state(takeover_state)
+    profile = getattr(backend, "profile", DEX3_PROFILE)
+    refresh_hand_lease = profile.name == "inspire-dfx"
+    if refresh_hand_lease:
+        if hand_freshness_gate is None:
+            hand_freshness_gate = HandStateFreshnessGate()
+        initial_freshness = hand_freshness_gate.check(takeover_state)
+        if not initial_freshness.ready:
+            raise DeploymentError(
+                "Inspire DFX feedback became stale before arm authority acquisition"
+            )
+        backend._reseed_inspire_hands_before_first_write(takeover_state)
     if stop_event.is_set():
         LOGGER.info("Arm takeover cancelled after the final state guard")
         return False
@@ -3060,6 +3425,7 @@ def _ramp_real_arm_authority(
 
     hand_write_started = time.monotonic()
     backend._publish_hands()
+    hand_writes = 1
     hand_write_s = time.monotonic() - hand_write_started
     if stop_event.is_set():
         LOGGER.info("Arm takeover cancelled after the measured hand hold write")
@@ -3094,9 +3460,23 @@ def _ramp_real_arm_authority(
         # q fixed at the measured pose captured before the first Write.  Chasing
         # measured q would hide motion instead of holding the handoff point.
         state = backend.state()
+        if refresh_hand_lease:
+            assert hand_freshness_gate is not None
+            freshness = hand_freshness_gate.check(state)
+            if not freshness.ready:
+                raise DeploymentError(
+                    "Inspire DFX feedback was lost during arm gravity acquisition: "
+                    f"stale_hands={freshness.stale_hands}, max_age_s={freshness.max_age_s:.3f}"
+                )
         _enforce_arm_tracking(backend, state, context="matched-pose gravity ramp")
         gravity_scale = min(1.0, (cycle_started - ramp_started + period) / duration)
         backend._publish_arm(gravity_scale=gravity_scale)
+        if refresh_hand_lease:
+            # Preserve arm-before-hand ordering on every arming cycle. The
+            # target is unchanged measured q; this is lease maintenance, not
+            # an additional motion step.
+            backend._publish_hands()
+            hand_writes += 1
         cycle_completed = time.monotonic()
         arm_writes += 1
         max_arm_cycle_s = max(max_arm_cycle_s, cycle_completed - cycle_started)
@@ -3137,6 +3517,14 @@ def _ramp_real_arm_authority(
         if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
             raise DeploymentError("Parent heartbeat expired while verifying arm takeover")
         state = backend.state()
+        if refresh_hand_lease:
+            assert hand_freshness_gate is not None
+            freshness = hand_freshness_gate.check(state)
+            if not freshness.ready:
+                raise DeploymentError(
+                    "Inspire DFX feedback was lost during arm takeover settling: "
+                    f"stale_hands={freshness.stale_hands}, max_age_s={freshness.max_age_s:.3f}"
+                )
         _enforce_arm_tracking(backend, state, context="matched-pose takeover settle")
         now = time.monotonic()
         arm_received_at = (
@@ -3179,6 +3567,9 @@ def _ramp_real_arm_authority(
             distinct_samples = 0
             last_arm_received_at = float("-inf")
         backend._publish_arm(gravity_scale=1.0)
+        if refresh_hand_lease:
+            backend._publish_hands()
+            hand_writes += 1
         elapsed = time.monotonic() - loop_started
         stop_event.wait(max(0.0, period - elapsed))
     else:
@@ -3195,7 +3586,8 @@ def _ramp_real_arm_authority(
     LOGGER.info(
         "Arm authority acquisition completed in %.3fs: gravity ramp=%.3fs, "
         "stationary verification=%.3fs, "
-        "matched-pose zero-torque arm write=%.3fs, hand hold write=%.3fs, arm writes=%d, "
+        "matched-pose zero-torque arm write=%.3fs, first hand hold write=%.3fs, "
+        "arm writes=%d, hand writes=%d, "
         "skipped 100 Hz ticks=%d, max arm cycle=%.3fs",
         completed_at - authority_started,
         ramp_completed_at - ramp_started,
@@ -3203,6 +3595,7 @@ def _ramp_real_arm_authority(
         initial_arm_write_s,
         hand_write_s,
         arm_writes,
+        hand_writes,
         skipped_ticks,
         max_arm_cycle_s,
     )
@@ -3223,6 +3616,7 @@ def _actuator_main(
     run_log_dir: str | None = None,
     gravity_feedforward: bool = True,
     hand_pause_generation: Any | None = None,
+    end_effector: str = "dex3",
 ) -> None:
     if run_log_dir is not None:
         configure_process_logging(Path(run_log_dir) / "actuator.log")
@@ -3249,6 +3643,16 @@ def _actuator_main(
         _status(status_queue, "fault", "gravity_feedforward must be a bool")
         _status(status_queue, "stopped")
         return
+    try:
+        profile = get_end_effector_profile(end_effector)
+    except ValueError as exc:
+        _status(status_queue, "fault", str(exc))
+        _status(status_queue, "stopped")
+        return
+    if profile.name == "inspire-dfx" and command_conditioning != "xr":
+        _status(status_queue, "fault", "Inspire DFX actuation requires XR command conditioning")
+        _status(status_queue, "stopped")
+        return
 
     last_sequence = 0
     tracking_checks_after = float("inf")
@@ -3256,7 +3660,11 @@ def _actuator_main(
     # The spawned actuator process must never perform terminal/file I/O from
     # its 100 Hz loop. Parent-owned statuses and the active timing ring retain
     # the same diagnostics without blocking command publication.
-    hand_watchdog = HandTrackingWatchdog(emit_logs=False)
+    hand_watchdog = (
+        HandTrackingWatchdog(emit_logs=False)
+        if profile.name == "dex3"
+        else HandTrackingWatchdog(profile, emit_logs=False)
+    )
     hand_freshness_gate = HandStateFreshnessGate()
     dds_hold_timing: DdsHoldTimingAccumulator | None = None
     active_timing: ActiveTimingRing | None = None
@@ -3280,7 +3688,14 @@ def _actuator_main(
         ]
     ] = []
     try:
-        if gravity_feedforward:
+        if profile.name == "inspire-dfx":
+            backend = _G1Dex3CommandBackend(
+                simulation,
+                network_interface,
+                gravity_feedforward=gravity_feedforward,
+                end_effector=profile.name,
+            )
+        elif gravity_feedforward:
             # Preserve the original two-argument construction shape for older
             # internal backend adapters; its API default is feed-forward on.
             backend = _G1Dex3CommandBackend(simulation, network_interface)
@@ -3292,7 +3707,11 @@ def _actuator_main(
             )
         backend._authority_ramp_timing_enabled = authority_ramp_diagnostics or dds_hold_diagnostics
         if command_conditioning == "xr":
-            conditioner = XrPolicyOutputConditioner()
+            conditioner = (
+                XrPolicyOutputConditioner()
+                if profile.name == "dex3"
+                else XrPolicyOutputConditioner(profile)
+            )
         _status(status_queue, "ready")
 
         # Publishers now exist but no message has been written.  Wait for the
@@ -3329,7 +3748,12 @@ def _actuator_main(
             )
 
         if not simulation:
-            if not _ramp_real_arm_authority(backend, stop_event, heartbeat):
+            if not _ramp_real_arm_authority(
+                backend,
+                stop_event,
+                heartbeat,
+                hand_freshness_gate,
+            ):
                 return
         tracking_checks_after = time.monotonic() + TRACKING_GRACE_S
         _status(status_queue, "armed")
@@ -3630,7 +4054,7 @@ def _actuator_main(
                             break
                         if paused_command == ("urgent_hold_barrier",):
                             # Operator STOP supersedes an automatic scheduler
-                            # replan even while Dex3 feedback is paused.  Do
+                            # replan even while hand feedback is paused. Do
                             # not let the old replan surface after recovery or
                             # leave the child logically outside HOLD.
                             pending_replan_detail = None
@@ -3656,7 +4080,7 @@ def _actuator_main(
                     state,
                     hand_watchdog,
                     now=time.monotonic(),
-                    context="Dex3 feedback recovery HOLD",
+                    context="hand-feedback recovery HOLD",
                 )
                 _set_direct_target(
                     backend,
@@ -3889,7 +4313,11 @@ def _actuator_main(
                         left_hand=backend._left_target.copy(),
                         right_hand=backend._right_target.copy(),
                     )
-                    warm_start_chunk = build_initialization_chunk(command_start, warm_start)
+                    warm_start_chunk = build_initialization_chunk(
+                        command_start,
+                        warm_start,
+                        allow_policy_warm_start=profile.name == "inspire-dfx",
+                    )
                     _status(
                         status_queue,
                         "warm_starting",
@@ -4026,7 +4454,12 @@ def _actuator_main(
                         raise DeploymentError("RTC plan timestamp is invalid") from exc
                     if not np.isfinite(plan_age) or not 0.0 <= plan_age <= CHUNK_MAX_AGE_S:
                         raise DeploymentError(f"RTC plan {sequence} expired before execution")
-                    proposed = ActionChunk(arm=arm, left_hand=left, right_hand=right)
+                    proposed = ActionChunk(
+                        arm=arm,
+                        left_hand=left,
+                        right_hand=right,
+                        end_effector=profile.name,
+                    )
                     if proposed.length != expected_horizon:
                         raise DeploymentError("RTC plan length changed in transit")
                     state = backend.state()
@@ -4114,7 +4547,12 @@ def _actuator_main(
                     if not np.isfinite(plan_age) or not 0.0 <= plan_age <= CHUNK_MAX_AGE_S:
                         raise DeploymentError(f"RTC replacement {sequence} expired before execution")
 
-                    replacement = ActionChunk(arm=arm, left_hand=left, right_hand=right)
+                    replacement = ActionChunk(
+                        arm=arm,
+                        left_hand=left,
+                        right_hand=right,
+                        end_effector=profile.name,
+                    )
                     if replacement.length != expected_horizon:
                         raise DeploymentError("RTC replacement length changed in transit")
                     # Validate every raw value, including the portion that elapsed
@@ -4163,6 +4601,7 @@ def _actuator_main(
                         arm=np.ascontiguousarray(replacement.arm[elapsed_actions:]),
                         left_hand=np.ascontiguousarray(replacement.left_hand[elapsed_actions:]),
                         right_hand=np.ascontiguousarray(replacement.right_hand[elapsed_actions:]),
+                        end_effector=profile.name,
                     )
                     try:
                         _validate_policy_target_input(
@@ -4244,7 +4683,12 @@ def _actuator_main(
                     if not np.isfinite(chunk_age) or not 0.0 <= chunk_age <= CHUNK_MAX_AGE_S:
                         raise DeploymentError(f"Action chunk {sequence} expired before execution")
                     state = backend.state()
-                    proposed = ActionChunk(arm=arm, left_hand=left, right_hand=right)
+                    proposed = ActionChunk(
+                        arm=arm,
+                        left_hand=left,
+                        right_hand=right,
+                        end_effector=profile.name,
+                    )
                     _validate_policy_target_input(
                         proposed,
                         backend._arm_target if replan_freeze_active else state.arm,
@@ -4650,7 +5094,7 @@ def _actuator_main(
 
 
 class SafeG1Dex3Actuator:
-    """Parent-side handle for the watchdog-owning actuator process."""
+    """Parent-side handle for the profile-selected guarded actuator process."""
 
     def __init__(
         self,
@@ -4661,11 +5105,23 @@ class SafeG1Dex3Actuator:
         dds_hold_diagnostics: bool = False,
         run_log_dir: str | None = None,
         gravity_feedforward: bool = True,
+        end_effector: str = "dex3",
     ):
         if command_conditioning not in COMMAND_CONDITIONING_MODES:
             raise DeploymentError(f"Unknown command conditioning mode {command_conditioning!r}")
         if not isinstance(gravity_feedforward, bool):
             raise DeploymentError("gravity_feedforward must be a bool")
+        try:
+            self._profile = get_end_effector_profile(end_effector)
+        except ValueError as exc:
+            raise DeploymentError(str(exc)) from exc
+        if simulation and not self._profile.supports_simulation:
+            raise DeploymentError(f"{self._profile.name} simulation is not qualified")
+        if gravity_feedforward and not self._profile.supports_gravity_feedforward:
+            raise DeploymentError(f"{self._profile.name} does not support gravity feed-forward")
+        if self._profile.name == "inspire-dfx" and command_conditioning != "xr":
+            raise DeploymentError("Inspire DFX actuation requires XR command conditioning")
+        self.end_effector = self._profile.name
         context = mp.get_context("spawn")
         self._command_queue = context.Queue(maxsize=1)
         self._status_queue = context.Queue(maxsize=32)
@@ -4695,11 +5151,14 @@ class SafeG1Dex3Actuator:
                 run_log_dir,
                 gravity_feedforward,
             )
+        process_kwargs = {"hand_pause_generation": self._hand_pause_generation}
+        if self._profile.name != "dex3":
+            process_kwargs["end_effector"] = self._profile.name
         self._process = context.Process(
             target=_actuator_main,
             args=process_args,
-            kwargs={"hand_pause_generation": self._hand_pause_generation},
-            name="groot-g1-dex3-actuator",
+            kwargs=process_kwargs,
+            name=f"groot-g1-{self._profile.name}-actuator",
         )
         self._sequence = 0
         self._started = False
@@ -4730,6 +5189,18 @@ class SafeG1Dex3Actuator:
         self._last_cleanup_phase: Any = None
         self._closed = False
 
+    def _require_payload_profile(self, payload: ActionChunk | InitializationSpec) -> None:
+        # Defaults preserve older internal test doubles and Dex3 callers that
+        # predate explicit payload identity. Real parsed chunks/specs are
+        # always tagged; Inspire never matches either Dex3 fallback.
+        actuator_end_effector = getattr(self, "end_effector", "dex3")
+        payload_end_effector = getattr(payload, "end_effector", "dex3")
+        if payload_end_effector != actuator_end_effector:
+            raise DeploymentError(
+                f"Actuator end effector is {actuator_end_effector!r}, but payload is tagged "
+                f"{payload_end_effector!r}"
+            )
+
     def heartbeat(self) -> None:
         with self._heartbeat.get_lock():
             self._heartbeat.value = time.monotonic()
@@ -4746,7 +5217,7 @@ class SafeG1Dex3Actuator:
         if kind == "hand_state_recovery_progress":
             self._last_hand_state_event = value
             LOGGER.warning(
-                "Dex3 feedback recovery safety reading %s/%s: %s",
+                "Hand-feedback recovery safety reading %s/%s: %s",
                 value.get("fresh_samples", "?") if isinstance(value, dict) else "?",
                 value.get("required_samples", "?") if isinstance(value, dict) else "?",
                 value,
@@ -4774,14 +5245,14 @@ class SafeG1Dex3Actuator:
             self._rtc_active = False
             self._rtc_terminal = None
             LOGGER.warning(
-                "Dex3 feedback remained stale through the operator-HOLD deadline: %s",
+                "Hand feedback remained stale through the operator-HOLD deadline: %s",
                 value,
             )
             return True
         if kind == "hand_state_recovered":
             self._hand_state_paused = False
             self._last_hand_state_event = value
-            LOGGER.info("Actuator Dex3 feedback recovered: %s", value)
+            LOGGER.info("Actuator hand feedback recovered: %s", value)
             return True
         if kind == "cleanup_phase":
             self._last_cleanup_phase = value
@@ -5053,6 +5524,7 @@ class SafeG1Dex3Actuator:
         self._armed = True
 
     def initialize(self, spec: InitializationSpec) -> None:
+        self._require_payload_profile(spec)
         if not self._armed or self._initialized:
             raise DeploymentError("Actuator must be armed and not yet initialized")
         validate_initialization_spec(spec)
@@ -5115,6 +5587,7 @@ class SafeG1Dex3Actuator:
     def warmup_pose(self, spec: InitializationSpec) -> None:
         """Move to one guarded non-policy pose and remain in powered HOLD."""
 
+        self._require_payload_profile(spec)
         if not self._initialized or not self._holding or self._chunk_in_flight:
             raise DeploymentError(
                 "Guarded warmup pose requires initialized HOLD with no chunk in flight"
@@ -5141,6 +5614,7 @@ class SafeG1Dex3Actuator:
     def warm_start(self, chunk: ActionChunk) -> None:
         """Smoothly reach a first policy target from an acknowledged hold."""
 
+        self._require_payload_profile(chunk)
         if not self._initialized or not self._holding or self._chunk_in_flight:
             raise DeploymentError("Policy warm-start requires initialized HOLD with no chunk in flight")
         if getattr(self, "_command_conditioning", "none") == "xr":
@@ -5153,8 +5627,12 @@ class SafeG1Dex3Actuator:
             arm=np.ascontiguousarray(chunk.arm[0], dtype=np.float64),
             left_hand=np.ascontiguousarray(chunk.left_hand[0], dtype=np.float64),
             right_hand=np.ascontiguousarray(chunk.right_hand[0], dtype=np.float64),
+            end_effector=self.end_effector,
         )
-        validate_initialization_spec(target)
+        validate_initialization_spec(
+            target,
+            allow_policy_warm_start=self.end_effector == "inspire-dfx",
+        )
         self._wait_for_hand_feedback()
         pause_generation = (
             self.hand_pause_generation
@@ -5183,6 +5661,7 @@ class SafeG1Dex3Actuator:
         self._holding = False
 
     def submit(self, chunk: ActionChunk) -> int:
+        self._require_payload_profile(chunk)
         if not self._initialized:
             raise DeploymentError("Actuator must complete initialization before policy actions")
         if self._chunk_in_flight:
@@ -5220,6 +5699,7 @@ class SafeG1Dex3Actuator:
     def start_rtc(self, plan: ActionChunk, *, action_budget: int) -> int:
         """Start one full-horizon plan under the child-owned RTC scheduler."""
 
+        self._require_payload_profile(plan)
         if not self._initialized:
             raise DeploymentError("Actuator must complete initialization before RTC")
         if self._chunk_in_flight or self._rtc_active:
@@ -5311,6 +5791,7 @@ class SafeG1Dex3Actuator:
     ) -> tuple[int, int]:
         """Atomically replace the unconsumed plan at the next 30 Hz action slot."""
 
+        self._require_payload_profile(plan)
         if not self._rtc_active or expected_sequence != self._pending_sequence:
             raise DeploymentError("RTC response is stale for the active plan generation")
         if getattr(self, "_command_conditioning", "none") == "xr":

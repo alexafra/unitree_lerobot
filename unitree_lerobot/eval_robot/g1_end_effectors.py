@@ -11,6 +11,9 @@ from dataclasses import dataclass
 import numpy as np
 
 
+UNQUALIFIED_INSPIRE_DFX_COMMAND_MAX_STEP = 0.2
+
+
 @dataclass(frozen=True)
 class EndEffectorProfile:
     name: str
@@ -70,6 +73,8 @@ class EndEffectorProfile:
                 raise ValueError(f"{self.name}: {field_name} must be a finite ({self.hand_dof},) vector")
             value.flags.writeable = False
             object.__setattr__(self, field_name, value)
+        if self.conditioned_step is not None and np.any(self.conditioned_step <= 0.0):
+            raise ValueError(f"{self.name}: conditioned_step must be strictly positive")
         if np.any(self.left_lower > self.left_upper) or np.any(self.right_lower > self.right_upper):
             raise ValueError(f"{self.name}: lower hand bounds exceed upper bounds")
         if self.home is not None:
@@ -176,22 +181,31 @@ INSPIRE_DFX_PROFILE = EndEffectorProfile(
     left_upper=np.ones(6, dtype=np.float64),
     right_lower=np.zeros(6, dtype=np.float64),
     right_upper=np.ones(6, dtype=np.float64),
-    # Inspire DFX uses 0=closed and 1=open.  A guarded live home target has not
-    # been qualified, so the read-only profile intentionally has no home.
+    # Inspire DFX uses 0=closed and 1=open. Live operation deliberately starts
+    # from freshly measured q; no fixed home pose is implied by this profile.
     home=None,
     value_unit="normalized_open_fraction",
     transport="inspire-dfx",
     limit_tolerance=0.0,
     measured_limit_tolerance=0.0,
+    # Raw 30 Hz model targets may move anywhere inside [0, 1]. The 0.2 ceiling
+    # applies only after conditioning and again at the final DDS writer.
     max_step=None,
-    conditioned_step=None,
+    conditioned_step=np.full(
+        6,
+        UNQUALIFIED_INSPIRE_DFX_COMMAND_MAX_STEP,
+        dtype=np.float64,
+    ),
     initialization_speed=None,
     initialization_tolerance=None,
     tracking_warning=None,
     tracking_clear=None,
     tracking_hard=None,
     supports_simulation=False,
-    supports_gravity_feedforward=False,
+    # This intentionally follows the existing Inspire teleop path, which uses
+    # the same g1_body29_hand14 model as Dex3. It is parity, not a newly
+    # identified Inspire payload model.
+    supports_gravity_feedforward=True,
     has_motor_stop=False,
     state_topic="rt/inspire/state",
     command_topic="rt/inspire/cmd",
