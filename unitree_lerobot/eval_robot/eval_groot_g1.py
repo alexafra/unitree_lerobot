@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a supported colour or colour+aligned-depth-derived GR00T policy on G1/Dex3.
+"""Run a supported colour or colour+aligned-depth-derived GR00T policy on G1.
 
 The default is read-only shadow mode.  ``--actuate`` creates a separate,
 watchdog-owning DDS actuator process only after model, camera, state, and action
@@ -60,6 +60,7 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     TeleimagerCamera,
     initialize_dds,
 )
+from unitree_lerobot.eval_robot.robot_control.g1_inspire_dfx import G1InspireDfxStateReader
 from unitree_lerobot.eval_robot.training_start_pose import (
     TRAINING_START_SOURCE,
     training_start_spec,
@@ -627,6 +628,25 @@ def _take_initial_voice_command(
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    end_effector = getattr(args, "end_effector", "dex3")
+    if end_effector not in {"dex3", "inspire-dfx"}:
+        raise DeploymentError("--end-effector must be dex3 or inspire-dfx")
+    if end_effector == "inspire-dfx":
+        if args.actuate:
+            raise DeploymentError(
+                "Inspire DFX is currently shadow/read-only only: live actuation is fail-closed "
+                "until its motion envelope, gravity payload, and command-loss behavior are qualified"
+            )
+        if args.sim:
+            raise DeploymentError("Inspire DFX simulation is not qualified in this guarded client")
+        if getattr(args, "gravity_feedforward", True):
+            raise DeploymentError(
+                "Inspire DFX cannot use the Dex3-payload gravity model; pass --no-gravity-feedforward"
+            )
+        if bool(getattr(args, "warmup1", False)):
+            raise DeploymentError(
+                "Inspire DFX has no reviewed training-frame Warmup1 pose; pass --no-warmup1"
+            )
     if args.execution_horizon < 1:
         raise DeploymentError("--execution-horizon must be at least 1")
     if args.max_chunks < 1:
@@ -1446,6 +1466,7 @@ def capture_policy_observation(
         depth_gray=depth_gray,
         surface_normals=surface_normals,
         allow_custom_instruction=allow_custom_instruction,
+        end_effector=getattr(model_contract, "end_effector", "dex3"),
     )
     return observation, state
 
@@ -1505,6 +1526,7 @@ def infer_chunk(
             current_right=state.right_hand,
             validate_initial_step=validate_initial_step,
             validate_target_steps=command_conditioning == "none",
+            end_effector=getattr(model_contract, "end_effector", "dex3"),
         )
         if pause_generation is not None:
             chunk = ActionChunk(
@@ -1512,6 +1534,7 @@ def infer_chunk(
                 left_hand=chunk.left_hand,
                 right_hand=chunk.right_hand,
                 hand_pause_generation=pause_generation,
+                end_effector=chunk.end_effector,
             )
         return chunk, inference_s
 
@@ -1569,6 +1592,7 @@ def infer_plan(
             current_right=state.right_hand,
             validate_initial_step=validate_initial_step,
             validate_target_steps=command_conditioning == "none",
+            end_effector=getattr(model_contract, "end_effector", "dex3"),
         )
         if pause_generation is not None:
             plan = ActionChunk(
@@ -1576,6 +1600,7 @@ def infer_plan(
                 left_hand=plan.left_hand,
                 right_hand=plan.right_hand,
                 hand_pause_generation=pause_generation,
+                end_effector=plan.end_effector,
             )
         return plan, inference_s
 
@@ -2226,6 +2251,7 @@ def _run_active_goal_rtc_controlled(
                         # handoff after measuring how many actions elapsed.
                         validate_initial_step=False,
                         validate_target_steps=getattr(args, "command_conditioning", "xr") == "none",
+                        end_effector=contract.end_effector,
                     )
                     current_sequence, actual_delay = actuator.replace_rtc(
                         replacement,
@@ -2418,6 +2444,7 @@ def _run_shadow_rtc(
                     current_right=reference_state.right_hand,
                     validate_initial_step=False,
                     validate_target_steps=getattr(args, "command_conditioning", "xr") == "none",
+                    end_effector=contract.end_effector,
                 )
                 actual_delay = plan_index - int(pending["request_index"])
                 if actual_delay < 0 or actual_delay >= int(pending["overlap"]):
@@ -2426,6 +2453,7 @@ def _run_shadow_rtc(
                     arm=np.ascontiguousarray(replacement.arm[actual_delay:]),
                     left_hand=np.ascontiguousarray(replacement.left_hand[actual_delay:]),
                     right_hand=np.ascontiguousarray(replacement.right_hand[actual_delay:]),
+                    end_effector=replacement.end_effector,
                 )
                 previous_index = max(0, plan_index - 1)
                 if getattr(args, "command_conditioning", "xr") == "none":
@@ -2544,10 +2572,12 @@ def run(args: argparse.Namespace) -> None:
             instruction,
         )
         confirm_custom_goal(instruction)
+    end_effector = getattr(args, "end_effector", "dex3")
     configured_initialization = load_initialization_spec(
         getattr(args, "initialization", "measured"),
         task_name=task_name,
         pose_file=getattr(args, "initial_pose_file", None),
+        end_effector=end_effector,
     )
     warmup1_enabled = bool(getattr(args, "warmup1", False))
     warmup1 = training_start_spec() if warmup1_enabled else None
@@ -2565,7 +2595,10 @@ def run(args: argparse.Namespace) -> None:
         policy = Gr00tClient(args.policy_host, args.policy_port)
         if not policy.ping():
             raise DeploymentError(f"GR00T server at {args.policy_host}:{args.policy_port} did not answer ping")
-        contract = validate_model_contract(policy.get_modality_config())
+        contract = validate_model_contract(
+            policy.get_modality_config(),
+            end_effector=end_effector,
+        )
         policy_metadata = policy.get_policy_metadata()
         requires_surface_normals = getattr(
             contract,
@@ -2579,6 +2612,7 @@ def run(args: argparse.Namespace) -> None:
         )
         visual_encoding = validate_policy_metadata(
             policy_metadata,
+            end_effector=end_effector,
             requires_depth=requires_depth_gray,
             requires_surface_normals=requires_surface_normals,
             vision_input_contract=getattr(contract, "vision_input_contract", None),  # earlyfusion
@@ -2618,11 +2652,17 @@ def run(args: argparse.Namespace) -> None:
                     "and PyTorch backend; restart it with the RTC-capable server code"
                 )
         LOGGER.info(
-            "GR00T contract verified: video=%s + four G1/Dex3 state/action keys, horizon %d",
+            "GR00T contract verified: video=%s + four G1/%s state/action keys, horizon %d",
             ",".join(contract.video_keys),
+            end_effector,
             contract.action_horizon,
         )
-        if getattr(args, "command_conditioning", "xr") == "xr":
+        if end_effector == "inspire-dfx":
+            LOGGER.info(
+                "Inspire DFX shadow contract enabled: native normalized 6-DoF hand values; "
+                "no command publisher or live conditioner exists"
+            )
+        elif getattr(args, "command_conditioning", "xr") == "xr":
             LOGGER.info(
                 "XR command conditioning enabled: 100 Hz arm lead 0.08->0.12 rad/5s; "
                 "no second Dex3 low-pass; nominal final slew arm=0.03 rad/write, "
@@ -2632,7 +2672,11 @@ def run(args: argparse.Namespace) -> None:
             LOGGER.warning("XR command conditioning disabled; raw policy target-step rejection is active")
 
         initialize_dds(args.sim, args.network_interface)
-        state_reader = G1Dex3StateReader(simulation=args.sim)
+        state_reader = (
+            G1Dex3StateReader(simulation=args.sim)
+            if end_effector == "dex3"
+            else G1InspireDfxStateReader(simulation=args.sim)
+        )
         depth_encoding = visual_encoding if isinstance(visual_encoding, DepthEncodingContract) else None
         surface_normal_encoding = (
             visual_encoding if isinstance(visual_encoding, SurfaceNormalEncodingContract) else None
@@ -2935,7 +2979,13 @@ def run(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Colour/RGBD GR00T runner for Unitree G1-29 + Dex3")
+    parser = argparse.ArgumentParser(description="Colour/RGBD GR00T runner for Unitree G1-29")
+    parser.add_argument(
+        "--end-effector",
+        choices=("dex3", "inspire-dfx"),
+        default="dex3",
+        help="Hand data/transport contract (default: dex3); Inspire DFX is currently shadow-only",
+    )
     goal_group = parser.add_mutually_exclusive_group()
     goal_group.add_argument("--task", choices=tuple(TASKS), help="Trained task ID; omit for a menu")
     goal_group.add_argument(

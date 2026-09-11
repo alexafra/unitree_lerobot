@@ -236,6 +236,10 @@ class RobotState:
     left_hand_received_at: float | None = None
     right_hand_received_at: float | None = None
     arm_received_at: float | None = None
+    # Inspire DFX exposes one uint32 ``lost`` counter per motor.  Dex3 leaves
+    # these unset; read-only DFX diagnostics preserve the latest exact values.
+    left_hand_lost: tuple[int, ...] | None = None
+    right_hand_lost: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)

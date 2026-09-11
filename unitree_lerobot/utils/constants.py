@@ -272,6 +272,12 @@ G1_INSPIRE_CONFIG = RobotConfig(
     json_action_data_name=["left_arm.qpos", "right_arm.qpos", "left_ee.qpos", "right_ee.qpos"],
 )
 
+G1_INSPIRE_HEAD_ONLY_CONFIG = dataclasses.replace(
+    G1_INSPIRE_CONFIG,
+    cameras=["ego_view"],
+    camera_to_image_key={"color_0": "ego_view"},
+)
+
 
 MOVEIBLE_LIFT_G1_DEX1_USEWAIST_CONFIG = RobotConfig(
     motors=[
@@ -501,6 +507,7 @@ ROBOT_CONFIGS = {
     "Unitree_G1_Dex3_HeadOnly": G1_DEX3_HEAD_ONLY_CONFIG,
     "Unitree_G1_Brainco": G1_BRAINCO_CONFIG,
     "Unitree_G1_Inspire": G1_INSPIRE_CONFIG,
+    "Unitree_G1_Inspire_HeadOnly": G1_INSPIRE_HEAD_ONLY_CONFIG,
     "Unitree_G1_MoveibleLift_Dex1_UseWaist": MOVEIBLE_LIFT_G1_DEX1_USEWAIST_CONFIG,
     "Unitree_G1_MoveibleLift_Dex1_NoUseWaist": MOVEIBLE_LIFT_G1_DEX1_NOUSEWAIST_CONFIG,
     "Unitree_G1_Lift_Dex1_UseWaist": LIFT_G1_DEX1_USEWAIST_CONFIG,

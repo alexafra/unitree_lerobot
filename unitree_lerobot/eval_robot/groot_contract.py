@@ -9,6 +9,12 @@ from typing import Any
 
 import numpy as np
 
+from unitree_lerobot.eval_robot.g1_end_effectors import (
+    DEX3_PROFILE,
+    EndEffectorProfile,
+    get_end_effector_profile,
+    inspire_dfx_dataset_contract,
+)
 from unitree_lerobot.eval_robot.groot_client import DeploymentError
 from unitree_lerobot.utils.depth_encoding import (
     DEPTH_ENCODING,
@@ -47,7 +53,7 @@ STATE_KEYS = ("left_arm", "right_arm", "left_hand", "right_hand")
 ACTION_KEYS = STATE_KEYS
 LANGUAGE_KEYS = ("annotation.human.task_description",)
 EXPECTED_TRAINING_TAG = "new_embodiment"
-EXPECTED_ROBOT_TYPE = "Unitree_G1_Dex3_HeadOnly"
+EXPECTED_ROBOT_TYPE = DEX3_PROFILE.robot_type
 EXPECTED_EGO_VIEW_SHAPE = [480, 640, 3]
 EXPECTED_DEPTH_VIEW_SHAPE = [480, 640, 3]
 EXPECTED_SURFACE_NORMAL_VIEW_SHAPE = [480, 640, 3]
@@ -91,7 +97,7 @@ LEFT_HAND_JOINT_NAMES = tuple(EXPECTED_JOINT_NAMES[14:21])
 RIGHT_HAND_JOINT_NAMES = tuple(EXPECTED_JOINT_NAMES[21:28])
 
 ARM_DOF = 14
-HAND_DOF = 7
+HAND_DOF = DEX3_PROFILE.hand_dof
 CONTROL_HZ = 30.0
 INITIALIZATION_MODES = ("measured", "xr-home", "pose-file")
 INITIAL_POSE_SCHEMA_VERSION = 1
@@ -114,10 +120,10 @@ MAX_ARM_STEP_RAD = 0.10
 # inward recovery from a measured-only tolerance may exceed that ordinary
 # conditioner ceiling but remains below this hard backstop. This 0.60-rad
 # backstop itself is not an official Unitree velocity limit.
-MAX_HAND_STEP_RAD = 0.60
+MAX_HAND_STEP_RAD = float(DEX3_PROFILE.max_step)
 JOINT_LIMIT_MARGIN_RAD = 0.015 #SAFETYCHANGE was 0.03
-HAND_LIMIT_TOLERANCE_RAD = 0.01
-MEASURED_LIMIT_TOLERANCE_RAD = 0.2
+HAND_LIMIT_TOLERANCE_RAD = DEX3_PROFILE.limit_tolerance
+MEASURED_LIMIT_TOLERANCE_RAD = DEX3_PROFILE.measured_limit_tolerance
 
 # OFFICIAL: Unitree-derived g1_body29_hand14.urdf position limits, reordered into
 # the G1_29_JointArmIndex / recorded-dataset action order.
@@ -161,19 +167,20 @@ ARM_UPPER = np.array(
     dtype=np.float64,
 )
 # OFFICIAL: Unitree-derived g1_body29_hand14.urdf left Dex3 lower position bounds.
-LEFT_HAND_LOWER = np.array(
-    [-1.04719755, -0.72431163, 0.0, -1.57079632, -1.74532925, -1.57079632, -1.74532925],
-    dtype=np.float64,
-)
+LEFT_HAND_LOWER = DEX3_PROFILE.left_lower
 # OFFICIAL: Unitree-derived g1_body29_hand14.urdf left Dex3 upper position bounds.
-LEFT_HAND_UPPER = np.array([1.04719755, 1.04719755, 1.74532925, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+LEFT_HAND_UPPER = DEX3_PROFILE.left_upper
 # OFFICIAL: Unitree-derived g1_body29_hand14.urdf right Dex3 lower position bounds.
-RIGHT_HAND_LOWER = np.array([-1.04719755, -1.04719755, -1.74532925, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+RIGHT_HAND_LOWER = DEX3_PROFILE.right_lower
 # OFFICIAL: Unitree-derived g1_body29_hand14.urdf right Dex3 upper position bounds.
-RIGHT_HAND_UPPER = np.array(
-    [1.04719755, 0.72431163, 0.0, 1.57079632, 1.74532925, 1.57079632, 1.74532925],
-    dtype=np.float64,
-)
+RIGHT_HAND_UPPER = DEX3_PROFILE.right_upper
+
+
+def _end_effector_profile(name: str) -> EndEffectorProfile:
+    try:
+        return get_end_effector_profile(name)
+    except ValueError as exc:
+        raise DeploymentError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -181,6 +188,7 @@ class ModelContract:
     action_horizon: int
     video_keys: tuple[str, ...] = COLOUR_VIDEO_KEYS
     vision_input_contract: dict[str, Any] | None = None  # earlyfusion
+    end_effector: str = "dex3"
 
     @property
     def requires_depth(self) -> bool:
@@ -236,6 +244,7 @@ class ActionChunk:
     # The actuator checks this immediately before installing policy motion so
     # a result computed across a feedback outage can never become executable.
     hand_pause_generation: int | None = None
+    end_effector: str = "dex3"
 
     @property
     def length(self) -> int:
@@ -251,6 +260,7 @@ class InitializationSpec:
     arm: np.ndarray | None
     left_hand: np.ndarray | None
     right_hand: np.ndarray | None
+    end_effector: str = "dex3"
 
     @property
     def moves(self) -> bool:
@@ -337,15 +347,17 @@ def _validate_surface_normal_metadata(contract: dict[str, Any]) -> SurfaceNormal
 def validate_policy_metadata(
     metadata: dict[str, Any],
     *,
+    end_effector: str = "dex3",
     requires_depth: bool = False,
     requires_surface_normals: bool = False,
     vision_input_contract: dict[str, Any] | None = None,  # earlyfusion
 ) -> DepthEncodingContract | SurfaceNormalEncodingContract | None:
+    profile = _end_effector_profile(end_effector)
     if metadata.get("protocol_version") != 1:
         raise DeploymentError(f"Unsupported GR00T deployment protocol {metadata.get('protocol_version')!r}")
     if metadata.get("embodiment_tag") != EXPECTED_TRAINING_TAG:
         raise DeploymentError(
-            f"This G1/Dex3 adapter requires GR00T training tag "
+            f"This G1/{profile.name} adapter requires GR00T training tag "
             f"'{EXPECTED_TRAINING_TAG}', got {metadata.get('embodiment_tag')!r}"
         )
     contract = metadata.get("dataset_contract")
@@ -354,16 +366,51 @@ def validate_policy_metadata(
             "GR00T server has no deployment dataset contract; start it with --deployment-dataset-path"
         )
     expected = {
-        "robot_type": EXPECTED_ROBOT_TYPE,
+        "robot_type": profile.robot_type,
         "fps": CONTROL_HZ,
-        "observation_state_names": EXPECTED_JOINT_NAMES,
-        "action_names": EXPECTED_JOINT_NAMES,
+        "observation_state_names": list(ARM_JOINT_NAMES + profile.joint_names),
+        "action_names": list(ARM_JOINT_NAMES + profile.joint_names),
         "ego_view_shape": EXPECTED_EGO_VIEW_SHAPE,
     }
     for field, value in expected.items():
         if contract.get(field) != value:
             raise DeploymentError(
                 f"Deployment dataset contract mismatch for {field}: got {contract.get(field)!r}, expected {value!r}"
+            )
+    vector_dim = ARM_DOF + 2 * profile.hand_dof
+    expected_layout = {
+        "left_arm": {"start": 0, "end": 7, "dim": 7},
+        "right_arm": {"start": 7, "end": 14, "dim": 7},
+        "left_hand": {"start": 14, "end": 14 + profile.hand_dof, "dim": profile.hand_dof},
+        "right_hand": {
+            "start": 14 + profile.hand_dof,
+            "end": vector_dim,
+            "dim": profile.hand_dof,
+        },
+    }
+    # Current servers always advertise these fields.  Keep accepting legacy
+    # Dex3 protocol-v1 test/deployment metadata which predated them, but require
+    # the full native 26D proof for every explicitly selected Inspire client.
+    vector_contract = {
+        "observation_state_shape": [vector_dim],
+        "action_shape": [vector_dim],
+        "state_layout": expected_layout,
+        "action_layout": expected_layout,
+    }
+    require_vector_contract = profile.name != "dex3"
+    for field, value in vector_contract.items():
+        if require_vector_contract or field in contract:
+            if contract.get(field) != value:
+                raise DeploymentError(
+                    f"Deployment dataset contract mismatch for {field}: "
+                    f"got {contract.get(field)!r}, expected {value!r}"
+                )
+    if profile.name == "inspire-dfx":
+        expected_end_effector = inspire_dfx_dataset_contract()
+        if contract.get("end_effector") != expected_end_effector:
+            raise DeploymentError(
+                "Deployment dataset contract mismatch for end_effector: "
+                f"got {contract.get('end_effector')!r}, expected {expected_end_effector!r}"
             )
     action_output = metadata.get("action_output_contract")
     if not isinstance(action_output, dict):
@@ -412,8 +459,10 @@ def _config_field(config: dict[str, Any], modality: str, field: str) -> Any:
     return value
 
 
-def validate_model_contract(config: dict[str, Any]) -> ModelContract:
-    """Accept only the supported G1/Dex3 colour and geometry contracts."""
+def validate_model_contract(config: dict[str, Any], *, end_effector: str = "dex3") -> ModelContract:
+    """Accept only the supported G1 colour/geometry and selected hand contract."""
+
+    profile = _end_effector_profile(end_effector)
 
     expected = {
         "state": STATE_KEYS,
@@ -463,7 +512,12 @@ def validate_model_contract(config: dict[str, Any]) -> ModelContract:
             )
         if state_key not in (None, key):
             raise DeploymentError(f"Action '{key}' refers to unexpected state key {state_key!r}")
-    return ModelContract(action_horizon=len(action_indices), video_keys=video_keys, vision_input_contract=vision_input_contract)  # earlyfusion
+    return ModelContract(
+        action_horizon=len(action_indices),
+        video_keys=video_keys,
+        vision_input_contract=vision_input_contract,
+        end_effector=profile.name,
+    )  # earlyfusion
 
 
 def make_observation(
@@ -477,9 +531,11 @@ def make_observation(
     depth_gray: np.ndarray | None = None,
     surface_normals: np.ndarray | None = None,
     allow_custom_instruction: bool = False,
+    end_effector: str = "dex3",
 ) -> dict[str, Any]:
     """Build exactly the video/state/language inputs selected by the checkpoint."""
 
+    profile = _end_effector_profile(end_effector)
     rgb = np.asarray(rgb)
     arm = np.asarray(arm)
     left_hand = np.asarray(left_hand)
@@ -490,8 +546,11 @@ def make_observation(
         )
     if arm.shape != (ARM_DOF,):
         raise DeploymentError(f"Expected 14 arm joints, got {arm.shape}")
-    if left_hand.shape != (HAND_DOF,) or right_hand.shape != (HAND_DOF,):
-        raise DeploymentError(f"Expected two 7-DoF hands, got {left_hand.shape} and {right_hand.shape}")
+    if left_hand.shape != (profile.hand_dof,) or right_hand.shape != (profile.hand_dof,):
+        raise DeploymentError(
+            f"Expected two {profile.hand_dof}-DoF {profile.name} hands, "
+            f"got {left_hand.shape} and {right_hand.shape}"
+        )
     if not all(np.all(np.isfinite(values)) for values in (arm, left_hand, right_hand)):
         raise DeploymentError("Robot observation contains NaN or infinity")
     if not isinstance(instruction, str) or not instruction or len(instruction) > 256:
@@ -547,14 +606,16 @@ def make_observation(
     }
 
 
-def _numeric_action(action: dict[str, Any], key: str, model_horizon: int) -> np.ndarray:
+def _numeric_action(action: dict[str, Any], key: str, model_horizon: int, width: int) -> np.ndarray:
     if key not in action:
         raise DeploymentError(f"Model action is missing '{key}'")
     value = np.asarray(action[key])
     if value.dtype.kind not in "iuf":
         raise DeploymentError(f"Action '{key}' has unsafe dtype {value.dtype}")
-    if value.shape != (1, model_horizon, 7):
-        raise DeploymentError(f"Action '{key}' must have shape (1, {model_horizon}, 7), got {value.shape}")
+    if value.shape != (1, model_horizon, width):
+        raise DeploymentError(
+            f"Action '{key}' must have shape (1, {model_horizon}, {width}), got {value.shape}"
+        )
     value = value.astype(np.float64, copy=False)
     if not np.all(np.isfinite(value)):
         raise DeploymentError(f"Action '{key}' contains NaN or infinity")
@@ -574,6 +635,7 @@ def _check_limits(
     tolerance: float = 0.0,
     margin_constant: str | None = None,
     tolerance_constant: str | None = None,
+    unit: str = "rad",
 ) -> None:
     safe_lower = lower + margin - tolerance
     safe_upper = upper - margin + tolerance
@@ -586,17 +648,17 @@ def _check_limits(
         boundary = float(lower[joint] if lower_violation else upper[joint])
         effective_boundary = float(safe_lower[joint] if lower_violation else safe_upper[joint])
         direction = "minimum" if lower_violation else "maximum"
-        terms = [f"{boundary_constant}[{joint}]={boundary:.4f} rad"]
+        terms = [f"{boundary_constant}[{joint}]={boundary:.4f} {unit}"]
         if margin_constant is not None:
             operator = "+" if lower_violation else "-"
-            terms.append(f"{operator} {margin_constant}={margin:.4f} rad")
+            terms.append(f"{operator} {margin_constant}={margin:.4f} {unit}")
         if tolerance_constant is not None:
             operator = "-" if lower_violation else "+"
-            terms.append(f"{operator} {tolerance_constant}={tolerance:.4f} rad")
+            terms.append(f"{operator} {tolerance_constant}={tolerance:.4f} {unit}")
         raise DeploymentError(
             f"{name} target is outside its safety-margined joint range at step {step}, "
-            f"joint {joint} ({joint_names[joint]}): {value:.4f} rad; effective {direction} "
-            f"is {effective_boundary:.4f} rad from {' '.join(terms)}"
+            f"joint {joint} ({joint_names[joint]}): {value:.4f} {unit}; effective {direction} "
+            f"is {effective_boundary:.4f} {unit} from {' '.join(terms)}"
         )
 
 
@@ -633,6 +695,13 @@ def _json_object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, A
 
 
 def validate_initialization_spec(spec: InitializationSpec) -> None:
+    profile = _end_effector_profile(spec.end_effector)
+    if profile.name != "dex3":
+        if spec.mode != "measured" or spec.moves:
+            raise DeploymentError(
+                "Inspire DFX has no qualified live initialization/home contract; "
+                "only measured read-only initialization is accepted"
+            )
     if spec.mode not in INITIALIZATION_MODES:
         raise DeploymentError(f"Unsupported initialization mode {spec.mode!r}")
     if not isinstance(spec.label, str) or not spec.label.strip() or len(spec.label) > 120:
@@ -737,6 +806,7 @@ def load_initialization_spec(
     *,
     task_name: str,
     pose_file: str | Path | None = None,
+    end_effector: str = "dex3",
 ) -> InitializationSpec:
     """Load one explicit initialization choice without consulting robot state.
 
@@ -746,12 +816,17 @@ def load_initialization_spec(
     hand poses.
     """
 
+    profile = _end_effector_profile(end_effector)
     if mode not in INITIALIZATION_MODES:
         raise DeploymentError(f"Unsupported initialization mode {mode!r}; expected one of {INITIALIZATION_MODES}")
     if mode == "pose-file" and task_name not in TASKS:
         raise DeploymentError("Pose-file initialization requires one of the exact trained tasks")
     if mode != "pose-file" and pose_file is not None:
         raise DeploymentError("--initial-pose-file is valid only with --initialization pose-file")
+    if profile.name != "dex3" and mode != "measured":
+        raise DeploymentError(
+            "Inspire DFX has no qualified live initialization/home contract; use --initialization measured"
+        )
 
     if mode == "measured":
         return InitializationSpec(
@@ -760,6 +835,7 @@ def load_initialization_spec(
             arm=None,
             left_hand=None,
             right_hand=None,
+            end_effector=profile.name,
         )
     if mode == "xr-home":
         spec = InitializationSpec(
@@ -768,6 +844,7 @@ def load_initialization_spec(
             arm=np.zeros(ARM_DOF, dtype=np.float64),
             left_hand=np.zeros(HAND_DOF, dtype=np.float64),
             right_hand=np.zeros(HAND_DOF, dtype=np.float64),
+            end_effector=profile.name,
         )
         validate_initialization_spec(spec)
         return spec
@@ -858,6 +935,7 @@ def load_initialization_spec(
         arm=_initial_pose_vector(document["arm"], field="arm", size=ARM_DOF, allow_measured=False),
         left_hand=left_hand,
         right_hand=right_hand,
+        end_effector=profile.name,
     )
     validate_initialization_spec(spec)
     return spec
@@ -868,14 +946,17 @@ def validate_measured_state(
     arm_dq: np.ndarray,
     left_hand: np.ndarray,
     right_hand: np.ndarray,
+    *,
+    end_effector: str = "dex3",
 ) -> None:
     """Reject malformed or physically implausible DDS state before it is reused."""
 
+    profile = _end_effector_profile(end_effector)
     arrays = {
         "arm": (np.asarray(arm, dtype=np.float64), (ARM_DOF,)),
         "arm velocity": (np.asarray(arm_dq, dtype=np.float64), (ARM_DOF,)),
-        "left hand": (np.asarray(left_hand, dtype=np.float64), (HAND_DOF,)),
-        "right hand": (np.asarray(right_hand, dtype=np.float64), (HAND_DOF,)),
+        "left hand": (np.asarray(left_hand, dtype=np.float64), (profile.hand_dof,)),
+        "right hand": (np.asarray(right_hand, dtype=np.float64), (profile.hand_dof,)),
     }
     for name, (values, expected_shape) in arrays.items():
         if values.shape != expected_shape:
@@ -888,41 +969,49 @@ def validate_measured_state(
         (
             "left hand",
             arrays["left hand"][0],
-            LEFT_HAND_LOWER,
-            LEFT_HAND_UPPER,
-            LEFT_HAND_JOINT_NAMES,
+            profile.left_lower,
+            profile.left_upper,
+            profile.left_joint_names,
             "LEFT_HAND_LOWER",
             "LEFT_HAND_UPPER",
         ),
         (
             "right hand",
             arrays["right hand"][0],
-            RIGHT_HAND_LOWER,
-            RIGHT_HAND_UPPER,
-            RIGHT_HAND_JOINT_NAMES,
+            profile.right_lower,
+            profile.right_upper,
+            profile.right_joint_names,
             "RIGHT_HAND_LOWER",
             "RIGHT_HAND_UPPER",
         ),
     )
     for name, values, lower, upper, joint_names, lower_constant, upper_constant in limits:
         bad = np.flatnonzero(
-            (values < lower - MEASURED_LIMIT_TOLERANCE_RAD) | (values > upper + MEASURED_LIMIT_TOLERANCE_RAD)
+            (values < lower - (MEASURED_LIMIT_TOLERANCE_RAD if name == "arm" else profile.measured_limit_tolerance))
+            | (values > upper + (MEASURED_LIMIT_TOLERANCE_RAD if name == "arm" else profile.measured_limit_tolerance))
         )
         if bad.size:
             joint = int(bad[0])
-            lower_violation = values[joint] < lower[joint] - MEASURED_LIMIT_TOLERANCE_RAD
+            tolerance = MEASURED_LIMIT_TOLERANCE_RAD if name == "arm" else profile.measured_limit_tolerance
+            unit = "rad" if name == "arm" else profile.value_unit
+            tolerance_constant = (
+                "MEASURED_LIMIT_TOLERANCE_RAD"
+                if name == "arm" or profile.name == "dex3"
+                else "MEASURED_LIMIT_TOLERANCE"
+            )
+            lower_violation = values[joint] < lower[joint] - tolerance
             boundary_constant = lower_constant if lower_violation else upper_constant
             boundary = float(lower[joint] if lower_violation else upper[joint])
             effective_boundary = boundary + (
-                -MEASURED_LIMIT_TOLERANCE_RAD if lower_violation else MEASURED_LIMIT_TOLERANCE_RAD
+                -tolerance if lower_violation else tolerance
             )
             direction = "minimum" if lower_violation else "maximum"
             raise DeploymentError(
                 f"Measured {name} joint {joint} ({joint_names[joint]}) is outside its physical range: "
-                f"{values[joint]:.4f} rad; effective {direction} is {effective_boundary:.4f} rad from "
-                f"{boundary_constant}[{joint}]={boundary:.4f} rad "
-                f"{'-' if lower_violation else '+'} MEASURED_LIMIT_TOLERANCE_RAD="
-                f"{MEASURED_LIMIT_TOLERANCE_RAD:.4f} rad"
+                f"{values[joint]:.4f} {unit}; effective {direction} is {effective_boundary:.4f} {unit} from "
+                f"{boundary_constant}[{joint}]={boundary:.4f} {unit} "
+                f"{'-' if lower_violation else '+'} {tolerance_constant}="
+                f"{tolerance:.4f} {unit}"
             )
 
 
@@ -955,12 +1044,13 @@ def validate_action_chunk_limits(chunk: ActionChunk) -> None:
     pass :func:`validate_action_chunk` before they reach DDS.
     """
 
+    profile = _end_effector_profile(chunk.end_effector)
     arm = np.asarray(chunk.arm, dtype=np.float64)
     left = np.asarray(chunk.left_hand, dtype=np.float64)
     right = np.asarray(chunk.right_hand, dtype=np.float64)
     if arm.ndim != 2 or arm.shape[1] != ARM_DOF or arm.shape[0] < 1:
         raise DeploymentError(f"Invalid arm chunk shape {arm.shape}")
-    if left.shape != (arm.shape[0], HAND_DOF) or right.shape != left.shape:
+    if left.shape != (arm.shape[0], profile.hand_dof) or right.shape != left.shape:
         raise DeploymentError(f"Invalid hand chunk shapes {left.shape} and {right.shape}")
     if not all(np.all(np.isfinite(values)) for values in (arm, left, right)):
         raise DeploymentError("Action chunk contains NaN or infinity")
@@ -979,24 +1069,26 @@ def validate_action_chunk_limits(chunk: ActionChunk) -> None:
     _check_limits(
         "left hand",
         left,
-        LEFT_HAND_LOWER,
-        LEFT_HAND_UPPER,
-        joint_names=LEFT_HAND_JOINT_NAMES,
+        profile.left_lower,
+        profile.left_upper,
+        joint_names=profile.left_joint_names,
         lower_constant="LEFT_HAND_LOWER",
         upper_constant="LEFT_HAND_UPPER",
-        tolerance=HAND_LIMIT_TOLERANCE_RAD,
+        tolerance=profile.limit_tolerance,
         tolerance_constant="HAND_LIMIT_TOLERANCE_RAD",
+        unit=profile.value_unit,
     )
     _check_limits(
         "right hand",
         right,
-        RIGHT_HAND_LOWER,
-        RIGHT_HAND_UPPER,
-        joint_names=RIGHT_HAND_JOINT_NAMES,
+        profile.right_lower,
+        profile.right_upper,
+        joint_names=profile.right_joint_names,
         lower_constant="RIGHT_HAND_LOWER",
         upper_constant="RIGHT_HAND_UPPER",
-        tolerance=HAND_LIMIT_TOLERANCE_RAD,
+        tolerance=profile.limit_tolerance,
         tolerance_constant="HAND_LIMIT_TOLERANCE_RAD",
+        unit=profile.value_unit,
     )
 
 
@@ -1009,13 +1101,18 @@ def validate_action_chunk(
     """Validate an already parsed chunk and every commanded target transition."""
 
     validate_action_chunk_limits(chunk)
+    profile = _end_effector_profile(chunk.end_effector)
     arm = np.asarray(chunk.arm, dtype=np.float64)
     left = np.asarray(chunk.left_hand, dtype=np.float64)
     right = np.asarray(chunk.right_hand, dtype=np.float64)
     current_arm = np.asarray(current_arm, dtype=np.float64)
     current_left = np.asarray(current_left, dtype=np.float64)
     current_right = np.asarray(current_right, dtype=np.float64)
-    if current_arm.shape != (ARM_DOF,) or current_left.shape != (HAND_DOF,) or current_right.shape != (HAND_DOF,):
+    if (
+        current_arm.shape != (ARM_DOF,)
+        or current_left.shape != (profile.hand_dof,)
+        or current_right.shape != (profile.hand_dof,)
+    ):
         raise DeploymentError("Fresh robot state has the wrong shape")
     if not all(np.all(np.isfinite(values)) for values in (current_arm, current_left, current_right)):
         raise DeploymentError("Robot state contains NaN or infinity")
@@ -1027,28 +1124,35 @@ def validate_action_chunk(
         joint_names=ARM_JOINT_NAMES,
         constant_name="MAX_ARM_STEP_RAD",
     )
-    _check_step_size(
-        "left hand",
-        left,
-        current_left,
-        MAX_HAND_STEP_RAD,
-        joint_names=LEFT_HAND_JOINT_NAMES,
-        constant_name="MAX_HAND_STEP_RAD",
-    )
-    _check_step_size(
-        "right hand",
-        right,
-        current_right,
-        MAX_HAND_STEP_RAD,
-        joint_names=RIGHT_HAND_JOINT_NAMES,
-        constant_name="MAX_HAND_STEP_RAD",
-    )
+    if profile.max_step is not None:
+        _check_step_size(
+            "left hand",
+            left,
+            current_left,
+            profile.max_step,
+            joint_names=profile.left_joint_names,
+            constant_name="MAX_HAND_STEP_RAD" if profile.name == "dex3" else "MAX_HAND_STEP",
+        )
+        _check_step_size(
+            "right hand",
+            right,
+            current_right,
+            profile.max_step,
+            joint_names=profile.right_joint_names,
+            constant_name="MAX_HAND_STEP_RAD" if profile.name == "dex3" else "MAX_HAND_STEP",
+        )
 
 
-def _parse_full_action(action: dict[str, Any], model_horizon: int) -> ActionChunk:
+def _parse_full_action(
+    action: dict[str, Any], model_horizon: int, *, end_effector: str = "dex3"
+) -> ActionChunk:
     """Parse a complete model prediction and enforce its absolute joint ranges."""
 
-    chunks = {key: _numeric_action(action, key, model_horizon) for key in ACTION_KEYS}
+    profile = _end_effector_profile(end_effector)
+    chunks = {
+        key: _numeric_action(action, key, model_horizon, 7 if "arm" in key else profile.hand_dof)
+        for key in ACTION_KEYS
+    }
     full_arm = np.concatenate((chunks["left_arm"], chunks["right_arm"]), axis=1)
     _check_limits(
         "arm",
@@ -1064,30 +1168,33 @@ def _parse_full_action(action: dict[str, Any], model_horizon: int) -> ActionChun
     _check_limits(
         "left hand",
         chunks["left_hand"],
-        LEFT_HAND_LOWER,
-        LEFT_HAND_UPPER,
-        joint_names=LEFT_HAND_JOINT_NAMES,
+        profile.left_lower,
+        profile.left_upper,
+        joint_names=profile.left_joint_names,
         lower_constant="LEFT_HAND_LOWER",
         upper_constant="LEFT_HAND_UPPER",
-        tolerance=HAND_LIMIT_TOLERANCE_RAD,
+        tolerance=profile.limit_tolerance,
         tolerance_constant="HAND_LIMIT_TOLERANCE_RAD",
+        unit=profile.value_unit,
     )
     _check_limits(
         "right hand",
         chunks["right_hand"],
-        RIGHT_HAND_LOWER,
-        RIGHT_HAND_UPPER,
-        joint_names=RIGHT_HAND_JOINT_NAMES,
+        profile.right_lower,
+        profile.right_upper,
+        joint_names=profile.right_joint_names,
         lower_constant="RIGHT_HAND_LOWER",
         upper_constant="RIGHT_HAND_UPPER",
-        tolerance=HAND_LIMIT_TOLERANCE_RAD,
+        tolerance=profile.limit_tolerance,
         tolerance_constant="HAND_LIMIT_TOLERANCE_RAD",
+        unit=profile.value_unit,
     )
 
     return ActionChunk(
         arm=np.ascontiguousarray(full_arm),
         left_hand=np.ascontiguousarray(chunks["left_hand"]),
         right_hand=np.ascontiguousarray(chunks["right_hand"]),
+        end_effector=profile.name,
     )
 
 
@@ -1099,10 +1206,11 @@ def parse_action_plan(
     current_right: np.ndarray,
     validate_initial_step: bool = True,
     validate_target_steps: bool = True,
+    end_effector: str = "dex3",
 ) -> ActionChunk:
     """Parse and rate-check the full prediction horizon used by RTC."""
 
-    result = _parse_full_action(action, model_horizon)
+    result = _parse_full_action(action, model_horizon, end_effector=end_effector)
     if validate_target_steps:
         if validate_initial_step:
             validation_state = (current_arm, current_left, current_right)
@@ -1121,6 +1229,7 @@ def parse_action_chunk(
     current_right: np.ndarray,
     validate_initial_step: bool = True,
     validate_target_steps: bool = True,
+    end_effector: str = "dex3",
 ) -> ActionChunk:
     if not 1 <= execution_horizon <= model_horizon:
         raise DeploymentError(
@@ -1128,12 +1237,13 @@ def parse_action_chunk(
             f"checkpoint action horizon={model_horizon}"
         )
 
-    full = _parse_full_action(action, model_horizon)
+    full = _parse_full_action(action, model_horizon, end_effector=end_effector)
 
     result = ActionChunk(
         arm=np.ascontiguousarray(full.arm[:execution_horizon]),
         left_hand=np.ascontiguousarray(full.left_hand[:execution_horizon]),
         right_hand=np.ascontiguousarray(full.right_hand[:execution_horizon]),
+        end_effector=full.end_effector,
     )
     if validate_target_steps:
         if validate_initial_step:
