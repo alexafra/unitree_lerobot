@@ -27,6 +27,7 @@ import cv2
 import numpy as np
 
 from unitree_lerobot.eval_robot.groot_client import DeploymentError, Gr00tClient
+from unitree_lerobot.eval_robot.g1_end_effectors import get_end_effector_profile
 from unitree_lerobot.eval_robot.groot_contract import (
     CONTROL_HZ,
     INITIALIZATION_MODES,
@@ -1614,7 +1615,8 @@ def chunk_delta_summary(chunk: ActionChunk, state_reader: G1Dex3StateReader) -> 
             np.max(np.abs(chunk.right_hand[0] - state.right_hand)),
         )
     )
-    return f"first-target pose gap arm={arm_delta:.4f} rad, hand={hand_delta:.4f} rad"
+    hand_unit = get_end_effector_profile(chunk.end_effector).value_unit
+    return f"first-target pose gap arm={arm_delta:.4f} rad, hand={hand_delta:.4f} {hand_unit}"
 
 
 def _prepare_policy_goal(

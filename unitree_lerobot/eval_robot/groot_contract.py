@@ -44,9 +44,17 @@ TASKS = {
 }
 
 COLOUR_VIDEO_KEYS = ("ego_view",)
+DEPTH_ONLY_VIDEO_KEYS = (DEPTH_OUTPUT_KEY,)
 RGBD_VIDEO_KEYS = ("ego_view", DEPTH_OUTPUT_KEY)
+SURFACE_NORMAL_ONLY_VIDEO_KEYS = (SURFACE_NORMAL_OUTPUT_KEY,)
 SURFACE_NORMAL_VIDEO_KEYS = ("ego_view", SURFACE_NORMAL_OUTPUT_KEY)
-SUPPORTED_VIDEO_KEYS = (COLOUR_VIDEO_KEYS, RGBD_VIDEO_KEYS, SURFACE_NORMAL_VIDEO_KEYS)
+SUPPORTED_VIDEO_KEYS = (
+    COLOUR_VIDEO_KEYS,
+    DEPTH_ONLY_VIDEO_KEYS,
+    RGBD_VIDEO_KEYS,
+    SURFACE_NORMAL_ONLY_VIDEO_KEYS,
+    SURFACE_NORMAL_VIDEO_KEYS,
+)
 # Backwards-compatible public name used by existing callers/tests.
 VIDEO_KEYS = COLOUR_VIDEO_KEYS
 STATE_KEYS = ("left_arm", "right_arm", "left_hand", "right_hand")
@@ -194,15 +202,15 @@ class ModelContract:
     def requires_depth(self) -> bool:
         """Whether the live camera must provide atomic aligned depth."""
 
-        return self.video_keys in (RGBD_VIDEO_KEYS, SURFACE_NORMAL_VIDEO_KEYS)
+        return DEPTH_OUTPUT_KEY in self.video_keys or SURFACE_NORMAL_OUTPUT_KEY in self.video_keys
 
     @property
     def requires_depth_gray(self) -> bool:
-        return self.video_keys == RGBD_VIDEO_KEYS
+        return DEPTH_OUTPUT_KEY in self.video_keys
 
     @property
     def requires_surface_normals(self) -> bool:
-        return self.video_keys == SURFACE_NORMAL_VIDEO_KEYS
+        return SURFACE_NORMAL_OUTPUT_KEY in self.video_keys
 
 
 @dataclass(frozen=True)
@@ -473,7 +481,7 @@ def validate_model_contract(config: dict[str, Any], *, end_effector: str = "dex3
     if video_keys not in SUPPORTED_VIDEO_KEYS:
         raise DeploymentError(
             f"Unsupported video keys from GR00T server: {video_keys}; expected exactly "
-            f"{COLOUR_VIDEO_KEYS}, {RGBD_VIDEO_KEYS}, or {SURFACE_NORMAL_VIDEO_KEYS}."
+            f"one of {SUPPORTED_VIDEO_KEYS}."
         )
     video_config = config["video"]  # earlyfusion
     fusion = video_config.get("channel_fusion") if isinstance(video_config, dict) else getattr(video_config, "channel_fusion", None)  # earlyfusion
@@ -562,10 +570,12 @@ def make_observation(
 
     if video_keys not in SUPPORTED_VIDEO_KEYS:
         raise DeploymentError(f"Cannot build an observation for unsupported video keys {video_keys}")
-    video = {"ego_view": np.ascontiguousarray(rgb)[None, None]}
-    if video_keys == RGBD_VIDEO_KEYS:
+    video = {}
+    if "ego_view" in video_keys:
+        video["ego_view"] = np.ascontiguousarray(rgb)[None, None]
+    if DEPTH_OUTPUT_KEY in video_keys:
         if depth_gray is None:
-            raise DeploymentError("RGBD checkpoint requires depth_gray_view")
+            raise DeploymentError("Depth checkpoint requires depth_gray_view")
         if surface_normals is not None:
             raise DeploymentError("Depth checkpoint must not receive surface_normals_view")
         depth_gray = np.asarray(depth_gray)
@@ -575,7 +585,7 @@ def make_observation(
                 f"{tuple(EXPECTED_DEPTH_VIEW_SHAPE)}, got {depth_gray.shape} {depth_gray.dtype}"
             )
         video[DEPTH_OUTPUT_KEY] = np.ascontiguousarray(depth_gray)[None, None]
-    elif video_keys == SURFACE_NORMAL_VIDEO_KEYS:
+    elif SURFACE_NORMAL_OUTPUT_KEY in video_keys:
         if surface_normals is None:
             raise DeploymentError("Surface-normal checkpoint requires surface_normals_view")
         if depth_gray is not None:
