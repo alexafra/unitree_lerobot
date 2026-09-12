@@ -113,15 +113,29 @@ class OperatorStop(Exception):
 class _OperatorTerminal:
     """Capture active-motion ``s``/``q`` keys without requiring Enter.
 
-    Raw key capture is enabled only while a policy goal is actively executing.
-    Armed line prompts use their own explicit q/Alt-Q/uppercase-S mapping.
-    The reader thread performs only thread-safe event signalling; it never
-    consumes actuator status acknowledgements.
+    Raw key capture is enabled around blocking actuation transitions and while
+    a policy goal is actively executing. Armed line prompts use their own
+    explicit q/Alt-Q/uppercase-S mapping. The reader thread performs only
+    thread-safe event signalling; it never consumes actuator status
+    acknowledgements.
+
+    ``stop_action="hold"`` is the normal active-loop behavior: ``s`` requests
+    a child-acknowledged powered HOLD. ``stop_action="release"`` is reserved
+    for blocking state transitions whose child cannot consume that HOLD
+    barrier until the transition returns; there ``s`` cancels through the
+    same orderly authority-release path as ``q``.
     """
 
-    def __init__(self, actuator: SafeG1Dex3Actuator, *, stop_enabled: bool = True):
+    def __init__(
+        self,
+        actuator: SafeG1Dex3Actuator,
+        *,
+        stop_action: str = "hold",
+    ):
+        if stop_action not in {"hold", "release"}:
+            raise ValueError(f"Unsupported operator stop action {stop_action!r}")
         self._actuator = actuator
-        self._stop_enabled = stop_enabled
+        self._stop_action = stop_action
         self._commands: queue.Queue[str | BaseException] = queue.Queue()
         self._stopping = threading.Event()
         self._thread: threading.Thread | None = None
@@ -164,7 +178,7 @@ class _OperatorTerminal:
                 if value == b"":
                     raise DeploymentError("stdin closed while command authority was active")
                 stop_sent = self._handle_key(value, stop_sent)
-                if value in {b"q", b"Q", b"\x11"}:
+                if self._is_release_key(value):
                     release_sent = True
                     break
         except (OSError, ValueError, DeploymentError) as exc:
@@ -193,7 +207,7 @@ class _OperatorTerminal:
                 if value == b"":
                     raise DeploymentError("stdin closed while command authority was active")
                 stop_sent = self._handle_key(value, stop_sent)
-                if value in {b"q", b"Q", b"\x11"}:
+                if self._is_release_key(value):
                     return
         except BaseException as exc:
             # Input failure is fail-closed: begin release even if the main
@@ -204,14 +218,23 @@ class _OperatorTerminal:
                 self._commands.put(exc)
 
     def _handle_key(self, value: bytes, stop_sent: bool) -> bool:
-        if self._stop_enabled and value in {b"s", b"S"} and not stop_sent:
-            self._actuator.request_immediate_hold()
-            self._commands.put("hold")
+        if value in {b"s", b"S"} and not stop_sent:
+            if self._stop_action == "release":
+                self._actuator.request_immediate_release()
+                self._commands.put("release")
+            else:
+                self._actuator.request_immediate_hold()
+                self._commands.put("hold")
             return True
         if value in {b"q", b"Q", b"\x11"}:
             self._actuator.request_immediate_release()
             self._commands.put("release")
         return stop_sent
+
+    def _is_release_key(self, value: bytes) -> bool:
+        return value in {b"q", b"Q", b"\x11"} or (
+            self._stop_action == "release" and value in {b"s", b"S"}
+        )
 
     def poll_control(self) -> str | None:
         result: str | None = None
@@ -367,10 +390,26 @@ def _confirm_before_authority(prompt: str) -> str:
 def _run_blocking_motion_with_immediate_release(
     actuator: SafeG1Dex3Actuator,
     operation: Callable[[], None],
+    *,
+    stage: str = "blocking robot transition",
 ) -> None:
-    """Keep q/Q live while an initialization-style motion blocks the main thread."""
+    """Keep s/q live while a child state transition blocks the main thread.
 
-    with _OperatorTerminal(actuator, stop_enabled=False) as terminal:
+    The normal powered-HOLD request uses a command-queue barrier serviced by
+    the child's active loop. Initialization, Warmup2, and Return-to-Start run
+    synchronously inside that same child, so they cannot acknowledge the
+    barrier until their motion has already finished. During these transitions
+    ``s`` therefore means cancel and orderly release, exactly like ``q``.
+    """
+
+    with _OperatorTerminal(actuator, stop_action="release") as terminal:
+        if terminal.enabled:
+            LOGGER.warning(
+                "%s IN PROGRESS: press s or q (no Enter) to cancel and start orderly "
+                "authority release; powered HOLD is unavailable until this blocking "
+                "transition returns",
+                stage,
+            )
         if terminal.poll_control() == "release":
             raise OperatorRelease
         try:
@@ -1377,6 +1416,7 @@ def _run_return_to_start_from_hold(
     _run_blocking_motion_with_immediate_release(
         actuator,
         lambda: actuator.warmup_pose(spec),
+        stage="RETURN-TO-START",
     )
     if _hand_convergence_is_software_verified(spec.end_effector):
         LOGGER.warning(
@@ -1861,6 +1901,7 @@ def _prepare_policy_goal(
         _run_blocking_motion_with_immediate_release(
             actuator,
             lambda: actuator.warm_start(warm_start_chunk),
+            stage="WARMUP2",
         )
     except HandFeedbackReplan as exc:
         LOGGER.warning(
@@ -3011,14 +3052,23 @@ def run(args: argparse.Namespace) -> None:
                 run_log_dir=run_log_dir,
                 **actuator_kwargs,
             )
-        _run_blocking_motion_with_immediate_release(actuator, actuator.start)
-        _run_blocking_motion_with_immediate_release(actuator, actuator.arm)
+        _run_blocking_motion_with_immediate_release(
+            actuator,
+            actuator.start,
+            stage="ACTUATOR STARTUP",
+        )
+        _run_blocking_motion_with_immediate_release(
+            actuator,
+            actuator.arm,
+            stage="ARM AUTHORITY ACQUISITION",
+        )
         LOGGER.warning("%s COMMAND MODE ARMED", "SIMULATION" if args.sim else "REAL ROBOT")
 
         confirm_initialization(actuator, configured_initialization)
         _run_blocking_motion_with_immediate_release(
             actuator,
             lambda: actuator.initialize(configured_initialization),
+            stage="INITIALIZATION",
         )
         if _hand_convergence_is_software_verified(configured_initialization.end_effector):
             LOGGER.warning("Initialization completed: %s", configured_initialization.label)
@@ -3034,6 +3084,7 @@ def run(args: argparse.Namespace) -> None:
             _run_blocking_motion_with_immediate_release(
                 actuator,
                 lambda: actuator.warmup_pose(warmup1),
+                stage="WARMUP1",
             )
             LOGGER.warning(
                 "Warmup1 completed: %s (source episode=%d frame=%d)",
@@ -3107,7 +3158,11 @@ def run(args: argparse.Namespace) -> None:
             if outcome == "complete":
                 if not return_to_start_enabled:
                     break
-                _run_blocking_motion_with_immediate_release(actuator, actuator.hold)
+                _run_blocking_motion_with_immediate_release(
+                    actuator,
+                    actuator.hold,
+                    stage="POST-GOAL HOLD TRANSITION",
+                )
                 LOGGER.warning(
                     "Goal %r completed; entered powered HOLD with Return-to-Start available",
                     task_name,

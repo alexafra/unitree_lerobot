@@ -225,7 +225,7 @@ class ZeroStateTest(unittest.TestCase):
             gravity_feedforward=False,
             run_log_dir="/tmp/zero-state-test",
         )
-        terminal_factory.assert_called_once_with(actuator, stop_enabled=False)
+        terminal_factory.assert_called_once_with(actuator, stop_action="release")
         terminal.__enter__.assert_called_once_with()
         terminal.__exit__.assert_called_once()
         self.assertEqual(events, ["start", "arm", "initialize", "close"])
@@ -234,11 +234,11 @@ class ZeroStateTest(unittest.TestCase):
         np.testing.assert_array_equal(actuator.target.left_hand, ZERO_STATE_JOINTS_RAD[14:21])
         np.testing.assert_array_equal(actuator.target.right_hand, ZERO_STATE_JOINTS_RAD[21:])
 
-    def test_q_variants_release_without_enter_during_every_authority_phase(self):
+    def test_s_and_q_release_without_enter_during_every_authority_phase(self):
         """The real raw-key monitor remains live from child start through final HOLD."""
 
         for phase in ("start", "arm", "initialize", "hold"):
-            for key in (b"q", b"Q", b"\x11"):
+            for key in (b"s", b"S", b"q", b"Q", b"\x11"):
                 with self.subTest(phase=phase, key=key):
                     master_fd, slave_fd = pty.openpty()
                     stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)

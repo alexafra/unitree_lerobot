@@ -106,7 +106,7 @@ def zero_state_spec() -> InitializationSpec:
 def _validate_runtime(args: argparse.Namespace) -> None:
     if not sys.stdin.isatty():
         raise DeploymentError(
-            "Zero state test requires an interactive TTY so q is always available"
+            "Zero state test requires an interactive TTY so s/q release is always available"
         )
     if not args.network_interface:
         raise DeploymentError("Zero state test requires an explicit --network-interface")
@@ -235,7 +235,15 @@ def run(args: argparse.Namespace) -> None:
     try:
         # The same terminal monitor remains alive across process startup,
         # authority acquisition, interpolation, and the final powered hold.
-        with _OperatorTerminal(actuator, stop_enabled=False) as terminal:
+        # This diagnostic has the same blocking child-state limitation as the
+        # deployment startup path: s cancels through orderly release rather
+        # than promising a powered HOLD the child cannot yet acknowledge.
+        with _OperatorTerminal(actuator, stop_action="release") as terminal:
+            LOGGER.warning(
+                "ZERO-STATE TRANSITION IN PROGRESS: press s or q (no Enter) to cancel "
+                "and start orderly authority release; powered HOLD is unavailable until "
+                "initialization completes"
+            )
             _run_interruptible(
                 terminal,
                 actuator.start,
@@ -255,7 +263,7 @@ def run(args: argparse.Namespace) -> None:
             LOGGER.warning(
                 "Zero state target is being held. The commanded target is exact; measured "
                 "joints remain subject to the actuator's configured convergence tolerances. "
-                "Press q to release."
+                "Press s or q to release."
             )
             _hold_until_release(actuator, terminal)
     finally:
@@ -264,7 +272,7 @@ def run(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Slowly command training episode 0 frame 0 and hold until q releases authority",
+        description="Slowly command training episode 0 frame 0 and hold until s/q releases authority",
     )
     parser.add_argument(
         "--network-interface",
