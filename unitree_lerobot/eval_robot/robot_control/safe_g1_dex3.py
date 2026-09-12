@@ -1370,8 +1370,9 @@ def build_initialization_chunk(
         )
 
     if profile.name != "dex3":
-        # This path is reachable only from the internal Warmup2 transition,
-        # after a same-profile policy chunk passed hard range validation.
+        # This path is used by the explicit profile XR-home and by the internal
+        # Warmup2 transition after a same-profile policy chunk passed hard
+        # range validation. Both share the final Inspire writer's step ceiling.
         assert spec.arm is not None and spec.left_hand is not None and spec.right_hand is not None
         assert profile.conditioned_step is not None
         targets = (
@@ -1409,7 +1410,7 @@ def build_initialization_chunk(
         duration_s = steps / PUBLISH_HZ
         if duration_s > INITIALIZATION_MAX_DURATION_S:
             raise DeploymentError(
-                f"Inspire DFX Warmup2 path needs {duration_s:.1f}s; "
+                f"Inspire DFX initialization/Warmup2 path needs {duration_s:.1f}s; "
                 f"INITIALIZATION_MAX_DURATION_S={INITIALIZATION_MAX_DURATION_S:.1f}s"
             )
         chunk = ActionChunk(

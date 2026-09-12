@@ -630,14 +630,15 @@ def _take_initial_voice_command(
 
 def validate_args(args: argparse.Namespace) -> None:
     end_effector = getattr(args, "end_effector", "dex3")
+    initialization = getattr(args, "initialization", "measured")
     if end_effector not in {"dex3", "inspire-dfx"}:
         raise DeploymentError("--end-effector must be dex3 or inspire-dfx")
     if end_effector == "inspire-dfx":
         if args.sim:
             raise DeploymentError("Inspire DFX simulation is not qualified in this guarded client")
-        if getattr(args, "initialization", "measured") != "measured":
+        if initialization not in {"measured", "xr-home"}:
             raise DeploymentError(
-                "Inspire DFX actuation starts from freshly measured state; use --initialization measured"
+                "Inspire DFX supports --initialization measured or the explicit fully-open xr-home"
             )
         if bool(getattr(args, "warmup1", False)):
             raise DeploymentError(
@@ -675,7 +676,6 @@ def validate_args(args: argparse.Namespace) -> None:
             "Live mode requires a loopback GR00T server. The wire protocol is not authenticated; "
             "use a shadow run for remote-server testing."
         )
-    initialization = getattr(args, "initialization", "measured")
     initial_pose_file = getattr(args, "initial_pose_file", None)
     if initialization not in INITIALIZATION_MODES:
         raise DeploymentError(f"--initialization must be one of {INITIALIZATION_MODES}")
@@ -691,6 +691,10 @@ def validate_args(args: argparse.Namespace) -> None:
     warmup1_enabled = bool(getattr(args, "warmup1", False))
     if return_to_start and not args.actuate:
         raise DeploymentError("--return-to-start requires --actuate")
+    if return_to_start and end_effector == "inspire-dfx" and initialization != "xr-home":
+        raise DeploymentError(
+            "Inspire DFX --return-to-start requires the explicit fixed --initialization xr-home target"
+        )
     if return_to_start and not warmup1_enabled and initialization == "measured":
         raise DeploymentError(
             "--return-to-start has no fixed target with --no-warmup1 and "
@@ -1243,7 +1247,10 @@ def confirm_return_to_start(
         "remain on the emergency stop."
     )
     if spec.moves_hands:
-        warning += " This target explicitly moves both Dex3 hands; verify their contents."
+        if spec.end_effector == "inspire-dfx":
+            warning += " This target opens both Inspire hands and can drop held objects; both hands must be empty."
+        else:
+            warning += " This target explicitly moves both Dex3 hands; verify their contents."
     return _confirm_goal_transition(actuator, warning, "RETURN TO START")
 
 
@@ -1297,7 +1304,16 @@ def confirm_initialization(
         "Keep the workspace clear and remain on the emergency stop."
     )
     if spec.mode == "xr-home":
-        warning += " XR-home targets all 14 arm joints and both 7-joint Dex3 hands to zero; both hands must be empty."
+        if spec.end_effector == "inspire-dfx":
+            warning += (
+                " XR-home targets all 14 arm joints to zero and all six channels of each Inspire "
+                "hand to normalized one (fully open); this can drop held objects, so both hands must be empty."
+            )
+        else:
+            warning += (
+                " XR-home targets all 14 arm joints and both 7-joint Dex3 hands to zero; "
+                "both hands must be empty."
+            )
     elif stage == "WARMUP1":
         warning += (
             " Warmup1 commands all 14 arms and both 7-joint hands from one recorded "
@@ -3117,9 +3133,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=INITIALIZATION_MODES,
         default="measured",
         help=(
-            "Pose before policy execution: preserve measured q (default), target XR's arm+hand "
-            "joint-zero home with guarded motion, or load an experimental reviewed task-bound JSON pose. "
-            "This stage runs before Warmup1"
+            "Pose before policy execution: preserve measured q (default), target the selected hand "
+            "profile's XR home with guarded motion (Dex3: zero; Inspire DFX: normalized one/fully open), "
+            "or load an experimental reviewed task-bound Dex3 JSON pose. This stage runs before Warmup1"
         ),
     )
     parser.add_argument(
@@ -3166,7 +3182,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Offer Shift+Tab in powered HOLD to repeat Warmup1 when enabled, otherwise the "
             "explicit xr-home/pose-file initialization target (default: disabled); it is "
-            "invalid with --no-warmup1 --initialization measured"
+            "invalid with --no-warmup1 --initialization measured. Inspire DFX requires xr-home"
         ),
     )
     parser.add_argument(

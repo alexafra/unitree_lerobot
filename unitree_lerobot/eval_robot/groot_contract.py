@@ -719,10 +719,30 @@ def validate_initialization_spec(
     if profile.name != "dex3":
         if spec.mode == "measured":
             return
+        if spec.mode == "xr-home":
+            if profile.home is None:
+                raise DeploymentError(f"{profile.name} has no configured XR-home hand target")
+            expected = (
+                ("arm", spec.arm, np.zeros(ARM_DOF, dtype=np.float64)),
+                ("left hand", spec.left_hand, profile.home),
+                ("right hand", spec.right_hand, profile.home),
+            )
+            for name, target, required in expected:
+                values = None if target is None else np.asarray(target)
+                if (
+                    values is None
+                    or values.shape != required.shape
+                    or values.dtype.kind not in "iuf"
+                    or not np.all(np.isfinite(values))
+                    or not np.array_equal(values, required)
+                ):
+                    semantics = "joint zero" if name == "arm" else "fully open (normalized one)"
+                    raise DeploymentError(f"Inspire DFX XR-home {name} target must be exactly {semantics}")
+            return
         if not allow_policy_warm_start or spec.mode != "pose-file":
             raise DeploymentError(
-                "Inspire DFX has no fixed initialization/home contract; only measured "
-                "initialization and the internal validated policy Warmup2 transition are accepted"
+                "Inspire DFX accepts measured initialization, its explicit XR-home, and the "
+                "internal validated policy Warmup2 transition"
             )
         if spec.arm is None or spec.left_hand is None or spec.right_hand is None:
             raise DeploymentError("Inspire DFX policy Warmup2 requires explicit arm and both-hand targets")
@@ -870,10 +890,11 @@ def load_initialization_spec(
 ) -> InitializationSpec:
     """Load one explicit initialization choice without consulting robot state.
 
-    ``xr-home`` faithfully reproduces XR startup targets: fourteen arm zeros and
-    seven zeros for each Dex3 hand.  ``pose-file`` is deliberately task-bound;
-    its hand policy is either explicit for both hands or preserves both measured
-    hand poses.
+    ``xr-home`` faithfully reproduces the profile's XR startup targets: fourteen
+    arm zeros and either seven zeros per Dex3 hand or six normalized ones (fully
+    open) per Inspire DFX hand. ``pose-file`` is deliberately task-bound and is
+    available only for the qualified Dex3 contract; its hand policy is either
+    explicit for both hands or preserves both measured hand poses.
     """
 
     profile = _end_effector_profile(end_effector)
@@ -883,9 +904,9 @@ def load_initialization_spec(
         raise DeploymentError("Pose-file initialization requires one of the exact trained tasks")
     if mode != "pose-file" and pose_file is not None:
         raise DeploymentError("--initial-pose-file is valid only with --initialization pose-file")
-    if profile.name != "dex3" and mode != "measured":
+    if profile.name != "dex3" and mode == "pose-file":
         raise DeploymentError(
-            "Inspire DFX has no qualified live initialization/home contract; use --initialization measured"
+            "Inspire DFX public pose-file initialization is not qualified; use measured or xr-home"
         )
 
     if mode == "measured":
@@ -898,12 +919,18 @@ def load_initialization_spec(
             end_effector=profile.name,
         )
     if mode == "xr-home":
+        if profile.home is None:
+            raise DeploymentError(f"{profile.name} has no configured XR-home hand target")
         spec = InitializationSpec(
             mode=mode,
-            label="XR joint-zero home (arms and both hands)",
+            label=(
+                "XR joint-zero home (arms and both Dex3 hands)"
+                if profile.name == "dex3"
+                else "XR home (zero arms; both Inspire DFX hands fully open)"
+            ),
             arm=np.zeros(ARM_DOF, dtype=np.float64),
-            left_hand=np.zeros(HAND_DOF, dtype=np.float64),
-            right_hand=np.zeros(HAND_DOF, dtype=np.float64),
+            left_hand=np.array(profile.home, dtype=np.float64, copy=True),
+            right_hand=np.array(profile.home, dtype=np.float64, copy=True),
             end_effector=profile.name,
         )
         validate_initialization_spec(spec)

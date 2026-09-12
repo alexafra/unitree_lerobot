@@ -63,11 +63,11 @@ cd /home/alex/Development/unitree_lerobot
   --policy-port 5555 \
   --image-host 192.168.123.164 \
   --network-interface enp132s0 \
-  --initialization measured \
+  --initialization xr-home \
   --no-warmup1 \
   --warmup2 \
   --future-goal-warmup2 \
-  --no-return-to-start \
+  --return-to-start \
   --gravity-feedforward \
   --inference-mode rtc \
   --execution-horizon 8 \
@@ -93,10 +93,16 @@ laboratory choices, not manufacturer-qualified limits or safety certification.
    `g1_body29_hand14.urdf` used by Inspire teleop. The unchanged hand command is
    refreshed throughout ramp and settle so DFX's roughly one-second lease does
    not expire.
-6. Measured initialization adds no home motion. Warmup1 is disabled because no
-   reviewed 26D training-frame home exists. At RUN and WARMUP2, `r` advances
-   after inspection. Warmup2 reaches only target zero of a fresh policy chunk,
-   discards it, then resets and re-observes for ordinary execution.
+6. The command above explicitly selects XR-home, preserving the original Inspire
+   teleop startup pose: all 14 arm targets are zero and all six normalized
+   channels of each hand are one (fully open). The guarded client interpolates
+   to it instead of issuing a discontinuous startup command. It can drop an
+   object, so both hands must be empty. `--initialization measured` remains the
+   default no-home-motion alternative.
+7. Warmup1 is disabled because there is no reviewed 26D training-frame home. At
+   INITIALIZE, RUN, and WARMUP2, `r` advances after inspection. Warmup2 reaches
+   only target zero of a fresh policy chunk, discards it, then resets and
+   re-observes for ordinary execution.
 
 The gravity model provides teleop parity, not an Inspire-specific payload
 identification. `--no-gravity-feedforward` remains available for a separately
@@ -148,8 +154,12 @@ and DDS write success. Arm tracking remains hard-gated by the existing client.
 - During active motion or HOLD, `q` starts orderly release and exit. `Ctrl-C`
   uses the same cleanup path.
 
-Return-to-Start is unavailable with measured initialization and no Warmup1
-because there is intentionally no fixed Inspire home target.
+For Inspire DFX, Return-to-Start is offered only when the run explicitly selects
+`--initialization xr-home --return-to-start`. Shift+Tab from powered HOLD asks
+for a fresh `r` confirmation, then follows the same bounded path back to zero
+arms and fully open hands. It does not repeat authority acquisition or Warmup1;
+the next goal follows the ordinary Warmup2 gate. Return-to-Start remains rejected
+with measured initialization because that mode deliberately has no fixed target.
 
 ### Lease-only hand release
 

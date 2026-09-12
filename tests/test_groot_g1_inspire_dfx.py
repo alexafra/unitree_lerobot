@@ -25,8 +25,10 @@ from unitree_lerobot.eval_robot.groot_contract import (
     EXPECTED_EGO_VIEW_SHAPE,
     InitializationSpec,
     TASKS,
+    load_initialization_spec,
     make_observation,
     parse_action_plan,
+    validate_initialization_spec,
     validate_model_contract,
     validate_policy_metadata,
 )
@@ -129,7 +131,9 @@ def _profiles_are_exact_immutable_and_dex3_remains_default() -> None:
     assert len(INSPIRE_DFX_PROFILE.joint_names) == 12
     assert INSPIRE_DFX_PROFILE.max_step is None
     np.testing.assert_array_equal(INSPIRE_DFX_PROFILE.conditioned_step, np.full(6, 0.2))
+    np.testing.assert_array_equal(INSPIRE_DFX_PROFILE.home, np.ones(6))
     assert not INSPIRE_DFX_PROFILE.left_lower.flags.writeable
+    assert not INSPIRE_DFX_PROFILE.home.flags.writeable
     with _CASE.assertRaises(ValueError):
         INSPIRE_DFX_PROFILE.left_lower[0] = -1.0
     assert "Unitree_G1_Inspire_HeadOnly" in ROBOT_CONFIGS
@@ -225,10 +229,80 @@ def _inspire_live_cli_requires_the_exact_authorized_gates() -> None:
             "--network-interface",
             "eth-test",
             "--allow-unqualified-real",
+            "--return-to-start",
         ]
     )
-    with _CASE.assertRaisesRegex(DeploymentError, "freshly measured state"):
-        validate_args(fixed_home)
+    validate_args(fixed_home)
+
+    measured_return = parser.parse_args(
+        [
+            "--task",
+            "pick-red-cup",
+            "--end-effector",
+            "inspire-dfx",
+            "--no-warmup1",
+            "--actuate",
+            "--network-interface",
+            "eth-test",
+            "--allow-unqualified-real",
+            "--return-to-start",
+        ]
+    )
+    with _CASE.assertRaisesRegex(DeploymentError, "requires the explicit fixed --initialization xr-home"):
+        validate_args(measured_return)
+
+
+def _xr_home_is_profile_aware_and_inspire_opens_both_hands_with_a_bounded_path() -> None:
+    dex3 = load_initialization_spec(
+        "xr-home",
+        task_name="pick-red-cup",
+        end_effector="dex3",
+    )
+    np.testing.assert_array_equal(dex3.arm, np.zeros(14))
+    np.testing.assert_array_equal(dex3.left_hand, np.zeros(7))
+    np.testing.assert_array_equal(dex3.right_hand, np.zeros(7))
+
+    inspire = load_initialization_spec(
+        "xr-home",
+        task_name="pick-red-cup",
+        end_effector="inspire-dfx",
+    )
+    assert inspire.end_effector == "inspire-dfx"
+    assert "fully open" in inspire.label
+    np.testing.assert_array_equal(inspire.arm, np.zeros(14))
+    np.testing.assert_array_equal(inspire.left_hand, np.ones(6))
+    np.testing.assert_array_equal(inspire.right_hand, np.ones(6))
+    assert inspire.left_hand is not INSPIRE_DFX_PROFILE.home
+    assert inspire.right_hand is not INSPIRE_DFX_PROFILE.home
+
+    state = RobotState(
+        captured_at=1.0,
+        mode_machine=6,
+        arm=np.full(14, 0.1),
+        arm_dq=np.zeros(14),
+        left_hand=np.full(6, 0.1),
+        right_hand=np.full(6, 0.3),
+    )
+    path = build_initialization_chunk(state, inspire)
+    assert path.end_effector == "inspire-dfx"
+    np.testing.assert_array_equal(path.arm[-1], np.zeros(14))
+    np.testing.assert_array_equal(path.left_hand[-1], np.ones(6))
+    np.testing.assert_array_equal(path.right_hand[-1], np.ones(6))
+    left_steps = np.diff(np.vstack((state.left_hand, path.left_hand)), axis=0)
+    right_steps = np.diff(np.vstack((state.right_hand, path.right_hand)), axis=0)
+    assert float(np.max(np.abs(left_steps))) <= INSPIRE_DFX_COMMAND_MAX_STEP + 1e-12
+    assert float(np.max(np.abs(right_steps))) <= INSPIRE_DFX_COMMAND_MAX_STEP + 1e-12
+
+    wrong_home = InitializationSpec(
+        mode="xr-home",
+        label="wrong Inspire home",
+        arm=np.zeros(14),
+        left_hand=np.zeros(6),
+        right_hand=np.zeros(6),
+        end_effector="inspire-dfx",
+    )
+    with _CASE.assertRaisesRegex(DeploymentError, r"fully open \(normalized one\)"):
+        validate_initialization_spec(wrong_home)
 
 
 def _inspire_metadata_requires_native_26d_shapes_and_layouts() -> None:
@@ -1061,6 +1135,9 @@ def _actuator_profile_identity_is_passed_to_child_and_mismatch_fails_before_queu
 class InspireDfxShadowTests(unittest.TestCase):
     test_profiles = staticmethod(_profiles_are_exact_immutable_and_dex3_remains_default)
     test_cli_gates = staticmethod(_inspire_live_cli_requires_the_exact_authorized_gates)
+    test_profile_aware_xr_home = staticmethod(
+        _xr_home_is_profile_aware_and_inspire_opens_both_hands_with_a_bounded_path
+    )
     test_metadata = staticmethod(_inspire_metadata_requires_native_26d_shapes_and_layouts)
     test_native_shapes = staticmethod(_inspire_native_six_dof_observation_and_action_contract)
     test_pre_dds_mismatch = staticmethod(_inspire_checkpoint_mismatch_stops_before_dds_initialization)

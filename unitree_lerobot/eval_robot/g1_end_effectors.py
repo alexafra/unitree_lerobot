@@ -181,9 +181,11 @@ INSPIRE_DFX_PROFILE = EndEffectorProfile(
     left_upper=np.ones(6, dtype=np.float64),
     right_lower=np.zeros(6, dtype=np.float64),
     right_upper=np.ones(6, dtype=np.float64),
-    # Inspire DFX uses 0=closed and 1=open. Live operation deliberately starts
-    # from freshly measured q; no fixed home pose is implied by this profile.
-    home=None,
+    # This is the exact hand target used by the original XR teleop startup:
+    # Inspire DFX uses 0=closed and 1=open, so its XR home is fully open. The
+    # guarded client still defaults to measured initialization; this target is
+    # used only when the operator explicitly selects ``--initialization xr-home``.
+    home=np.ones(6, dtype=np.float64),
     value_unit="normalized_open_fraction",
     transport="inspire-dfx",
     limit_tolerance=0.0,
