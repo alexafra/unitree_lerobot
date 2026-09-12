@@ -104,6 +104,11 @@ def _inspire_metadata() -> dict:
     return {
         "protocol_version": 1,
         "embodiment_tag": "new_embodiment",
+        "task_contract": {
+            "schema_version": 1,
+            "instructions": ["pick up the red cup.", "put down the red cup."],
+            "sha256": "1dc8e65b8210cd017ad48081d860208805ad4638785496059eef743fd1d633e7",
+        },
         "action_output_contract": EXPECTED_ACTION_OUTPUT_CONTRACT,
         "dataset_contract": {
             "robot_type": profile.robot_type,

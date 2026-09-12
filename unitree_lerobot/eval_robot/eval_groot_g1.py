@@ -2781,6 +2781,7 @@ def run(args: argparse.Namespace) -> None:
         visual_encoding = validate_policy_metadata(
             policy_metadata,
             end_effector=end_effector,
+            instruction=instruction,
             requires_depth=requires_depth_gray,
             requires_surface_normals=requires_surface_normals,
             vision_input_contract=getattr(contract, "vision_input_contract", None),  # earlyfusion
@@ -3131,6 +3132,15 @@ def run(args: argparse.Namespace) -> None:
                     selector_kwargs["confirm_voice_text"] = bool(getattr(args, "confirm_text", False))
                 next_goal = _select_next_goal_while_holding(actuator, **selector_kwargs)
                 custom_goal_mode = mode_state["custom_goal_mode"]
+                if isinstance(next_goal, tuple):
+                    validate_policy_metadata(
+                        policy_metadata,
+                        end_effector=end_effector,
+                        instruction=next_goal[1],
+                        requires_depth=requires_depth_gray,
+                        requires_surface_normals=requires_surface_normals,
+                        vision_input_contract=getattr(contract, "vision_input_contract", None),
+                    )
                 if next_goal is not None:
                     acknowledge = getattr(actuator, "acknowledge_hand_operator_hold", None)
                     if callable(acknowledge):

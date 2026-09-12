@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,7 @@ EXPECTED_ACTION_OUTPUT_CONTRACT = {
     "use_relative_action": True,
     "relative_keys_decoded_to_absolute": ["left_arm", "right_arm"],
 }
+TASK_CONTRACT_SCHEMA_VERSION = 1
 EXPECTED_JOINT_NAMES = [
     "kLeftShoulderPitch",
     "kLeftShoulderRoll",
@@ -226,6 +228,70 @@ class SurfaceNormalEncodingContract:
     max_neighbor_depth_delta_m: float
 
 
+def _task_contract_sha256(instructions: list[str]) -> str:
+    canonical = json.dumps(
+        {
+            "schema_version": TASK_CONTRACT_SCHEMA_VERSION,
+            "instructions": instructions,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def validate_policy_instruction(metadata: dict[str, Any], instruction: str) -> tuple[str, ...]:
+    """Require an exact instruction advertised by the checkpoint-bound dataset."""
+
+    contract = metadata.get("task_contract")
+    if not isinstance(contract, dict):
+        raise DeploymentError(
+            "GR00T server has no checkpoint task contract; restart it with "
+            "--deployment-dataset-path using the task-contract-capable server"
+        )
+    schema_version = contract.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != TASK_CONTRACT_SCHEMA_VERSION
+    ):
+        raise DeploymentError(
+            f"Unsupported GR00T task contract schema {schema_version!r}; "
+            f"expected {TASK_CONTRACT_SCHEMA_VERSION}"
+        )
+    instructions = contract.get("instructions")
+    if (
+        not isinstance(instructions, list)
+        or not instructions
+        or any(
+            not isinstance(value, str)
+            or not value
+            or len(value) > 256
+            or any(ord(character) < 32 for character in value)
+            for value in instructions
+        )
+        or len(set(instructions)) != len(instructions)
+    ):
+        raise DeploymentError(
+            "GR00T checkpoint task contract must contain unique 1..256 character "
+            "printable instruction strings"
+        )
+    advertised_hash = contract.get("sha256")
+    expected_hash = _task_contract_sha256(instructions)
+    if advertised_hash != expected_hash:
+        raise DeploymentError(
+            "GR00T checkpoint task contract SHA-256 mismatch: "
+            f"got {advertised_hash!r}, expected {expected_hash!r}"
+        )
+    if instruction not in instructions:
+        raise DeploymentError(
+            f"Instruction {instruction!r} is not advertised by this checkpoint; "
+            f"allowed instructions are {instructions!r}"
+        )
+    return tuple(instructions)
+
+
 def _vision_input_contract(video_keys: tuple[str, ...], fusion: Any = None) -> dict[str, Any]:  # earlyfusion
     layout = ["ego_view:0", "ego_view:1", "ego_view:2"]  # earlyfusion
     if fusion is not None:  # earlyfusion
@@ -357,6 +423,7 @@ def validate_policy_metadata(
     metadata: dict[str, Any],
     *,
     end_effector: str = "dex3",
+    instruction: str | None = None,
     requires_depth: bool = False,
     requires_surface_normals: bool = False,
     vision_input_contract: dict[str, Any] | None = None,  # earlyfusion
@@ -369,6 +436,8 @@ def validate_policy_metadata(
             f"This G1/{profile.name} adapter requires GR00T training tag "
             f"'{EXPECTED_TRAINING_TAG}', got {metadata.get('embodiment_tag')!r}"
         )
+    if instruction is not None:
+        validate_policy_instruction(metadata, instruction)
     contract = metadata.get("dataset_contract")
     if not isinstance(contract, dict):
         raise DeploymentError(

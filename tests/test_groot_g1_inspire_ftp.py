@@ -96,6 +96,11 @@ def _metadata(*, protocol: str = "ftp") -> dict:
     return {
         "protocol_version": 1,
         "embodiment_tag": "new_embodiment",
+        "task_contract": {
+            "schema_version": 1,
+            "instructions": ["pick up the red cup.", "put down the red cup."],
+            "sha256": "1dc8e65b8210cd017ad48081d860208805ad4638785496059eef743fd1d633e7",
+        },
         "vision_input_contract": {
             "version": 1,
             "mode": "separate_views",
