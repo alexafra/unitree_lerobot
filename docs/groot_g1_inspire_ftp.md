@@ -105,15 +105,19 @@ Both acknowledgement flags and the interactive `r` confirmation are required.
 closure is not a verified hand stop.
 
 Arming samples both hands independently and reseeds the first command from the
-final fresh measured state. The first hand target is sent only after the first
-matched-pose arm command succeeds. Each final hand write is limited to 0.2 in
-normalized units by both the XR conditioner and the writer. This is a locally
-chosen discontinuity backstop, not a manufacturer speed/acceleration limit.
+final fresh DDS-received state. The first hand target is submitted only after
+the first matched-pose arm command succeeds. Each final hand write is limited
+to 0.2 in normalized units by both the XR conditioner and the writer. This is a
+locally chosen discontinuity backstop, not a manufacturer speed/acceleration
+limit.
 
 FTP left and right writes are separate and therefore non-atomic. Both targets
-are validated before either message is sent; accepted-command history is then
-recorded independently. If left succeeds and right fails, cleanup records that
-as a partial write and does not invent or refresh a right-hand target.
+are validated before either message is sent; successful-DDS-Write history is
+then recorded independently. If the left Write returns success and the right
+Write fails, cleanup records that as a partial write and does not invent or
+refresh a right-hand target. A successful DDS Write means only that the local
+middleware call returned `True`; it is not an acknowledgement from the bridge
+or physical hand.
 
 `xr-home` preserves the original explicit Inspire startup convention: arm
 targets are all zero and both hands are all one (fully open). The move follows a
@@ -129,15 +133,37 @@ motion even if the other continues. Recovery requires newer paired samples and
 the existing bounded recovery gate. The client validates exact six-value
 `angle_act` shape, finiteness and the 0..1000 wire range before normalizing.
 
+The FTP state IDL contains no device-read timestamp, sequence number, or lost
+counter. Consequently, “fresh” here means a recent valid DDS callback. The
+client cannot distinguish a genuinely new physical hand read from a bridge
+repeatedly publishing a cached valid `angle_act` sample. Unchanged values also
+cannot be rejected because a stationary hand legitimately repeats them. Verify
+the reviewed bridge is healthy before actuation; DDS receipt freshness alone is
+not proof of a new device read, command execution, or hand convergence.
+
 No FTP command-expiry behavior, motor-stop command, or stop acknowledgement has
 been qualified in this client. On `q`, Ctrl-C, normal completion, or a fault,
 the client ramps arm authority to zero first and then closes both FTP command
 publishers without sending a cleanup hand target. Closing publishers must not
-be interpreted as a hand stop; conservatively treat any last accepted hand
-setpoint as still active. The run log records whether neither, one, or both hand
-commands had ever been accepted. The physical emergency stop remains the
+be interpreted as a hand stop; conservatively treat any hand setpoint from a
+successful DDS Write as potentially still active. The run log records whether
+neither, one, or both per-side DDS Writes ever completed; it does not report
+bridge or device acceptance. The physical emergency stop remains the
 authoritative stop mechanism.
 
-The normal keys are unchanged: `r` advances a displayed motion/authority gate,
-`s` enters powered HOLD during policy motion, and `q` performs orderly arm
-release followed by publisher closure.
+There is no qualified Inspire hand tracking-error threshold. Initialization,
+Warmup2, and Return-to-Start completion therefore means the arm endpoint and
+stability dwell passed while valid hand DDS callbacks continued and the hand
+target was submitted; it does **not** mean the hands were observed to reach the
+target. After initialization and Warmup2, the existing `r` gate explicitly
+requires visual confirmation of both hands. Return-to-Start has an additional
+post-motion `r` gate for the same check. Press `s` at a post-motion gate if
+either hand did not reach the displayed target; press `q` to release authority.
+
+At each displayed gate, `r` advances, `s` stays in or enters powered HOLD, and
+`q` starts orderly release. During the subsequent blocking startup,
+initialization, Warmup2, or Return-to-Start motion, `s` and `q` both cancel by
+starting orderly release: the client cannot service the powered-HOLD barrier
+until that blocking transition returns. During active policy motion, `s`
+instead discards timed work and enters powered HOLD. These software keys do not
+replace the physical emergency stop.

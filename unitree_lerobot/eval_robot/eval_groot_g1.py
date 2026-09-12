@@ -807,13 +807,17 @@ def confirm_actuation(
                 "WARNING: Inspire DFX has no motor-stop command or acknowledgement. On release, "
                 "the client first ramps arm authority down, then stops hand writes and relies on "
                 "the DFX command lease expiring. The 0.2 normalized hand slew and existing "
-                "g1_body29_hand14 gravity model are explicitly unqualified lab choices."
+                "g1_body29_hand14 gravity model are explicitly unqualified lab choices. There is "
+                "no qualified hand tracking-error threshold, so each post-motion hand check is visual."
             )
         elif end_effector == "inspire-ftp":
             print(
                 "WARNING: Inspire RH56E2/FTP has separate non-atomic left/right commands and no "
                 "verified command expiry, motor stop, or stop acknowledgement. Closing the client "
-                "must be treated as leaving its last hand setpoint active. The 0.2 normalized hand slew and existing "
+                "must be treated as leaving its last hand setpoint active. A successful DDS Write is "
+                "not bridge/device acknowledgement, and fresh DDS callbacks cannot exclude a bridge "
+                "republishing cached angle_act. There is no qualified hand tracking-error threshold, "
+                "so each post-motion hand check is visual. The 0.2 normalized hand slew and existing "
                 "g1_body29_hand14 gravity model are explicitly unqualified lab choices."
             )
         else:
@@ -1311,10 +1315,38 @@ def confirm_return_to_start(
     )
     if spec.moves_hands:
         if spec.end_effector != "dex3":
-            warning += " This target opens both Inspire hands and can drop held objects; both hands must be empty."
+            warning += (
+                " This target opens both Inspire hands and can drop held objects; both hands must be empty. "
+                "After the move, a second r gate requires visual confirmation because Inspire hand "
+                "convergence is not software-verified."
+            )
         else:
             warning += " This target explicitly moves both Dex3 hands; verify their contents."
     return _confirm_goal_transition(actuator, warning, "RETURN TO START")
+
+
+def _hand_convergence_is_software_verified(end_effector: str) -> bool:
+    """Return whether endpoint completion includes a qualified hand-error gate."""
+
+    return get_end_effector_profile(end_effector).tracking_hard is not None
+
+
+def confirm_return_to_start_complete(
+    actuator: SafeG1Dex3Actuator,
+    spec: InitializationSpec,
+) -> str:
+    """Require the missing post-motion visual check for untracked Inspire hands."""
+
+    if _hand_convergence_is_software_verified(spec.end_effector):
+        return "continue"
+    return _confirm_goal_transition(
+        actuator,
+        f"\nReturn-to-Start arm target {spec.label!r} converged. The Inspire hand target was "
+        "submitted to DDS, but hand convergence is not software-verified. Visually confirm "
+        "both hands reached the intended target before pressing r. Press s if either hand "
+        "did not reach it.",
+        "CONFIRM RETURN-TO-START VISUAL CHECK",
+    )
 
 
 def _run_return_to_start_from_hold(
@@ -1346,11 +1378,19 @@ def _run_return_to_start_from_hold(
         actuator,
         lambda: actuator.warmup_pose(spec),
     )
+    if _hand_convergence_is_software_verified(spec.end_effector):
+        LOGGER.warning(
+            "Returned to startup target %r; remaining in powered HOLD",
+            spec.label,
+        )
+        return "continue"
     LOGGER.warning(
-        "Returned to startup target %r; remaining in powered HOLD",
+        "Return-to-Start arm convergence verified for %r; Inspire hand target was submitted "
+        "to DDS, but hand convergence is not software-verified; remaining in powered HOLD "
+        "pending explicit visual confirmation",
         spec.label,
     )
-    return "continue"
+    return confirm_return_to_start_complete(actuator, spec)
 
 
 def confirm_initialization(
@@ -1394,10 +1434,21 @@ def confirm_initialization(
 
 
 def confirm_policy_start(actuator: SafeG1Dex3Actuator, spec: InitializationSpec) -> None:
+    if _hand_convergence_is_software_verified(spec.end_effector):
+        message = (
+            f"\nStartup pose {spec.label!r} converged. Visually verify robot and scene state. "
+            "The discarded preflight will not be reused; RUN starts with policy reset and a fresh observation."
+        )
+    else:
+        message = (
+            f"\nStartup arm pose {spec.label!r} converged. The Inspire hand target was submitted "
+            "to DDS, but hand convergence is not software-verified. Visually confirm both hands "
+            "reached the intended target before pressing r to RUN. The discarded preflight will "
+            "not be reused; RUN starts with policy reset and a fresh observation."
+        )
     _confirm_while_armed(
         actuator,
-        f"\nStartup pose {spec.label!r} converged. Visually verify robot and scene state. "
-        "The discarded preflight will not be reused; RUN starts with policy reset and a fresh observation.",
+        message,
         "RUN",
     )
 
@@ -1446,11 +1497,25 @@ def confirm_policy_warm_start(actuator: SafeG1Dex3Actuator, delta_summary: str) 
     )
 
 
-def confirm_policy_continue(actuator: SafeG1Dex3Actuator) -> str:
+def confirm_policy_continue(
+    actuator: SafeG1Dex3Actuator,
+    end_effector: str = "dex3",
+) -> str:
+    if _hand_convergence_is_software_verified(end_effector):
+        message = (
+            "\nWarmup2 converged. Visually verify the robot and scene. CONTINUE resets "
+            "GR00T, captures a fresh observation, and restores normal action-step limits."
+        )
+    else:
+        message = (
+            "\nWarmup2 arm target converged. The Inspire hand target was submitted to DDS, "
+            "but hand convergence is not software-verified. Visually confirm both hands reached "
+            "the intended target before pressing r to CONTINUE. CONTINUE resets GR00T, captures "
+            "a fresh observation, and restores normal action-step limits."
+        )
     return _confirm_goal_transition(
         actuator,
-        "\nWarmup2 converged. Visually verify the robot and scene. CONTINUE resets "
-        "GR00T, captures a fresh observation, and restores normal action-step limits.",
+        message,
         "CONTINUE",
     )
 
@@ -1815,8 +1880,15 @@ def _prepare_policy_goal(
             allow_custom_instruction=allow_custom_instruction,
             warmup2_enabled=warmup2_enabled,
         )
-    LOGGER.warning("Warmup2 reached target 0; the inferred chunk was discarded")
-    decision = confirm_policy_continue(actuator)
+    warmup_end_effector = getattr(contract, "end_effector", "dex3")
+    if _hand_convergence_is_software_verified(warmup_end_effector):
+        LOGGER.warning("Warmup2 reached target 0; the inferred chunk was discarded")
+    else:
+        LOGGER.warning(
+            "Warmup2 arm convergence verified at target 0; Inspire hand target 0 was submitted "
+            "to DDS, but hand convergence is not software-verified; the inferred chunk was discarded"
+        )
+    decision = confirm_policy_continue(actuator, warmup_end_effector)
     if decision in {"hold", "release"}:
         return decision
     try:
@@ -2947,7 +3019,14 @@ def run(args: argparse.Namespace) -> None:
             actuator,
             lambda: actuator.initialize(configured_initialization),
         )
-        LOGGER.warning("Initialization completed: %s", configured_initialization.label)
+        if _hand_convergence_is_software_verified(configured_initialization.end_effector):
+            LOGGER.warning("Initialization completed: %s", configured_initialization.label)
+        else:
+            LOGGER.warning(
+                "Initialization arm convergence verified: %s; Inspire hand target was submitted "
+                "to DDS, but hand convergence is not software-verified",
+                configured_initialization.label,
+            )
         if warmup1_enabled:
             assert warmup1 is not None
             confirm_initialization(actuator, warmup1, stage="WARMUP1")

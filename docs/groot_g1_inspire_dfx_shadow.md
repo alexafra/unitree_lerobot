@@ -100,9 +100,13 @@ laboratory choices, not manufacturer-qualified limits or safety certification.
    object, so both hands must be empty. `--initialization measured` remains the
    default no-home-motion alternative.
 7. Warmup1 is disabled because there is no reviewed 26D training-frame home. At
-   INITIALIZE, RUN, and WARMUP2, `r` advances after inspection. Warmup2 reaches
-   only target zero of a fresh policy chunk, discards it, then resets and
-   re-observes for ordinary execution.
+   INITIALIZE, RUN, and WARMUP2, `r` advances after inspection. Because no
+   qualified Inspire hand tracking-error threshold exists, endpoint completion
+   verifies arm convergence only: the hand target was submitted, but hand
+   convergence is not software-verified. Visually confirm both hands at RUN and
+   CONTINUE. Return-to-Start adds a post-motion `r` visual-confirmation gate.
+   Warmup2 moves only toward target zero of a fresh policy chunk, discards it,
+   then resets and re-observes for ordinary execution.
 
 The gravity model provides teleop parity, not an Inspire-specific payload
 identification. `--no-gravity-feedforward` remains available for a separately
@@ -113,8 +117,8 @@ supervised zero-torque comparison.
 Raw 30 Hz policy targets may span `[0, 1]`. The 100 Hz XR conditioner limits
 each final finger command to at most `0.2` normalized units from the last
 command. The writer independently applies the same check against the last
-command DDS accepted, and validates both hands before mutating or sending the
-combined message.
+successful DDS Write, and validates both hands before mutating or sending the
+combined message. DDS Write success is not a physical-hand acknowledgement.
 
 This is a per-write discontinuity backstop, not a speed or acceleration rating:
 repeated 100 Hz writes can traverse more than 0.2 per second. It is derived from
@@ -149,8 +153,9 @@ and DDS write success. Arm tracking remains hard-gated by the existing client.
   position HOLD at the last commanded arm/hand targets. It is not a passive
   brake and can continue exerting force. A newly selected goal is freshly
   inferred; initialization and Warmup1 are not repeated.
-- During guarded initialization/Warmup2 interpolation, `q` is the immediate
-  orderly-abort key; `s` is deliberately not a mid-interpolation pause.
+- During blocking startup, initialization, Warmup2, or Return-to-Start motion,
+  `s` and `q` both cancel via orderly release. A powered-HOLD barrier cannot be
+  serviced until the blocking transition returns.
 - During active motion or HOLD, `q` starts orderly release and exit. `Ctrl-C`
   uses the same cleanup path.
 

@@ -9,7 +9,10 @@ import numpy as np
 import pytest
 
 from unitree_lerobot.eval_robot.eval_groot_g1 import (
+    _run_return_to_start_from_hold,
     build_parser,
+    confirm_policy_continue,
+    confirm_policy_start,
     resolve_runtime_end_effector,
     run,
     validate_args,
@@ -215,6 +218,7 @@ def test_ftp_profile_contract_and_explicit_live_gate():
     assert resolve_runtime_end_effector("dex3", True) == "dex3"
     assert INSPIRE_DFX_PROFILE.supports_simulation
     assert not INSPIRE_FTP_PROFILE.supports_simulation
+    assert not INSPIRE_FTP_PROFILE.uses_lost_counters
     validate_policy_metadata(_metadata(), end_effector="inspire-ftp")
     with pytest.raises(DeploymentError, match="end_effector"):
         validate_policy_metadata(_metadata(protocol="dfx"), end_effector="inspire-ftp")
@@ -471,6 +475,66 @@ def test_ftp_state_uses_independent_topics_and_normalizes_angle_codes():
     assert all(subscriber.closed for subscriber in FakeSubscriber.instances.values())
 
 
+def test_ftp_completion_prompts_require_visual_hand_confirmation():
+    module = "unitree_lerobot.eval_robot.eval_groot_g1"
+    spec = load_initialization_spec(
+        "xr-home",
+        task_name="pick-red-cup",
+        end_effector="inspire-ftp",
+    )
+    actuator = SimpleNamespace(end_effector="inspire-ftp")
+
+    with mock.patch(f"{module}._confirm_while_armed") as confirm:
+        confirm_policy_start(actuator, spec)
+    startup_message = confirm.call_args.args[1]
+    assert "Startup arm pose" in startup_message
+    assert "hand convergence is not software-verified" in startup_message
+    assert "Visually confirm both hands" in startup_message
+
+    with mock.patch(f"{module}._confirm_goal_transition", return_value="continue") as confirm:
+        assert confirm_policy_continue(actuator, "inspire-ftp") == "continue"
+    warmup_message = confirm.call_args.args[1]
+    assert "Warmup2 arm target converged" in warmup_message
+    assert "hand convergence is not software-verified" in warmup_message
+    assert "Visually confirm both hands" in warmup_message
+
+
+def test_ftp_return_to_start_requires_a_post_motion_visual_gate():
+    module = "unitree_lerobot.eval_robot.eval_groot_g1"
+    spec = load_initialization_spec(
+        "xr-home",
+        task_name="pick-red-cup",
+        end_effector="inspire-ftp",
+    )
+    events: list[str] = []
+    actuator = SimpleNamespace(
+        wait_for_hand_feedback=lambda: events.append("feedback"),
+        warmup_pose=lambda _spec: events.append("motion"),
+    )
+
+    def run_motion(_actuator, operation, **_kwargs):
+        operation()
+
+    def visual_gate(_actuator, message, required):
+        events.append("visual")
+        assert "arm target" in message
+        assert "hand convergence is not software-verified" in message
+        assert "Visually confirm both hands" in message
+        assert required == "CONFIRM RETURN-TO-START VISUAL CHECK"
+        return "continue"
+
+    with (
+        mock.patch(f"{module}.confirm_return_to_start", return_value="continue"),
+        mock.patch(
+            f"{module}._run_blocking_motion_with_immediate_release",
+            side_effect=run_motion,
+        ),
+        mock.patch(f"{module}._confirm_goal_transition", side_effect=visual_gate),
+    ):
+        assert _run_return_to_start_from_hold(actuator, spec) == "continue"
+    assert events == ["feedback", "motion", "visual"]
+
+
 def test_ftp_state_reader_unwinds_partial_subscriber_initialization():
     class FailingSubscriber(FakeSubscriber):
         instances: dict[str, "FailingSubscriber"] = {}
@@ -575,9 +639,9 @@ def test_ftp_backend_records_partial_history_and_cleanup_only_closes():
         "inspire_ftp_publishers_close_end",
     ]
     assert phases[-1][1]["motor_stop_acknowledged"] is False
-    assert phases[-1][1]["left_command_accepted"] is True
-    assert phases[-1][1]["right_command_accepted"] is False
-    assert phases[-1][1]["assumed_accepted_setpoint_persists"] is True
+    assert phases[-1][1]["left_dds_write_completed"] is True
+    assert phases[-1][1]["right_dds_write_completed"] is False
+    assert phases[-1][1]["assume_written_setpoint_may_persist"] is True
 
 
 def test_ftp_backend_missing_sdk_fails_before_child_dds_initialization():
@@ -610,7 +674,7 @@ def test_ftp_release_reaches_zero_arm_weight_without_hand_refresh():
     backend.simulation = False
     backend._weight = 1.0
     # Model the safety-significant partial case: only the left write was ever
-    # accepted. FTP cleanup must not synthesize or refresh either side.
+    # written through DDS. FTP cleanup must not synthesize or refresh either side.
     backend._hand_writer = SimpleNamespace(
         has_written=True,
         left_has_written=True,

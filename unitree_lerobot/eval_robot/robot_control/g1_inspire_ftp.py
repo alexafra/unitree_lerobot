@@ -8,6 +8,8 @@ the same six normalized-open fractions in ``[0, 1]`` used by teleoperation.
 Construction subscribes and creates publishers but never writes.  State
 freshness is tracked independently for the two hands, and every command is
 checked again against the teleop-derived 0.2 normalized per-write backstop.
+Successful DDS ``Write`` return values are tracked as transport completions;
+they are not bridge or physical-device acknowledgements.
 """
 
 from __future__ import annotations
@@ -151,7 +153,7 @@ class InspireFtpWriteResult:
 
 
 class InspireFtpPartialWriteError(DeploymentError):
-    """A left command was accepted before the right-hand DDS write failed."""
+    """The left DDS Write completed before the right-hand DDS Write failed."""
 
     def __init__(self, message: str, *, left_completed_at: float, left: np.ndarray) -> None:
         super().__init__(message)
@@ -242,7 +244,8 @@ class InspireFtpCommandWriter:
         message.angle_set = wire
         message.mode = 1
         # History and the next slew origin describe the exact integer command
-        # accepted on the wire, not an unrepresentable between-code target.
+        # passed to the last successful DDS Write call, not an unrepresentable
+        # between-code target. This is not a bridge/device acknowledgement.
         return np.asarray(wire, dtype=np.float64) / FTP_WIRE_SCALE
 
     @staticmethod
@@ -265,16 +268,17 @@ class InspireFtpCommandWriter:
         if self._closed:
             raise DeploymentError("Inspire FTP command writer is closed")
         candidate_left, candidate_right = self._validated_candidates(left, right)
-        accepted_left = self._prepare_message(self._left_message, candidate_left)
-        accepted_right = self._prepare_message(self._right_message, candidate_right)
+        written_left = self._prepare_message(self._left_message, candidate_left)
+        written_right = self._prepare_message(self._right_message, candidate_right)
 
         assert self._left_publisher is not None and self._right_publisher is not None
         left_completed_at = self._write_side(
             self._left_publisher, self._left_message, side="left"
         )
-        # Preserve the exact physically accepted per-side target even if the
-        # subsequent right-hand write fails.
-        self._last_left = accepted_left
+        # Preserve the exact left target whose DDS Write returned True even if
+        # the subsequent right-hand Write fails. Neither return value proves
+        # bridge receipt or physical hand execution.
+        self._last_left = written_left
         self._left_has_written = True
         try:
             right_completed_at = self._write_side(
@@ -284,15 +288,15 @@ class InspireFtpCommandWriter:
             raise InspireFtpPartialWriteError(
                 str(exc),
                 left_completed_at=left_completed_at,
-                left=accepted_left.copy(),
+                left=written_left.copy(),
             ) from exc
-        self._last_right = accepted_right
+        self._last_right = written_right
         self._right_has_written = True
         return InspireFtpWriteResult(
             left_completed_at,
             right_completed_at,
-            accepted_left.copy(),
-            accepted_right.copy(),
+            written_left.copy(),
+            written_right.copy(),
         )
 
     def _close_publishers(self, *, suppress_errors: bool) -> None:
@@ -320,7 +324,12 @@ class InspireFtpCommandWriter:
 
 
 class G1InspireFtpStateReader:
-    """Subscribe to G1 arm and independent Inspire FTP hand state topics."""
+    """Subscribe to G1 arm and independent Inspire FTP hand state topics.
+
+    The vendor state IDL has no device-read timestamp, sequence, or lost counter.
+    Hand ages therefore measure DDS callback receipt only and cannot distinguish
+    a new physical read from a bridge that republishes a cached valid sample.
+    """
 
     end_effector = "inspire-ftp"
 

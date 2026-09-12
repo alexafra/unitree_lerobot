@@ -2496,9 +2496,10 @@ class _G1Dex3CommandBackend:
                 try:
                     result = self._hand_writer.write(left_target, right_target)
                 except InspireFtpPartialWriteError as exc:
-                    # FTP is two non-atomic DDS writes. Preserve the accepted
-                    # left-side history before propagating the right-side
-                    # failure into the ordinary fail-closed release path.
+                    # FTP is two non-atomic DDS writes. Preserve the left-side
+                    # successful-Write history before propagating the right-side
+                    # failure into the ordinary fail-closed release path. A
+                    # successful DDS Write is not a bridge/device acknowledgement.
                     self._left_hand_publish_history.append(
                         PublishedHandTarget(exc.left_completed_at, exc.left)
                     )
@@ -2574,11 +2575,11 @@ class _G1Dex3CommandBackend:
         if profile.name == "inspire-ftp":
             if phase_callback is not None:
                 phase_callback("inspire_ftp_publishers_close_begin", {})
-            left_command_accepted = bool(
+            left_dds_write_completed = bool(
                 self._hand_writer is not None
                 and getattr(self._hand_writer, "left_has_written", False)
             )
-            right_command_accepted = bool(
+            right_dds_write_completed = bool(
                 self._hand_writer is not None
                 and getattr(self._hand_writer, "right_has_written", False)
             )
@@ -2592,24 +2593,25 @@ class _G1Dex3CommandBackend:
                     {
                         "elapsed_s": elapsed,
                         "motor_stop_acknowledged": False,
-                        "left_command_accepted": left_command_accepted,
-                        "right_command_accepted": right_command_accepted,
-                        "assumed_accepted_setpoint_persists": (
-                            left_command_accepted or right_command_accepted
+                        "left_dds_write_completed": left_dds_write_completed,
+                        "right_dds_write_completed": right_dds_write_completed,
+                        "assume_written_setpoint_may_persist": (
+                            left_dds_write_completed or right_dds_write_completed
                         ),
                     },
                 )
-            if left_command_accepted or right_command_accepted:
+            if left_dds_write_completed or right_dds_write_completed:
                 LOGGER.warning(
-                    "Inspire FTP publishers closed after arm authority release; accepted commands "
-                    "left=%s right=%s. No DDS expiry, motor stop, or acknowledgement is verified, "
-                    "so conservatively assume each accepted hand setpoint remains active",
-                    left_command_accepted,
-                    right_command_accepted,
+                    "Inspire FTP publishers closed after arm authority release; successful DDS "
+                    "Writes left=%s right=%s. Write success does not acknowledge bridge receipt or "
+                    "physical execution. No DDS expiry or motor stop is verified, so conservatively "
+                    "assume each written hand setpoint may remain active",
+                    left_dds_write_completed,
+                    right_dds_write_completed,
                 )
             else:
                 LOGGER.info(
-                    "Inspire FTP publishers closed without any accepted hand command; cleanup did "
+                    "Inspire FTP publishers closed without any successful hand DDS Write; cleanup did "
                     "not acquire or refresh a hand setpoint"
                 )
             return
