@@ -128,6 +128,7 @@ def _profiles_are_exact_immutable_and_dex3_remains_default() -> None:
     assert get_end_effector_profile(args.end_effector) is DEX3_PROFILE
     assert INSPIRE_DFX_PROFILE.robot_type == "Unitree_G1_Inspire_HeadOnly"
     assert INSPIRE_DFX_PROFILE.hand_dof == 6
+    assert INSPIRE_DFX_PROFILE.supports_simulation
     assert len(INSPIRE_DFX_PROFILE.joint_names) == 12
     assert INSPIRE_DFX_PROFILE.max_step is None
     np.testing.assert_array_equal(INSPIRE_DFX_PROFILE.conditioned_step, np.full(6, 0.2))
@@ -466,7 +467,7 @@ def _dfx_combined_state_uses_official_states_field_and_freezes_only_lost_side() 
 
     FakeSubscriber.instances.clear()
     with mock.patch.dict(sys.modules, fake_modules):
-        reader = G1InspireDfxStateReader(max_age_s=1.0)
+        reader = G1InspireDfxStateReader(simulation=True, max_age_s=1.0)
         arm_message = SimpleNamespace(
             mode_machine=6,
             motor_state=[SimpleNamespace(q=0.0, dq=0.0) for _ in range(14)],

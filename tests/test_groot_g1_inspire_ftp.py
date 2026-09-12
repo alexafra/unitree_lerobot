@@ -8,9 +8,15 @@ import sys
 import numpy as np
 import pytest
 
-from unitree_lerobot.eval_robot.eval_groot_g1 import build_parser, run, validate_args
+from unitree_lerobot.eval_robot.eval_groot_g1 import (
+    build_parser,
+    resolve_runtime_end_effector,
+    run,
+    validate_args,
+)
 from unitree_lerobot.eval_robot.g1_end_effectors import (
     DEX3_PROFILE,
+    INSPIRE_DFX_PROFILE,
     INSPIRE_FTP_PROFILE,
     get_end_effector_profile,
     inspire_ftp_dataset_contract,
@@ -19,6 +25,7 @@ from unitree_lerobot.eval_robot.groot_client import DeploymentError
 from unitree_lerobot.eval_robot.groot_contract import (
     ACTION_KEYS,
     ARM_JOINT_NAMES,
+    ActionChunk,
     COLOUR_VIDEO_KEYS,
     EXPECTED_ACTION_OUTPUT_CONTRACT,
     EXPECTED_EGO_VIEW_SHAPE,
@@ -203,6 +210,11 @@ def test_ftp_profile_contract_and_explicit_live_gate():
     np.testing.assert_array_equal(INSPIRE_FTP_PROFILE.conditioned_step, np.full(6, 0.2))
     np.testing.assert_array_equal(INSPIRE_FTP_PROFILE.home, np.ones(6))
     assert inspire_ftp_dataset_contract()["protocol"] == "ftp"
+    assert resolve_runtime_end_effector("inspire-ftp", True) == "inspire-dfx"
+    assert resolve_runtime_end_effector("inspire-ftp", False) == "inspire-ftp"
+    assert resolve_runtime_end_effector("dex3", True) == "dex3"
+    assert INSPIRE_DFX_PROFILE.supports_simulation
+    assert not INSPIRE_FTP_PROFILE.supports_simulation
     validate_policy_metadata(_metadata(), end_effector="inspire-ftp")
     with pytest.raises(DeploymentError, match="end_effector"):
         validate_policy_metadata(_metadata(protocol="dfx"), end_effector="inspire-ftp")
@@ -229,11 +241,84 @@ def test_ftp_profile_contract_and_explicit_live_gate():
         validate_args(live)
     live.allow_inspire_ftp_unverified_stop = True
     validate_args(live)
+    simulation = parser.parse_args(
+        [
+            "--task",
+            "pick-red-cup",
+            "--end-effector",
+            "inspire-ftp",
+            "--no-warmup1",
+            "--sim",
+            "--actuate",
+            "--confirm-sim-network-isolated",
+        ]
+    )
+    validate_args(simulation)
     wrong_profile = parser.parse_args(
         ["--task", "pick-red-cup", "--allow-inspire-ftp-unverified-stop"]
     )
     with pytest.raises(DeploymentError, match="valid only"):
         validate_args(wrong_profile)
+
+
+def test_ftp_sim_validates_ftp_metadata_then_uses_combined_dfx_runtime():
+    args = build_parser().parse_args(
+        [
+            "--task",
+            "pick-red-cup",
+            "--end-effector",
+            "inspire-ftp",
+            "--no-warmup1",
+            "--sim",
+        ]
+    )
+    policy = mock.Mock()
+    policy.ping.return_value = True
+    policy.get_modality_config.return_value = _modality_config()
+    policy.get_policy_metadata.return_value = _metadata()
+    reader = SimpleNamespace(close=mock.Mock())
+    camera = SimpleNamespace(
+        config={
+            "head_camera": {
+                "type": "Head",
+                "image_shape": [480, 640],
+                "binocular": False,
+                "fps": 30,
+            }
+        },
+        close=mock.Mock(),
+    )
+    chunk = ActionChunk(
+        arm=np.zeros((1, 14)),
+        left_hand=np.zeros((1, 6)),
+        right_hand=np.zeros((1, 6)),
+        end_effector="inspire-dfx",
+    )
+    module = "unitree_lerobot.eval_robot.eval_groot_g1"
+    with (
+        mock.patch(f"{module}.Gr00tClient", return_value=policy),
+        mock.patch(f"{module}.require_inspire_ftp_sdk") as require_ftp_sdk,
+        mock.patch(f"{module}.initialize_dds") as initialize_dds,
+        mock.patch(f"{module}.G1InspireDfxStateReader", return_value=reader) as dfx_reader,
+        mock.patch(f"{module}.G1InspireFtpStateReader") as ftp_reader,
+        mock.patch(f"{module}.TeleimagerCamera", return_value=camera),
+        mock.patch(f"{module}.infer_chunk", return_value=(chunk, 0.01)) as infer_chunk,
+        mock.patch(f"{module}.chunk_delta_summary", return_value="synthetic preflight"),
+    ):
+        run(args)
+
+    # FTP remains the checkpoint provenance gate: the real validator accepted
+    # _metadata() only because it advertises protocol=ftp. The rewritten tag is
+    # introduced afterwards and is limited to the simulator's DFX wire path.
+    assert infer_chunk.call_args.args[4].end_effector == "inspire-dfx"
+    require_ftp_sdk.assert_not_called()
+    initialize_dds.assert_called_once_with(True, None)
+    dfx_reader.assert_called_once_with(simulation=True)
+    ftp_reader.assert_not_called()
+    policy.reset.assert_called_once_with()
+    policy.close.assert_called_once_with()
+    reader.close.assert_called_once_with()
+    camera.close.assert_called_once_with()
 
 
 def test_ftp_xr_home_and_return_to_start_are_profile_aware():

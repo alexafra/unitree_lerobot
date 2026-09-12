@@ -217,7 +217,10 @@ INSPIRE_DFX_PROFILE = EndEffectorProfile(
     tracking_warning=None,
     tracking_clear=None,
     tracking_hard=None,
-    supports_simulation=False,
+    # Unitree IsaacLab exposes this exact combined DFX DDS transport for its
+    # Inspire asset. Public DFX selection remains rejected by the guarded CLI;
+    # this capability is used by the explicit FTP-in-simulation adapter.
+    supports_simulation=True,
     # This intentionally follows the existing Inspire teleop path, which uses
     # the same g1_body29_hand14 model as Dex3. It is parity, not a newly
     # identified Inspire payload model.

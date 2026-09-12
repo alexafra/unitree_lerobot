@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import os
 from pathlib import Path
@@ -632,13 +632,46 @@ def _take_initial_voice_command(
     return resolved
 
 
+def resolve_runtime_end_effector(end_effector: str, simulation: bool) -> str:
+    """Select the DDS transport without changing the checkpoint contract.
+
+    The Unitree IsaacLab Inspire model implements the combined DFX DDS topics,
+    while the physical RH56E2 policy is labelled with the split FTP transport.
+    Both profiles have the same canonical 26D action semantics.  Keep FTP as
+    the logical profile for checkpoint/metadata validation, then use DFX only
+    as the simulator transport.
+    """
+
+    if simulation and end_effector == "inspire-ftp":
+        logical = get_end_effector_profile(end_effector)
+        runtime = get_end_effector_profile("inspire-dfx")
+        scalar_fields = ("robot_type", "hand_dof", "joint_names", "value_unit")
+        vector_fields = (
+            "left_lower",
+            "left_upper",
+            "right_lower",
+            "right_upper",
+            "home",
+            "conditioned_step",
+        )
+        if any(getattr(logical, name) != getattr(runtime, name) for name in scalar_fields) or any(
+            not np.array_equal(getattr(logical, name), getattr(runtime, name))
+            for name in vector_fields
+        ):
+            raise DeploymentError(
+                "Inspire FTP and simulator DFX profiles no longer have identical action semantics"
+            )
+        return runtime.name
+    return end_effector
+
+
 def validate_args(args: argparse.Namespace) -> None:
     end_effector = getattr(args, "end_effector", "dex3")
     initialization = getattr(args, "initialization", "measured")
     if end_effector not in {"dex3", "inspire-dfx", "inspire-ftp"}:
         raise DeploymentError("--end-effector must be dex3, inspire-dfx, or inspire-ftp")
     if end_effector != "dex3":
-        if args.sim:
+        if args.sim and end_effector != "inspire-ftp":
             raise DeploymentError(f"{end_effector} simulation is not qualified in this guarded client")
         if initialization not in {"measured", "xr-home"}:
             raise DeploymentError(
@@ -2635,11 +2668,12 @@ def run(args: argparse.Namespace) -> None:
         )
         confirm_custom_goal(instruction)
     end_effector = getattr(args, "end_effector", "dex3")
+    runtime_end_effector = resolve_runtime_end_effector(end_effector, args.sim)
     configured_initialization = load_initialization_spec(
         getattr(args, "initialization", "measured"),
         task_name=task_name,
         pose_file=getattr(args, "initial_pose_file", None),
-        end_effector=end_effector,
+        end_effector=runtime_end_effector,
     )
     warmup1_enabled = bool(getattr(args, "warmup1", False))
     warmup1 = training_start_spec() if warmup1_enabled else None
@@ -2679,6 +2713,14 @@ def run(args: argparse.Namespace) -> None:
             requires_surface_normals=requires_surface_normals,
             vision_input_contract=getattr(contract, "vision_input_contract", None),  # earlyfusion
         )
+        if runtime_end_effector != end_effector:
+            LOGGER.warning(
+                "SIMULATION TRANSPORT ADAPTER: checkpoint metadata remains %s, while IsaacLab "
+                "state/commands use the compatible combined %s DDS profile",
+                end_effector,
+                runtime_end_effector,
+            )
+            contract = replace(contract, end_effector=runtime_end_effector)
         if args.execution_horizon > contract.action_horizon:
             raise DeploymentError(
                 f"Checkpoint action horizon is only {contract.action_horizon}, but "
@@ -2736,7 +2778,7 @@ def run(args: argparse.Namespace) -> None:
 
         # Missing vendor IDL/package must fail while the process is still
         # publisher-free and before ChannelFactoryInitialize changes DDS state.
-        if end_effector == "inspire-ftp":
+        if end_effector == "inspire-ftp" and not args.sim:
             require_inspire_ftp_sdk()
         initialize_dds(args.sim, args.network_interface)
         state_readers = {
@@ -2744,7 +2786,7 @@ def run(args: argparse.Namespace) -> None:
             "inspire-dfx": G1InspireDfxStateReader,
             "inspire-ftp": G1InspireFtpStateReader,
         }
-        state_reader = state_readers[end_effector](simulation=args.sim)
+        state_reader = state_readers[runtime_end_effector](simulation=args.sim)
         depth_encoding = visual_encoding if isinstance(visual_encoding, DepthEncodingContract) else None
         surface_normal_encoding = (
             visual_encoding if isinstance(visual_encoding, SurfaceNormalEncodingContract) else None
@@ -2884,8 +2926,8 @@ def run(args: argparse.Namespace) -> None:
         actuator_kwargs = {}
         if hasattr(args, "gravity_feedforward"):
             actuator_kwargs["gravity_feedforward"] = args.gravity_feedforward
-        if end_effector != "dex3":
-            actuator_kwargs["end_effector"] = end_effector
+        if runtime_end_effector != "dex3":
+            actuator_kwargs["end_effector"] = runtime_end_effector
         run_log_dir = getattr(args, "_run_log_dir", None)
         if run_log_dir is None:
             # Keep direct library callers and existing test doubles compatible.

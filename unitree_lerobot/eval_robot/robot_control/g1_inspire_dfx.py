@@ -230,8 +230,9 @@ class G1InspireDfxStateReader:
         max_age_constant: str = "STATE_MAX_AGE_S",
         hand_max_age_constant: str | None = None,
     ):
-        if simulation:
-            raise DeploymentError("Inspire DFX simulation is not qualified in this guarded client")
+        # IsaacLab publishes the same combined MotorStates_ wire contract as
+        # the DFX bridge. The guarded CLI exposes it only through the explicit
+        # FTP logical-profile simulation adapter.
         from unitree_lerobot.eval_robot.robot_control.robot_arm import G1_29_JointArmIndex
         from unitree_sdk2py.core.channel import ChannelSubscriber
         from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorStates_
