@@ -14,6 +14,7 @@ from unitree_lerobot.eval_robot.g1_end_effectors import (
     EndEffectorProfile,
     get_end_effector_profile,
     inspire_dfx_dataset_contract,
+    inspire_ftp_dataset_contract,
 )
 from unitree_lerobot.eval_robot.groot_client import DeploymentError
 from unitree_lerobot.utils.depth_encoding import (
@@ -413,8 +414,12 @@ def validate_policy_metadata(
                     f"Deployment dataset contract mismatch for {field}: "
                     f"got {contract.get(field)!r}, expected {value!r}"
                 )
-    if profile.name == "inspire-dfx":
-        expected_end_effector = inspire_dfx_dataset_contract()
+    inspire_contracts = {
+        "inspire-dfx": inspire_dfx_dataset_contract,
+        "inspire-ftp": inspire_ftp_dataset_contract,
+    }
+    if profile.name in inspire_contracts:
+        expected_end_effector = inspire_contracts[profile.name]()
         if contract.get("end_effector") != expected_end_effector:
             raise DeploymentError(
                 "Deployment dataset contract mismatch for end_effector: "
@@ -737,15 +742,19 @@ def validate_initialization_spec(
                     or not np.array_equal(values, required)
                 ):
                     semantics = "joint zero" if name == "arm" else "fully open (normalized one)"
-                    raise DeploymentError(f"Inspire DFX XR-home {name} target must be exactly {semantics}")
+                    raise DeploymentError(
+                        f"{profile.name} XR-home {name} target must be exactly {semantics}"
+                    )
             return
         if not allow_policy_warm_start or spec.mode != "pose-file":
             raise DeploymentError(
-                "Inspire DFX accepts measured initialization, its explicit XR-home, and the "
+                f"{profile.name} accepts measured initialization, its explicit XR-home, and the "
                 "internal validated policy Warmup2 transition"
             )
         if spec.arm is None or spec.left_hand is None or spec.right_hand is None:
-            raise DeploymentError("Inspire DFX policy Warmup2 requires explicit arm and both-hand targets")
+            raise DeploymentError(
+                f"{profile.name} policy Warmup2 requires explicit arm and both-hand targets"
+            )
         inspire_targets = (
             ("arm", spec.arm, ARM_DOF, ARM_LOWER, ARM_UPPER, ARM_JOINT_NAMES, JOINT_LIMIT_MARGIN_RAD, "rad"),
             (
@@ -892,7 +901,7 @@ def load_initialization_spec(
 
     ``xr-home`` faithfully reproduces the profile's XR startup targets: fourteen
     arm zeros and either seven zeros per Dex3 hand or six normalized ones (fully
-    open) per Inspire DFX hand. ``pose-file`` is deliberately task-bound and is
+    open) per Inspire hand. ``pose-file`` is deliberately task-bound and is
     available only for the qualified Dex3 contract; its hand policy is either
     explicit for both hands or preserves both measured hand poses.
     """
@@ -906,7 +915,7 @@ def load_initialization_spec(
         raise DeploymentError("--initial-pose-file is valid only with --initialization pose-file")
     if profile.name != "dex3" and mode == "pose-file":
         raise DeploymentError(
-            "Inspire DFX public pose-file initialization is not qualified; use measured or xr-home"
+            f"{profile.name} public pose-file initialization is not qualified; use measured or xr-home"
         )
 
     if mode == "measured":
@@ -926,7 +935,7 @@ def load_initialization_spec(
             label=(
                 "XR joint-zero home (arms and both Dex3 hands)"
                 if profile.name == "dex3"
-                else "XR home (zero arms; both Inspire DFX hands fully open)"
+                else f"XR home (zero arms; both {profile.name} hands fully open)"
             ),
             arm=np.zeros(ARM_DOF, dtype=np.float64),
             left_hand=np.array(profile.home, dtype=np.float64, copy=True),

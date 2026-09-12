@@ -1410,7 +1410,7 @@ def build_initialization_chunk(
         duration_s = steps / PUBLISH_HZ
         if duration_s > INITIALIZATION_MAX_DURATION_S:
             raise DeploymentError(
-                f"Inspire DFX initialization/Warmup2 path needs {duration_s:.1f}s; "
+                f"{profile.name} initialization/Warmup2 path needs {duration_s:.1f}s; "
                 f"INITIALIZATION_MAX_DURATION_S={INITIALIZATION_MAX_DURATION_S:.1f}s"
             )
         chunk = ActionChunk(
@@ -2007,6 +2007,14 @@ class _G1Dex3CommandBackend:
         if gravity_feedforward and not self.profile.supports_gravity_feedforward:
             raise DeploymentError(f"{self.profile.name} does not support gravity feed-forward")
         self.end_effector = self.profile.name
+        if self.profile.name == "inspire-ftp":
+            # Direct/backend callers must retain the same fail-before-DDS
+            # dependency preflight as the parent runner.
+            from unitree_lerobot.eval_robot.robot_control.g1_inspire_ftp import (
+                require_inspire_ftp_sdk,
+            )
+
+            require_inspire_ftp_sdk()
         # CHANGEDSAFETY: the original deployment adapter published zero arm
         # feed-forward torque.  Unitree XR instead publishes static RNEA torque
         # on every command; restore that demonstrated controller contract.
@@ -2041,7 +2049,7 @@ class _G1Dex3CommandBackend:
             }
             if self.profile.name == "dex3":
                 self.reader = G1Dex3StateReader(**reader_kwargs)
-            else:
+            elif self.profile.name == "inspire-dfx":
                 # Lazy import avoids the state adapter's deliberate RobotState
                 # dependency forming a module-import cycle.
                 from unitree_lerobot.eval_robot.robot_control.g1_inspire_dfx import (
@@ -2049,6 +2057,12 @@ class _G1Dex3CommandBackend:
                 )
 
                 self.reader = G1InspireDfxStateReader(**reader_kwargs)
+            else:
+                from unitree_lerobot.eval_robot.robot_control.g1_inspire_ftp import (
+                    G1InspireFtpStateReader,
+                )
+
+                self.reader = G1InspireFtpStateReader(**reader_kwargs)
             initial = self.reader.read(timeout_s=5.0)
             if not simulation and initial.mode_machine != QUALIFIED_REAL_MODE_MACHINE:
                 raise DeploymentError(
@@ -2094,12 +2108,18 @@ class _G1Dex3CommandBackend:
             self._right_publisher.Init()
             self._left_message = unitree_hg_msg_dds__HandCmd_()
             self._right_message = unitree_hg_msg_dds__HandCmd_()
-        else:
+        elif self.profile.name == "inspire-dfx":
             from unitree_lerobot.eval_robot.robot_control.g1_inspire_dfx import (
                 InspireDfxCommandWriter,
             )
 
             self._hand_writer = InspireDfxCommandWriter(initial.left_hand, initial.right_hand)
+        else:
+            from unitree_lerobot.eval_robot.robot_control.g1_inspire_ftp import (
+                InspireFtpCommandWriter,
+            )
+
+            self._hand_writer = InspireFtpCommandWriter(initial.left_hand, initial.right_hand)
         self._crc = CRC()
         self._weight = 0.0
         self._released = False
@@ -2120,7 +2140,7 @@ class _G1Dex3CommandBackend:
     def _close_constructed_resources(self, *, suppress_errors: bool) -> None:
         failures: list[str] = []
         resources = (
-            ("Inspire DFX command writer", "_hand_writer", "close"),
+            ("Inspire command writer", "_hand_writer", "close"),
             ("right hand publisher", "_right_publisher", "Close"),
             ("left hand publisher", "_left_publisher", "Close"),
             ("arm publisher", "_arm_publisher", "Close"),
@@ -2294,14 +2314,14 @@ class _G1Dex3CommandBackend:
         self._right_hand_publish_history.clear()
 
     def _reseed_inspire_hands_before_first_write(self, state: RobotState) -> None:
-        """Use the final measured pre-arm sample as DFX's first held target."""
+        """Use the final measured pre-arm sample as Inspire's first held target."""
 
-        if self.profile.name != "inspire-dfx":
+        if self.profile.name == "dex3":
             return
         if self._hand_writer is None:
-            raise DeploymentError("Inspire DFX command writer was not constructed")
+            raise DeploymentError("Inspire command writer was not constructed")
         # Hand drift is deliberately not part of the arm stationary dwell.
-        # Sample it again at the final no-write guard so the first lease packet
+        # Sample it again at the final no-write guard so the first command packet
         # holds current measured q instead of pulling toward constructor-time q.
         self._left_target = state.left_hand.copy()
         self._right_target = state.right_hand.copy()
@@ -2462,6 +2482,40 @@ class _G1Dex3CommandBackend:
             self._left_hand_publish_history.append(PublishedHandTarget(completed_at, written_left))
             self._right_hand_publish_history.append(PublishedHandTarget(completed_at, written_right))
             return
+        if profile.name == "inspire-ftp":
+            if self._hand_writer is None:
+                raise DeploymentError("Inspire FTP command writer was not constructed")
+            from unitree_lerobot.eval_robot.robot_control.g1_inspire_ftp import (
+                InspireFtpPartialWriteError,
+            )
+
+            timing_enabled = getattr(self, "_authority_ramp_timing_enabled", False)
+            timing = getattr(self, "_last_publish_timing_ms", {})
+            started_ns = time.monotonic_ns()
+            try:
+                try:
+                    result = self._hand_writer.write(left_target, right_target)
+                except InspireFtpPartialWriteError as exc:
+                    # FTP is two non-atomic DDS writes. Preserve the accepted
+                    # left-side history before propagating the right-side
+                    # failure into the ordinary fail-closed release path.
+                    self._left_hand_publish_history.append(
+                        PublishedHandTarget(exc.left_completed_at, exc.left)
+                    )
+                    raise
+            finally:
+                if timing_enabled:
+                    elapsed_ms = (time.monotonic_ns() - started_ns) / 1e6
+                    timing["hands_write"] = elapsed_ms
+                    timing["left_write"] = elapsed_ms
+                    timing["right_write"] = elapsed_ms
+            self._left_hand_publish_history.append(
+                PublishedHandTarget(result.left_completed_at, result.left)
+            )
+            self._right_hand_publish_history.append(
+                PublishedHandTarget(result.right_completed_at, result.right)
+            )
+            return
         left_command = left_target
         right_command = right_target
         if self.simulation:
@@ -2497,7 +2551,7 @@ class _G1Dex3CommandBackend:
         self._right_hand_publish_history.append(PublishedHandTarget(completed_at=time.monotonic(), target=right_target))
 
     def _stop_hands(self, phase_callback: Any | None = None) -> None:
-        """Stop Dex3 motors or relinquish the Inspire DFX command lease."""
+        """Stop Dex3 motors or close the selected Inspire command publishers."""
 
         profile = getattr(self, "profile", DEX3_PROFILE)
         if profile.name == "inspire-dfx":
@@ -2516,6 +2570,48 @@ class _G1Dex3CommandBackend:
                 "Inspire DFX command lease relinquished after arm authority release; "
                 "no hand motor-stop command or acknowledgement exists"
             )
+            return
+        if profile.name == "inspire-ftp":
+            if phase_callback is not None:
+                phase_callback("inspire_ftp_publishers_close_begin", {})
+            left_command_accepted = bool(
+                self._hand_writer is not None
+                and getattr(self._hand_writer, "left_has_written", False)
+            )
+            right_command_accepted = bool(
+                self._hand_writer is not None
+                and getattr(self._hand_writer, "right_has_written", False)
+            )
+            started = time.monotonic()
+            if self._hand_writer is not None:
+                self._hand_writer.close()
+            elapsed = time.monotonic() - started
+            if phase_callback is not None:
+                phase_callback(
+                    "inspire_ftp_publishers_close_end",
+                    {
+                        "elapsed_s": elapsed,
+                        "motor_stop_acknowledged": False,
+                        "left_command_accepted": left_command_accepted,
+                        "right_command_accepted": right_command_accepted,
+                        "assumed_accepted_setpoint_persists": (
+                            left_command_accepted or right_command_accepted
+                        ),
+                    },
+                )
+            if left_command_accepted or right_command_accepted:
+                LOGGER.warning(
+                    "Inspire FTP publishers closed after arm authority release; accepted commands "
+                    "left=%s right=%s. No DDS expiry, motor stop, or acknowledgement is verified, "
+                    "so conservatively assume each accepted hand setpoint remains active",
+                    left_command_accepted,
+                    right_command_accepted,
+                )
+            else:
+                LOGGER.info(
+                    "Inspire FTP publishers closed without any accepted hand command; cleanup did "
+                    "not acquire or refresh a hand setpoint"
+                )
             return
 
         for message, indices in (
@@ -2710,12 +2806,18 @@ class _G1Dex3CommandBackend:
         try:
             self._stop_hands(phase_callback)
         except Exception as exc:
-            operation = "Dex3 stopMotors" if profile.name == "dex3" else "Inspire DFX lease relinquish"
+            operation = {
+                "dex3": "Dex3 stopMotors",
+                "inspire-dfx": "Inspire DFX lease relinquish",
+                "inspire-ftp": "Inspire FTP publisher close",
+            }[profile.name]
             failures.append(f"{operation} failed: {exc}")
         if profile.name == "dex3":
             LOGGER.info("Dex3 stopMotors phase finished in %.3fs", time.monotonic() - hand_stop_started)
-        else:
+        elif profile.name == "inspire-dfx":
             LOGGER.info("Inspire DFX lease-relinquish phase finished in %.3fs", time.monotonic() - hand_stop_started)
+        else:
+            LOGGER.info("Inspire FTP publisher-close phase finished in %.3fs", time.monotonic() - hand_stop_started)
         if failures:
             raise DeploymentError("; ".join(failures))
 
@@ -3394,14 +3496,15 @@ def _ramp_real_arm_authority(
     takeover_state = backend.state()
     backend._validate_prearm_takeover_state(takeover_state)
     profile = getattr(backend, "profile", DEX3_PROFILE)
+    monitor_inspire_feedback = profile.name != "dex3"
     refresh_hand_lease = profile.name == "inspire-dfx"
-    if refresh_hand_lease:
+    if monitor_inspire_feedback:
         if hand_freshness_gate is None:
             hand_freshness_gate = HandStateFreshnessGate()
         initial_freshness = hand_freshness_gate.check(takeover_state)
         if not initial_freshness.ready:
             raise DeploymentError(
-                "Inspire DFX feedback became stale before arm authority acquisition"
+                f"{profile.name} feedback became stale before arm authority acquisition"
             )
         backend._reseed_inspire_hands_before_first_write(takeover_state)
     if stop_event.is_set():
@@ -3461,12 +3564,12 @@ def _ramp_real_arm_authority(
         # q fixed at the measured pose captured before the first Write.  Chasing
         # measured q would hide motion instead of holding the handoff point.
         state = backend.state()
-        if refresh_hand_lease:
+        if monitor_inspire_feedback:
             assert hand_freshness_gate is not None
             freshness = hand_freshness_gate.check(state)
             if not freshness.ready:
                 raise DeploymentError(
-                    "Inspire DFX feedback was lost during arm gravity acquisition: "
+                    f"{profile.name} feedback was lost during arm gravity acquisition: "
                     f"stale_hands={freshness.stale_hands}, max_age_s={freshness.max_age_s:.3f}"
                 )
         _enforce_arm_tracking(backend, state, context="matched-pose gravity ramp")
@@ -3518,12 +3621,12 @@ def _ramp_real_arm_authority(
         if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
             raise DeploymentError("Parent heartbeat expired while verifying arm takeover")
         state = backend.state()
-        if refresh_hand_lease:
+        if monitor_inspire_feedback:
             assert hand_freshness_gate is not None
             freshness = hand_freshness_gate.check(state)
             if not freshness.ready:
                 raise DeploymentError(
-                    "Inspire DFX feedback was lost during arm takeover settling: "
+                    f"{profile.name} feedback was lost during arm takeover settling: "
                     f"stale_hands={freshness.stale_hands}, max_age_s={freshness.max_age_s:.3f}"
                 )
         _enforce_arm_tracking(backend, state, context="matched-pose takeover settle")
@@ -3650,8 +3753,8 @@ def _actuator_main(
         _status(status_queue, "fault", str(exc))
         _status(status_queue, "stopped")
         return
-    if profile.name == "inspire-dfx" and command_conditioning != "xr":
-        _status(status_queue, "fault", "Inspire DFX actuation requires XR command conditioning")
+    if profile.name != "dex3" and command_conditioning != "xr":
+        _status(status_queue, "fault", f"{profile.name} actuation requires XR command conditioning")
         _status(status_queue, "stopped")
         return
 
@@ -3689,7 +3792,7 @@ def _actuator_main(
         ]
     ] = []
     try:
-        if profile.name == "inspire-dfx":
+        if profile.name != "dex3":
             backend = _G1Dex3CommandBackend(
                 simulation,
                 network_interface,
@@ -4317,7 +4420,7 @@ def _actuator_main(
                     warm_start_chunk = build_initialization_chunk(
                         command_start,
                         warm_start,
-                        allow_policy_warm_start=profile.name == "inspire-dfx",
+                        allow_policy_warm_start=profile.name != "dex3",
                     )
                     _status(
                         status_queue,
@@ -5120,8 +5223,8 @@ class SafeG1Dex3Actuator:
             raise DeploymentError(f"{self._profile.name} simulation is not qualified")
         if gravity_feedforward and not self._profile.supports_gravity_feedforward:
             raise DeploymentError(f"{self._profile.name} does not support gravity feed-forward")
-        if self._profile.name == "inspire-dfx" and command_conditioning != "xr":
-            raise DeploymentError("Inspire DFX actuation requires XR command conditioning")
+        if self._profile.name != "dex3" and command_conditioning != "xr":
+            raise DeploymentError(f"{self._profile.name} actuation requires XR command conditioning")
         self.end_effector = self._profile.name
         context = mp.get_context("spawn")
         self._command_queue = context.Queue(maxsize=1)
@@ -5632,7 +5735,7 @@ class SafeG1Dex3Actuator:
         )
         validate_initialization_spec(
             target,
-            allow_policy_warm_start=self.end_effector == "inspire-dfx",
+            allow_policy_warm_start=self.end_effector != "dex3",
         )
         self._wait_for_hand_feedback()
         pause_generation = (

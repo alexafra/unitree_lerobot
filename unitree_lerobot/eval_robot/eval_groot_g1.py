@@ -62,6 +62,10 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     initialize_dds,
 )
 from unitree_lerobot.eval_robot.robot_control.g1_inspire_dfx import G1InspireDfxStateReader
+from unitree_lerobot.eval_robot.robot_control.g1_inspire_ftp import (
+    G1InspireFtpStateReader,
+    require_inspire_ftp_sdk,
+)
 from unitree_lerobot.eval_robot.training_start_pose import (
     TRAINING_START_SOURCE,
     training_start_spec,
@@ -631,24 +635,43 @@ def _take_initial_voice_command(
 def validate_args(args: argparse.Namespace) -> None:
     end_effector = getattr(args, "end_effector", "dex3")
     initialization = getattr(args, "initialization", "measured")
-    if end_effector not in {"dex3", "inspire-dfx"}:
-        raise DeploymentError("--end-effector must be dex3 or inspire-dfx")
-    if end_effector == "inspire-dfx":
+    if end_effector not in {"dex3", "inspire-dfx", "inspire-ftp"}:
+        raise DeploymentError("--end-effector must be dex3, inspire-dfx, or inspire-ftp")
+    if end_effector != "dex3":
         if args.sim:
-            raise DeploymentError("Inspire DFX simulation is not qualified in this guarded client")
+            raise DeploymentError(f"{end_effector} simulation is not qualified in this guarded client")
         if initialization not in {"measured", "xr-home"}:
             raise DeploymentError(
-                "Inspire DFX supports --initialization measured or the explicit fully-open xr-home"
+                f"{end_effector} supports --initialization measured or the explicit fully-open xr-home"
             )
         if bool(getattr(args, "warmup1", False)):
             raise DeploymentError(
-                "Inspire DFX has no reviewed training-frame Warmup1 pose; pass --no-warmup1"
+                f"{end_effector} has no reviewed training-frame Warmup1 pose; pass --no-warmup1"
             )
         if args.actuate and getattr(args, "command_conditioning", "xr") != "xr":
             raise DeploymentError(
-                "Inspire DFX actuation requires --command-conditioning xr so the authorized "
+                f"{end_effector} actuation requires --command-conditioning xr so the authorized "
                 "0.2 normalized per-write hand limit is enforced"
             )
+    if (
+        end_effector == "inspire-ftp"
+        and args.actuate
+        and not args.sim
+        and not bool(getattr(args, "allow_inspire_ftp_unverified_stop", False))
+    ):
+        raise DeploymentError(
+            "Inspire FTP actuation requires --allow-inspire-ftp-unverified-stop: no command "
+            "expiry, motor stop, or stop acknowledgement has been verified for RH56E2/FTP, so "
+            "closing this client must be treated as leaving the last hand setpoint active"
+        )
+    if (
+        end_effector != "inspire-ftp"
+        and bool(getattr(args, "allow_inspire_ftp_unverified_stop", False))
+    ):
+        raise DeploymentError(
+            "--allow-inspire-ftp-unverified-stop is valid only with "
+            "--end-effector inspire-ftp"
+        )
     if args.execution_horizon < 1:
         raise DeploymentError("--execution-horizon must be at least 1")
     if args.max_chunks < 1:
@@ -691,9 +714,9 @@ def validate_args(args: argparse.Namespace) -> None:
     warmup1_enabled = bool(getattr(args, "warmup1", False))
     if return_to_start and not args.actuate:
         raise DeploymentError("--return-to-start requires --actuate")
-    if return_to_start and end_effector == "inspire-dfx" and initialization != "xr-home":
+    if return_to_start and end_effector != "dex3" and initialization != "xr-home":
         raise DeploymentError(
-            "Inspire DFX --return-to-start requires the explicit fixed --initialization xr-home target"
+            f"{end_effector} --return-to-start requires the explicit fixed --initialization xr-home target"
         )
     if return_to_start and not warmup1_enabled and initialization == "measured":
         raise DeploymentError(
@@ -751,6 +774,13 @@ def confirm_actuation(
                 "WARNING: Inspire DFX has no motor-stop command or acknowledgement. On release, "
                 "the client first ramps arm authority down, then stops hand writes and relies on "
                 "the DFX command lease expiring. The 0.2 normalized hand slew and existing "
+                "g1_body29_hand14 gravity model are explicitly unqualified lab choices."
+            )
+        elif end_effector == "inspire-ftp":
+            print(
+                "WARNING: Inspire RH56E2/FTP has separate non-atomic left/right commands and no "
+                "verified command expiry, motor stop, or stop acknowledgement. Closing the client "
+                "must be treated as leaving its last hand setpoint active. The 0.2 normalized hand slew and existing "
                 "g1_body29_hand14 gravity model are explicitly unqualified lab choices."
             )
         else:
@@ -1247,7 +1277,7 @@ def confirm_return_to_start(
         "remain on the emergency stop."
     )
     if spec.moves_hands:
-        if spec.end_effector == "inspire-dfx":
+        if spec.end_effector != "dex3":
             warning += " This target opens both Inspire hands and can drop held objects; both hands must be empty."
         else:
             warning += " This target explicitly moves both Dex3 hands; verify their contents."
@@ -1304,7 +1334,7 @@ def confirm_initialization(
         "Keep the workspace clear and remain on the emergency stop."
     )
     if spec.mode == "xr-home":
-        if spec.end_effector == "inspire-dfx":
+        if spec.end_effector != "dex3":
             warning += (
                 " XR-home targets all 14 arm joints to zero and all six channels of each Inspire "
                 "hand to normalized one (fully open); this can drop held objects, so both hands must be empty."
@@ -2689,10 +2719,11 @@ def run(args: argparse.Namespace) -> None:
             end_effector,
             contract.action_horizon,
         )
-        if end_effector == "inspire-dfx":
+        if end_effector != "dex3":
             LOGGER.info(
-                "Inspire DFX contract enabled: native normalized 6-DoF hand values; "
-                "XR conditioning limits each final hand write to 0.2 normalized units"
+                "Inspire %s contract enabled: native normalized 6-DoF hand values; "
+                "XR conditioning limits each final hand write to 0.2 normalized units",
+                end_effector.removeprefix("inspire-").upper(),
             )
         elif getattr(args, "command_conditioning", "xr") == "xr":
             LOGGER.info(
@@ -2703,12 +2734,17 @@ def run(args: argparse.Namespace) -> None:
         else:
             LOGGER.warning("XR command conditioning disabled; raw policy target-step rejection is active")
 
+        # Missing vendor IDL/package must fail while the process is still
+        # publisher-free and before ChannelFactoryInitialize changes DDS state.
+        if end_effector == "inspire-ftp":
+            require_inspire_ftp_sdk()
         initialize_dds(args.sim, args.network_interface)
-        state_reader = (
-            G1Dex3StateReader(simulation=args.sim)
-            if end_effector == "dex3"
-            else G1InspireDfxStateReader(simulation=args.sim)
-        )
+        state_readers = {
+            "dex3": G1Dex3StateReader,
+            "inspire-dfx": G1InspireDfxStateReader,
+            "inspire-ftp": G1InspireFtpStateReader,
+        }
+        state_reader = state_readers[end_effector](simulation=args.sim)
         depth_encoding = visual_encoding if isinstance(visual_encoding, DepthEncodingContract) else None
         surface_normal_encoding = (
             visual_encoding if isinstance(visual_encoding, SurfaceNormalEncodingContract) else None
@@ -3026,9 +3062,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Colour/RGBD GR00T runner for Unitree G1-29")
     parser.add_argument(
         "--end-effector",
-        choices=("dex3", "inspire-dfx"),
+        choices=("dex3", "inspire-dfx", "inspire-ftp"),
         default="dex3",
-        help="Hand data/transport contract (default: dex3); Inspire DFX real use requires the expert override",
+        help="Hand data/transport contract (default: dex3); Inspire real use requires explicit expert overrides",
     )
     goal_group = parser.add_mutually_exclusive_group()
     goal_group.add_argument("--task", choices=tuple(TASKS), help="Trained task ID; omit for a menu")
@@ -3134,7 +3170,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="measured",
         help=(
             "Pose before policy execution: preserve measured q (default), target the selected hand "
-            "profile's XR home with guarded motion (Dex3: zero; Inspire DFX: normalized one/fully open), "
+            "profile's XR home with guarded motion (Dex3: zero; Inspire: normalized one/fully open), "
             "or load an experimental reviewed task-bound Dex3 JSON pose. This stage runs before Warmup1"
         ),
     )
@@ -3182,7 +3218,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Offer Shift+Tab in powered HOLD to repeat Warmup1 when enabled, otherwise the "
             "explicit xr-home/pose-file initialization target (default: disabled); it is "
-            "invalid with --no-warmup1 --initialization measured. Inspire DFX requires xr-home"
+            "invalid with --no-warmup1 --initialization measured. Inspire requires xr-home"
         ),
     )
     parser.add_argument(
@@ -3199,8 +3235,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-unqualified-real",
         action="store_true",
         help=(
-            "Expert override for unqualified real hand failover and, with Inspire DFX, the "
-            "authorized 0.2 normalized slew, lease-only shutdown, and teleop-parity gravity model"
+            "Expert override for unqualified real hand failover and Inspire's authorized 0.2 "
+            "normalized slew and teleop-parity gravity model"
+        ),
+    )
+    parser.add_argument(
+        "--allow-inspire-ftp-unverified-stop",
+        action="store_true",
+        help=(
+            "Additional RH56E2/FTP actuation acknowledgement: closing its command publishers "
+            "is not a verified stop and must be treated as leaving the last hand setpoint active"
         ),
     )
     parser.add_argument(

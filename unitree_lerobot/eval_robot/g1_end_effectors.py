@@ -1,7 +1,7 @@
 """Static end-effector contracts for the guarded G1 deployment client.
 
 Selecting a profile changes only the hand transport and data contract.  Dex3
-remains the default; Inspire DFX must be requested explicitly.
+remains the default; either Inspire transport must be requested explicitly.
 """
 
 from __future__ import annotations
@@ -12,6 +12,10 @@ import numpy as np
 
 
 UNQUALIFIED_INSPIRE_DFX_COMMAND_MAX_STEP = 0.2
+# The normalized command domain and teleop-derived per-write backstop are the
+# same for DFX and RH56E2/FTP.  Keep the original public DFX name for callers
+# that imported it before FTP support was added.
+UNQUALIFIED_INSPIRE_COMMAND_MAX_STEP = UNQUALIFIED_INSPIRE_DFX_COMMAND_MAX_STEP
 
 
 @dataclass(frozen=True)
@@ -95,6 +99,16 @@ class EndEffectorProfile:
         elif self.transport == "inspire-dfx":
             if not self.state_topic or not self.command_topic or not self.uses_lost_counters:
                 raise ValueError("Inspire DFX profile requires combined DDS topics and lost counters")
+        elif self.transport == "inspire-ftp":
+            if not all(
+                (
+                    self.left_state_topic,
+                    self.right_state_topic,
+                    self.left_command_topic,
+                    self.right_command_topic,
+                )
+            ) or self.uses_lost_counters:
+                raise ValueError("Inspire FTP profile requires separate per-hand DDS topics")
         else:
             raise ValueError(f"Unsupported hand transport {self.transport!r}")
 
@@ -215,9 +229,49 @@ INSPIRE_DFX_PROFILE = EndEffectorProfile(
 )
 
 
+INSPIRE_FTP_PROFILE = EndEffectorProfile(
+    name="inspire-ftp",
+    robot_type="Unitree_G1_Inspire_HeadOnly",
+    hand_dof=6,
+    left_joint_names=INSPIRE_DFX_PROFILE.left_joint_names,
+    right_joint_names=INSPIRE_DFX_PROFILE.right_joint_names,
+    left_lower=np.zeros(6, dtype=np.float64),
+    left_upper=np.ones(6, dtype=np.float64),
+    right_lower=np.zeros(6, dtype=np.float64),
+    right_upper=np.ones(6, dtype=np.float64),
+    # Preserve the original explicit XR-home convention: normalized one sends
+    # angle_set=1000 for all six channels and fully opens the hands. Current
+    # teleop does not publish this target automatically before valid XR input.
+    home=np.ones(6, dtype=np.float64),
+    value_unit="normalized_open_fraction",
+    transport="inspire-ftp",
+    limit_tolerance=0.0,
+    measured_limit_tolerance=0.0,
+    max_step=None,
+    conditioned_step=np.full(
+        6,
+        UNQUALIFIED_INSPIRE_COMMAND_MAX_STEP,
+        dtype=np.float64,
+    ),
+    initialization_speed=None,
+    initialization_tolerance=None,
+    tracking_warning=None,
+    tracking_clear=None,
+    tracking_hard=None,
+    supports_simulation=False,
+    supports_gravity_feedforward=True,
+    has_motor_stop=False,
+    left_state_topic="rt/inspire_hand/state/l",
+    right_state_topic="rt/inspire_hand/state/r",
+    left_command_topic="rt/inspire_hand/ctrl/l",
+    right_command_topic="rt/inspire_hand/ctrl/r",
+)
+
+
 END_EFFECTOR_PROFILES = {
     DEX3_PROFILE.name: DEX3_PROFILE,
     INSPIRE_DFX_PROFILE.name: INSPIRE_DFX_PROFILE,
+    INSPIRE_FTP_PROFILE.name: INSPIRE_FTP_PROFILE,
 }
 
 
@@ -235,6 +289,24 @@ def inspire_dfx_dataset_contract() -> dict[str, object]:
         "one_semantics": "fully_open",
         "left_joint_names": list(INSPIRE_DFX_PROFILE.left_joint_names),
         "right_joint_names": list(INSPIRE_DFX_PROFILE.right_joint_names),
+        "canonical_order": "left_then_right",
+    }
+
+
+def inspire_ftp_dataset_contract() -> dict[str, object]:
+    """Return the exact converted-dataset provenance required for RH56E2/FTP."""
+
+    return {
+        "schema_version": 1,
+        "type": "inspire",
+        "protocol": "ftp",
+        "hand_dof": INSPIRE_FTP_PROFILE.hand_dof,
+        "value_unit": "normalized_open_fraction",
+        "value_range": [0.0, 1.0],
+        "zero_semantics": "fully_closed",
+        "one_semantics": "fully_open",
+        "left_joint_names": list(INSPIRE_FTP_PROFILE.left_joint_names),
+        "right_joint_names": list(INSPIRE_FTP_PROFILE.right_joint_names),
         "canonical_order": "left_then_right",
     }
 
