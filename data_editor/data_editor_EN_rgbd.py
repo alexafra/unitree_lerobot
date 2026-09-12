@@ -1,3 +1,4 @@
+import argparse
 import os
 import re
 import sys
@@ -133,6 +134,13 @@ def resolve_depth_scale_m_per_unit(json_obj):
             f"depth scale must be positive and finite, got {stored_scale!r}"
         )
     return depth_scale_m_per_unit
+
+
+def resolve_display_depth_scale(json_obj, color_only=False):
+    """Resolve depth scale only when depth is part of the active preview."""
+    if color_only:
+        return None
+    return resolve_depth_scale_m_per_unit(json_obj)
 
 
 def depth_to_gray_rgb(
@@ -460,15 +468,30 @@ class DatasetPlayer(QWidget):
         "raw_depth_0": (1, 1),
     }
 
+    @classmethod
+    def active_display_configuration(cls, color_only=False):
+        """Return the requested preview streams without changing RGB-D defaults."""
+        if not color_only:
+            return cls.DISPLAY_STREAMS, cls.DISPLAY_GRID_POSITIONS
+        return (
+            {"color_0": cls.DISPLAY_STREAMS["color_0"]},
+            {"color_0": cls.DISPLAY_GRID_POSITIONS["color_0"]},
+        )
+
     FRAME_FILE_PATTERN = re.compile(
         r"^(\d+)(_.+)$",
         re.IGNORECASE,
     )
 
-    def __init__(self, root_dir, interval_ms=100):
+    def __init__(self, root_dir, interval_ms=100, color_only=False):
         super().__init__()
         self.root_dir = root_dir
         self.interval_ms = interval_ms
+        self.color_only = bool(color_only)
+        (
+            self.active_display_streams,
+            self.active_display_grid_positions,
+        ) = self.active_display_configuration(self.color_only)
         self.playback_speed = 1
         self.playback_frame_step = 1
 
@@ -478,7 +501,9 @@ class DatasetPlayer(QWidget):
         self.frame_keys = []
         self.frames_map = defaultdict(dict)
         self.current_frame_index = 0
-        self.depth_scale_m_per_unit = DEFAULT_DEPTH_SCALE_M_PER_UNIT
+        self.depth_scale_m_per_unit = (
+            None if self.color_only else DEFAULT_DEPTH_SCALE_M_PER_UNIT
+        )
 
         self.is_playing = True
         self.play_selection_only = False
@@ -618,13 +643,13 @@ class DatasetPlayer(QWidget):
 
         self.image_labels = {
             stream_key: ImageLabel(title)
-            for stream_key, (title, _) in self.DISPLAY_STREAMS.items()
+            for stream_key, (title, _) in self.active_display_streams.items()
         }
 
         grid = QGridLayout()
         grid.setSpacing(8)
 
-        for stream_key, (row, column) in self.DISPLAY_GRID_POSITIONS.items():
+        for stream_key, (row, column) in self.active_display_grid_positions.items():
             grid.addWidget(
                 self.image_labels[stream_key],
                 row,
@@ -894,14 +919,16 @@ class DatasetPlayer(QWidget):
         self.frame_keys = []
         self.frames_map = defaultdict(dict)
         self.current_frame_index = 0
-        self.depth_scale_m_per_unit = DEFAULT_DEPTH_SCALE_M_PER_UNIT
+        self.depth_scale_m_per_unit = (
+            None if self.color_only else DEFAULT_DEPTH_SCALE_M_PER_UNIT
+        )
         self.play_selection_only = False
 
         self.episode_label.setText("Current Episode: None")
         self.info_label.setText(message)
 
         for stream_key, label in self.image_labels.items():
-            title = self.DISPLAY_STREAMS[stream_key][0]
+            title = self.active_display_streams[stream_key][0]
             label.set_placeholder(
                 f"{title}\nNo image"
             )
@@ -1093,7 +1120,7 @@ class DatasetPlayer(QWidget):
             )
 
             for stream_key, label in self.image_labels.items():
-                title = self.DISPLAY_STREAMS[stream_key][0]
+                title = self.active_display_streams[stream_key][0]
                 label.set_placeholder(
                     f"{title}\ndata.json not found"
                 )
@@ -1123,7 +1150,10 @@ class DatasetPlayer(QWidget):
             return
 
         try:
-            self.depth_scale_m_per_unit = resolve_depth_scale_m_per_unit(json_obj)
+            self.depth_scale_m_per_unit = resolve_display_depth_scale(
+                json_obj,
+                color_only=self.color_only,
+            )
         except ValueError as error:
             self.clear_player_state(
                 f"Invalid depth scale in {json_path}: {error}"
@@ -1192,7 +1222,7 @@ class DatasetPlayer(QWidget):
             )
 
             for stream_key, label in self.image_labels.items():
-                title = self.DISPLAY_STREAMS[stream_key][0]
+                title = self.active_display_streams[stream_key][0]
                 label.set_placeholder(
                     f"{title}\nNo image"
                 )
@@ -1245,17 +1275,23 @@ class DatasetPlayer(QWidget):
             else "Paused"
         )
 
+        visual_input_text = (
+            "Visuals: Color only"
+            if self.color_only
+            else f"Depth scale: {self.depth_scale_m_per_unit:g} m/unit"
+        )
+
         self.info_label.setText(
             f"Dataset: {self.current_episode_name}    "
             f"Current frame: "
             f"{frame_index}/{len(self.frame_keys) - 1}    "
             f"Frame ID: {frame_id:06d}    "
-            f"Depth scale: {self.depth_scale_m_per_unit:g} m/unit    "
+            f"{visual_input_text}    "
             f"Mode: {mode_text}    "
             f"State: {state_text}"
         )
 
-        for stream_key, stream_info in self.DISPLAY_STREAMS.items():
+        for stream_key, stream_info in self.active_display_streams.items():
             title, render_mode = stream_info
 
             label = self.image_labels[stream_key]
@@ -1769,12 +1805,34 @@ class DatasetPlayer(QWidget):
 
         return renumbered
 
-def main():
-    app = QApplication(sys.argv)
+def parse_cli_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Review and trim Unitree raw episodes.",
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "--color-only",
+        action="store_true",
+        help=(
+            "show only color_0 and ignore depth metadata while previewing; "
+            "RGB-D preview remains the default and trimming still keeps any "
+            "present depth sidecars aligned"
+        ),
+    )
+    return parser.parse_known_args(argv)
+
+
+def main(argv=None):
+    args, qt_args = parse_cli_args(sys.argv[1:] if argv is None else argv)
+    app = QApplication([sys.argv[0], *qt_args])
 
     root_dir = ""
 
-    player = DatasetPlayer(root_dir=root_dir, interval_ms=100)
+    player = DatasetPlayer(
+        root_dir=root_dir,
+        interval_ms=100,
+        color_only=args.color_only,
+    )
     player.show()
 
     sys.exit(app.exec_())

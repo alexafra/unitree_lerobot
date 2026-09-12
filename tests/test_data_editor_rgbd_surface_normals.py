@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -120,6 +122,45 @@ class DataEditorRgbdSurfaceNormalsTest(unittest.TestCase):
             "depth",
         )
 
+    def test_color_only_cli_is_explicit_and_preserves_qt_arguments(self):
+        args, qt_args = self.editor.parse_cli_args([])
+        self.assertFalse(args.color_only)
+        self.assertEqual(qt_args, [])
+
+        args, qt_args = self.editor.parse_cli_args(
+            ["--color-only", "-platform", "offscreen"]
+        )
+        self.assertTrue(args.color_only)
+        self.assertEqual(qt_args, ["-platform", "offscreen"])
+
+        args, qt_args = self.editor.parse_cli_args(["--color"])
+        self.assertFalse(args.color_only)
+        self.assertEqual(qt_args, ["--color"])
+
+    def test_color_only_display_configuration_contains_only_rgb(self):
+        streams, positions = self.editor.DatasetPlayer.active_display_configuration(False)
+        self.assertIs(streams, self.editor.DatasetPlayer.DISPLAY_STREAMS)
+        self.assertIs(positions, self.editor.DatasetPlayer.DISPLAY_GRID_POSITIONS)
+
+        streams, positions = self.editor.DatasetPlayer.active_display_configuration(True)
+        self.assertEqual(streams, {"color_0": ("RGB Camera 0", "color")})
+        self.assertEqual(positions, {"color_0": (0, 0)})
+
+    def test_color_only_ignores_invalid_unused_depth_scale(self):
+        payload = {"info": {"depth": {"scale_m_per_unit": "invalid"}}}
+        with mock.patch.object(
+            self.editor,
+            "resolve_depth_scale_m_per_unit",
+            side_effect=AssertionError("depth scale must not be inspected"),
+        ) as resolver:
+            self.assertIsNone(
+                self.editor.resolve_display_depth_scale(payload, color_only=True)
+            )
+        resolver.assert_not_called()
+
+        with self.assertRaises(ValueError):
+            self.editor.resolve_display_depth_scale(payload, color_only=False)
+
     def test_derived_view_uses_the_aligned_depth_path_not_raw_depth(self):
         paths = self.editor.resolve_frame_display_paths(
             {
@@ -166,9 +207,11 @@ class DataEditorRgbdSurfaceNormalsTest(unittest.TestCase):
         player.current_episode_name = "episode_0001"
         player.play_selection_only = False
         player.is_playing = False
+        player.color_only = False
         player.depth_scale_m_per_unit = 0.001
         player.info_label = mock.Mock()
-        player.image_labels = {key: _Label() for key in player.DISPLAY_STREAMS}
+        player.active_display_streams = player.DISPLAY_STREAMS
+        player.image_labels = {key: _Label() for key in player.active_display_streams}
         player.range_slider = mock.Mock()
 
         with (
@@ -194,6 +237,83 @@ class DataEditorRgbdSurfaceNormalsTest(unittest.TestCase):
                 mock.call("/episode/raw_depths/000007_raw_depth_0.png", 0.001),
             ],
         )
+
+    def test_color_only_show_frame_never_dispatches_depth_renderers(self):
+        player = object.__new__(self.editor.DatasetPlayer)
+        player.frame_keys = [7]
+        player.frames_map = {
+            7: {
+                "color_0": "/episode/colors/000007_color_0.jpg",
+                "depth_0": "/episode/depths/000007_depth_0.png",
+                "surface_normals_view": "/episode/depths/000007_depth_0.png",
+                "raw_depth_0": "/episode/raw_depths/000007_raw_depth_0.png",
+            }
+        }
+        player.current_episode_name = "episode_0001"
+        player.play_selection_only = False
+        player.is_playing = False
+        player.color_only = True
+        player.depth_scale_m_per_unit = None
+        player.info_label = mock.Mock()
+        player.active_display_streams = {"color_0": player.DISPLAY_STREAMS["color_0"]}
+        player.image_labels = {"color_0": _Label()}
+        player.range_slider = mock.Mock()
+
+        with (
+            mock.patch.object(self.editor.os.path, "isfile", return_value=True),
+            mock.patch.object(
+                self.editor,
+                "QPixmap",
+                return_value=_Pixmap(),
+            ) as load_color,
+            mock.patch.object(self.editor, "load_depth_pixmap") as load_depth,
+            mock.patch.object(
+                self.editor,
+                "load_surface_normals_pixmap",
+            ) as load_normals,
+        ):
+            player.show_frame(0)
+
+        load_color.assert_called_once_with("/episode/colors/000007_color_0.jpg")
+        load_depth.assert_not_called()
+        load_normals.assert_not_called()
+        self.assertIn("Visuals: Color only", player.info_label.setText.call_args.args[0])
+
+    def test_trim_color_only_episode_without_depth(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            episode = Path(temp_dir) / "episode_0001"
+            colors = episode / "colors"
+            colors.mkdir(parents=True)
+            frames = []
+            for index, contents in enumerate((b"zero", b"one", b"two")):
+                filename = f"{index:06d}_color_0.jpg"
+                (colors / filename).write_bytes(contents)
+                frames.append(
+                    {
+                        "idx": index,
+                        "colors": {"color_0": f"colors/{filename}"},
+                        "depths": {},
+                    }
+                )
+            (episode / "data.json").write_text(
+                json.dumps({"info": {}, "data": frames}),
+                encoding="utf-8",
+            )
+
+            player = object.__new__(self.editor.DatasetPlayer)
+            player.root_dir = temp_dir
+            player.current_episode_name = "episode_0001"
+            player.delete_and_renumber_frames([1])
+
+            payload = json.loads((episode / "data.json").read_text(encoding="utf-8"))
+            self.assertEqual([frame["idx"] for frame in payload["data"]], [0, 1])
+            self.assertEqual(
+                [frame["colors"]["color_0"] for frame in payload["data"]],
+                ["colors/000000_color_0.jpg", "colors/000001_color_0.jpg"],
+            )
+            self.assertEqual((colors / "000000_color_0.jpg").read_bytes(), b"zero")
+            self.assertEqual((colors / "000001_color_0.jpg").read_bytes(), b"two")
+            self.assertFalse((colors / "000002_color_0.jpg").exists())
 
 
 if __name__ == "__main__":
