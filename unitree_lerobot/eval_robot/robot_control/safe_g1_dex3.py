@@ -57,6 +57,7 @@ from unitree_lerobot.eval_robot.groot_contract import (
     validate_initialization_spec,
     validate_measured_state,
 )
+from unitree_lerobot.eval_robot.image_server.rgbd_protocol import RGBD_PROTOCOL
 from unitree_lerobot.eval_robot.robot_control.g1_arm_gravity import G1ArmGravityCompensator
 from unitree_lerobot.eval_robot.run_logging import (
     configure_process_logging,
@@ -1822,14 +1823,36 @@ def _validate_live_head_config(
     return port, depth_port, depth_scale
 
 
+def _advertised_atomic_rgbd_port(config: dict[str, Any]) -> tuple[int | None, str]:
+    """Return an exact v1 atomic port, or a diagnostic for legacy fallback."""
+
+    head = config.get("head_camera")
+    if not isinstance(head, dict):
+        return None, "the live config has no head_camera object"
+    protocol = head.get("rgbd_protocol")
+    if protocol != RGBD_PROTOCOL:
+        if protocol is None:
+            return None, f"{RGBD_PROTOCOL!r} is not advertised"
+        return None, f"advertised protocol {protocol!r} is not {RGBD_PROTOCOL!r}"
+    try:
+        port = int(head["rgbd_zmq_port"])
+    except (KeyError, TypeError, ValueError):
+        return None, "the advertised atomic stream has no valid rgbd_zmq_port"
+    if not 1 <= port <= 65535:
+        return None, f"the advertised atomic stream has invalid rgbd_zmq_port {port!r}"
+    return port, ""
+
+
 class TeleimagerCamera:
-    """TeleImager client for colour or client-encoded legacy aligned-depth geometry."""
+    """TeleImager client with optional atomic RGBD and sticky legacy fallback."""
 
     def __init__(
         self,
         host: str,
         depth_encoding: DepthEncodingContract | None = None,
         surface_normal_encoding: SurfaceNormalEncodingContract | None = None,
+        *,
+        prefer_atomic_rgbd: bool = False,
     ):
         from unitree_lerobot.eval_robot.image_server.image_client import ImageClient
 
@@ -1841,11 +1864,21 @@ class TeleimagerCamera:
         self._requires_depth = depth_encoding is not None or surface_normal_encoding is not None
         self._last_color_received_ns: int | None = None
         self._last_depth_received_ns: int | None = None
+        self._last_rgbd_sequence: int | None = None
+        self._last_rgbd_server_capture_ns: int | None = None
+        self._geometry_transport = "legacy"
+        self._atomic_ever_succeeded = False
+        self._geometry_selection_logged = False
+        self._rgbd_subscriber = None
         live_config = request_live_camera_config(host)
         stream_port, depth_port, depth_scale = _validate_live_head_config(
             live_config,
             requires_depth=self._requires_depth,
         )
+        atomic_port: int | None = None
+        atomic_unavailable_reason = ""
+        if self._requires_depth and prefer_atomic_rgbd:
+            atomic_port, atomic_unavailable_reason = _advertised_atomic_rgbd_port(live_config)
         if depth_scale is not None:
             self._depth_scale_m_per_unit = depth_scale
         try:
@@ -1880,12 +1913,42 @@ class TeleimagerCamera:
             raise DeploymentError("TeleImager aligned-depth subscriber stopped during startup")
         self._reported_stream_fps = False
         if self._requires_depth:
-            LOGGER.warning(
-                "Using legacy independent TeleImager RGB and aligned-depth streams on ports %d and %d, "
-                "matching the training data collection transport",
-                stream_port,
-                depth_port,
-            )
+            if not prefer_atomic_rgbd:
+                LOGGER.warning(
+                    "Using legacy independent TeleImager RGB and aligned-depth streams on ports "
+                    "%d and %d, matching the training data collection transport",
+                    stream_port,
+                    depth_port,
+                )
+                self._geometry_selection_logged = True
+            elif atomic_port is None:
+                LOGGER.warning(
+                    "TeleImager geometry transport selected legacy RGB+depth on ports %d/%d: %s",
+                    stream_port,
+                    depth_port,
+                    atomic_unavailable_reason,
+                )
+                self._geometry_selection_logged = True
+            else:
+                try:
+                    self._client.enable_head_rgbd_stream()
+                    self._rgbd_subscriber = self._client._subscriber_manager._subscriber_threads[
+                        (host, atomic_port)
+                    ]
+                    if not self._rgbd_subscriber.is_alive():
+                        raise DeploymentError("atomic subscriber stopped during startup")
+                    self._geometry_transport = "atomic"
+                except Exception as exc:
+                    self._rgbd_subscriber = None
+                    LOGGER.warning(
+                        "TeleImager geometry transport selected legacy RGB+depth on ports %d/%d; "
+                        "optional atomic v1 subscription on port %d was unavailable (%s)",
+                        stream_port,
+                        depth_port,
+                        atomic_port,
+                        exc,
+                    )
+                    self._geometry_selection_logged = True
 
     def _assert_subscriber_alive(self) -> None:
         if not self._head_subscriber.is_alive():
@@ -1893,6 +1956,11 @@ class TeleimagerCamera:
         depth_subscriber = getattr(self, "_depth_subscriber", None)
         if depth_subscriber is not None and not depth_subscriber.is_alive():
             raise DeploymentError("TeleImager aligned-depth subscriber stopped")
+
+    def _assert_atomic_subscriber_alive(self) -> None:
+        subscriber = getattr(self, "_rgbd_subscriber", None)
+        if subscriber is None or not subscriber.is_alive():
+            raise DeploymentError("TeleImager atomic RGBD subscriber stopped")
 
     def read_rgb(self, timeout_s: float = 3.0) -> np.ndarray:
         if getattr(self, "_requires_depth", False):
@@ -1919,7 +1987,116 @@ class TeleimagerCamera:
                 time.sleep(0.01)
         raise TimeoutError(f"Timed out waiting for a fresh TeleImager frame ({last_error})")
 
-    def _read_geometry(self, timeout_s: float) -> CameraImages:
+    def _encode_geometry(self, depth_u16: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
+        if list(depth_u16.shape) != EXPECTED_DEPTH_VIEW_SHAPE[:2]:
+            raise DeploymentError(
+                f"Aligned depth shape {depth_u16.shape} does not match the training contract "
+                f"{tuple(EXPECTED_DEPTH_VIEW_SHAPE[:2])}"
+            )
+        try:
+            depth_encoding = getattr(self, "_depth_encoding", None)
+            surface_normal_encoding = getattr(self, "_surface_normal_encoding", None)
+            if depth_encoding is not None:
+                return (
+                    encode_depth_gray_rgb(
+                        depth_u16,
+                        scale_m_per_unit=self._depth_scale_m_per_unit,
+                        near_m=depth_encoding.near_m,
+                        far_m=depth_encoding.far_m,
+                    ),
+                    None,
+                )
+            if surface_normal_encoding is not None:
+                return (
+                    None,
+                    encode_surface_normals_rgb(
+                        depth_u16,
+                        scale_m_per_unit=self._depth_scale_m_per_unit,
+                        intrinsics=surface_normal_encoding.intrinsics,
+                        max_neighbor_depth_delta_m=(
+                            surface_normal_encoding.max_neighbor_depth_delta_m
+                        ),
+                    ),
+                )
+            raise DeploymentError("Geometry camera has no selected encoding")
+        except ValueError as exc:
+            raise DeploymentError(f"Could not encode aligned depth geometry: {exc}") from exc
+
+    def _read_atomic_geometry(self, timeout_s: float) -> CameraImages:
+        deadline = time.monotonic() + timeout_s
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                self._assert_atomic_subscriber_alive()
+                frame = self._client.get_head_rgbd_frame()
+                if frame is None:
+                    raise TimeoutError("TeleImager atomic RGBD transport has no fresh packet")
+                try:
+                    measured_fps = float(self._client.get_head_rgbd_fps())
+                except (TypeError, ValueError) as exc:
+                    raise TimeoutError("TeleImager atomic RGBD stream FPS is not numeric") from exc
+                if not np.isfinite(measured_fps) or measured_fps <= 0.0:
+                    raise TimeoutError(
+                        "TeleImager atomic RGBD stream has not established a live rolling FPS"
+                    )
+                if frame.received_monotonic_ns is None:
+                    raise DeploymentError("TeleImager atomic RGBD packet has no local receive timestamp")
+                age_s = (
+                    time.monotonic_ns() - int(frame.received_monotonic_ns)
+                ) / 1_000_000_000.0
+                if age_s < 0.0 or age_s > RGBD_MAX_RECEIVE_AGE_S:
+                    raise TimeoutError(
+                        f"TeleImager atomic RGBD packet is stale ({age_s:.3f}s old); "
+                        f"RGBD_MAX_RECEIVE_AGE_S={RGBD_MAX_RECEIVE_AGE_S:.3f}s"
+                    )
+                previous_sequence = getattr(self, "_last_rgbd_sequence", None)
+                if previous_sequence is not None:
+                    if frame.sequence < previous_sequence:
+                        raise DeploymentError(
+                            "TeleImager atomic RGBD sequence regressed from "
+                            f"{previous_sequence} to {frame.sequence}"
+                        )
+                    if frame.sequence == previous_sequence:
+                        raise TimeoutError(
+                            f"TeleImager atomic RGBD sequence {frame.sequence} is not new"
+                        )
+                previous_capture_ns = getattr(self, "_last_rgbd_server_capture_ns", None)
+                if (
+                    previous_capture_ns is not None
+                    and frame.server_capture_monotonic_ns <= previous_capture_ns
+                ):
+                    raise DeploymentError(
+                        "TeleImager atomic RGBD server capture timestamp did not advance"
+                    )
+
+                rgb = _decode_color_jpeg_rgb(frame.color_jpeg, self.config)
+                depth_u16 = _decode_depth_png_u16(frame.aligned_depth_png)
+                depth_gray, surface_normals = self._encode_geometry(depth_u16)
+                self._last_rgbd_sequence = frame.sequence
+                self._last_rgbd_server_capture_ns = frame.server_capture_monotonic_ns
+                self._atomic_ever_succeeded = True
+                self._reported_stream_fps = True
+                if not getattr(self, "_geometry_selection_logged", False):
+                    LOGGER.info(
+                        "TeleImager geometry transport selected atomic RGBD v1 at %.1f measured FPS; "
+                        "legacy RGB+depth remains armed for fallback",
+                        measured_fps,
+                    )
+                    self._geometry_selection_logged = True
+                return CameraImages(
+                    rgb=rgb,
+                    depth_gray=depth_gray,
+                    surface_normals=surface_normals,
+                    sequence=frame.sequence,
+                )
+            except TimeoutError as exc:
+                last_error = exc
+                time.sleep(0.005)
+            except (TypeError, ValueError) as exc:
+                raise DeploymentError(f"Invalid TeleImager atomic RGBD packet: {exc}") from exc
+        raise TimeoutError(f"Timed out waiting for fresh atomic TeleImager RGBD ({last_error})")
+
+    def _read_legacy_geometry(self, timeout_s: float) -> CameraImages:
         deadline = time.monotonic() + timeout_s
         last_error: Exception | None = None
         while time.monotonic() < deadline:
@@ -1970,45 +2147,19 @@ class TeleimagerCamera:
                 if not depth_bytes:
                     raise TimeoutError("TeleImager aligned-depth stream has no fresh PNG")
                 depth_u16 = _decode_depth_png_u16(depth_bytes)
-                if list(depth_u16.shape) != EXPECTED_DEPTH_VIEW_SHAPE[:2]:
-                    raise DeploymentError(
-                        f"Aligned depth shape {depth_u16.shape} does not match the training contract "
-                        f"{tuple(EXPECTED_DEPTH_VIEW_SHAPE[:2])}"
-                    )
-                try:
-                    depth_encoding = getattr(self, "_depth_encoding", None)
-                    surface_normal_encoding = getattr(self, "_surface_normal_encoding", None)
-                    if depth_encoding is not None:
-                        depth_gray = encode_depth_gray_rgb(
-                            depth_u16,
-                            scale_m_per_unit=self._depth_scale_m_per_unit,
-                            near_m=depth_encoding.near_m,
-                            far_m=depth_encoding.far_m,
-                        )
-                        surface_normals = None
-                    elif surface_normal_encoding is not None:
-                        depth_gray = None
-                        surface_normals = encode_surface_normals_rgb(
-                            depth_u16,
-                            scale_m_per_unit=self._depth_scale_m_per_unit,
-                            intrinsics=surface_normal_encoding.intrinsics,
-                            max_neighbor_depth_delta_m=(
-                                surface_normal_encoding.max_neighbor_depth_delta_m
-                            ),
-                        )
-                    else:
-                        raise DeploymentError("Geometry camera has no selected encoding")
-                except ValueError as exc:
-                    raise DeploymentError(f"Could not encode aligned depth geometry: {exc}") from exc
+                depth_gray, surface_normals = self._encode_geometry(depth_u16)
                 self._last_color_received_ns = received_ns["RGB"]
                 self._last_depth_received_ns = received_ns["aligned-depth"]
                 if not self._reported_stream_fps:
-                    LOGGER.info(
-                        "TeleImager legacy streams are live: RGB %.1f FPS, aligned depth %.1f FPS",
-                        measured_fps["RGB"],
-                        measured_fps["aligned-depth"],
-                    )
                     self._reported_stream_fps = True
+                    if not getattr(self, "_geometry_selection_logged", False):
+                        LOGGER.info(
+                            "TeleImager geometry transport selected legacy RGB+depth at %.1f/%.1f "
+                            "measured FPS",
+                            measured_fps["RGB"],
+                            measured_fps["aligned-depth"],
+                        )
+                        self._geometry_selection_logged = True
                 return CameraImages(
                     rgb=rgb,
                     depth_gray=depth_gray,
@@ -2020,6 +2171,25 @@ class TeleimagerCamera:
             except (TypeError, ValueError) as exc:
                 raise DeploymentError(f"Invalid TeleImager geometry frame: {exc}") from exc
         raise TimeoutError(f"Timed out waiting for fresh TeleImager geometry ({last_error})")
+
+    def _read_geometry(self, timeout_s: float) -> CameraImages:
+        if getattr(self, "_geometry_transport", "legacy") != "atomic":
+            return self._read_legacy_geometry(timeout_s)
+
+        started = time.monotonic()
+        atomic_fraction = 0.4 if getattr(self, "_atomic_ever_succeeded", False) else 0.75
+        atomic_timeout = max(0.001, timeout_s * atomic_fraction)
+        try:
+            return self._read_atomic_geometry(atomic_timeout)
+        except Exception as exc:
+            self._geometry_transport = "legacy"
+            LOGGER.warning(
+                "TeleImager atomic RGBD failed (%s); permanently falling back to legacy RGB+depth",
+                exc,
+            )
+            self._geometry_selection_logged = True
+            remaining = max(0.001, timeout_s - (time.monotonic() - started))
+            return self._read_legacy_geometry(remaining)
 
     def read(self, timeout_s: float = 3.0) -> CameraImages:
         if self._requires_depth:

@@ -5,7 +5,11 @@ import unittest
 
 import numpy as np
 
-from unitree_lerobot.eval_robot.eval_groot_g1 import chunk_delta_summary
+from unitree_lerobot.eval_robot.eval_groot_g1 import (
+    EXPERIMENTAL_ATOMIC_RGBD_OPT_IN,
+    _prefer_atomic_rgbd_for_camera,
+    chunk_delta_summary,
+)
 from unitree_lerobot.eval_robot.groot_contract import (
     ACTION_KEYS,
     DEPTH_ONLY_VIDEO_KEYS,
@@ -42,6 +46,21 @@ def _modality_config(video_keys: tuple[str, ...]) -> dict:
 
 
 class GeometryOnlyContractTests(unittest.TestCase):
+    def test_runner_never_prefers_atomic_rgbd_without_experimental_opt_in(self):
+        self.assertIs(EXPERIMENTAL_ATOMIC_RGBD_OPT_IN, False)
+        for end_effector in ("dex3", "inspire-dfx", "inspire-ftp"):
+            for requires_geometry in (False, True):
+                with self.subTest(
+                    end_effector=end_effector,
+                    requires_geometry=requires_geometry,
+                ):
+                    self.assertFalse(
+                        _prefer_atomic_rgbd_for_camera(
+                            end_effector,
+                            requires_geometry=requires_geometry,
+                        )
+                    )
+
     def test_geometry_only_contracts_apply_to_dex3_and_inspire(self):
         cases = (
             (DEPTH_ONLY_VIDEO_KEYS, True, False),

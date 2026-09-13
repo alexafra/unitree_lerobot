@@ -74,6 +74,8 @@ from unitree_lerobot.eval_robot.groot_contract import (
     validate_measured_state,
 )
 from unitree_lerobot.eval_robot.image_server.rgbd_protocol import (
+    RGBD_PROTOCOL,
+    TeleRgbdFrame,
     pack_rgbd_packet,
     unpack_rgbd_packet,
 )
@@ -3317,6 +3319,228 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertEqual(frame.sequence, 4)
         self.assertEqual(frame.received_monotonic_ns, 10)
 
+    def test_image_client_can_add_atomic_rgbd_to_legacy_geometry_streams(self):
+        if image_client_module is None:
+            self.skipTest(f"TeleImager client dependencies are unavailable: {image_client_import_error_message}")
+        config = {
+            "head_camera": {
+                "enable_zmq": True,
+                "enable_webrtc": False,
+                "zmq_port": 5555,
+                "depth_zmq_port": 5556,
+                "rgbd_zmq_port": 5560,
+            },
+            "left_wrist_camera": {"enable_zmq": False},
+            "right_wrist_camera": {"enable_zmq": False},
+        }
+        packet = pack_rgbd_packet(4, 5, b"jpeg", b"png")
+
+        class FakeRequester:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def request(self):
+                return config
+
+            def close(self):
+                pass
+
+        class FakeManager:
+            def __init__(self):
+                self.calls = []
+
+            def subscribe(self, host, port, request_bgr=False):
+                self.calls.append((host, port, request_bgr))
+                return image_client_module.TeleImage(
+                    fps=30.0,
+                    jpg=packet,
+                    received_monotonic_ns=10,
+                )
+
+            def close(self):
+                pass
+
+        manager = FakeManager()
+        with (
+            mock.patch.object(image_client_module, "ZMQ_Requester", FakeRequester),
+            mock.patch.object(
+                image_client_module.ZMQ_SubscriberManager,
+                "get_instance",
+                return_value=manager,
+            ),
+        ):
+            client = image_client_module.ImageClient(host="camera", request_depth=True)
+            client.enable_head_rgbd_stream()
+            client.get_head_frame()
+            client.get_head_depth_frame()
+            frame = client.get_head_rgbd_frame()
+
+        self.assertEqual(
+            manager.calls,
+            [
+                ("camera", 5555, False),
+                ("camera", 5556, False),
+                ("camera", 5560, False),
+                ("camera", 5555, False),
+                ("camera", 5556, False),
+                ("camera", 5560, False),
+            ],
+        )
+        self.assertEqual(frame.sequence, 4)
+
+    def test_geometry_camera_atomic_preference_is_explicit_and_keeps_legacy_armed(self):
+        live_config = {
+            "head_camera": {
+                "enable_zmq": True,
+                "enable_webrtc": False,
+                "fps": 30,
+                "image_shape": [480, 640],
+                "type": "realsense",
+                "enable_depth": True,
+                "binocular": False,
+                "zmq_port": 5555,
+                "depth_zmq_port": 5556,
+                "depth_scale_m_per_unit": 0.001,
+                "rgbd_protocol": RGBD_PROTOCOL,
+                "rgbd_zmq_port": 5560,
+            }
+        }
+
+        class FakeImageClient:
+            instance = None
+
+            def __init__(self, **kwargs):
+                type(self).instance = self
+                self.kwargs = kwargs
+                self.closed = False
+                self.atomic_enable_calls = 0
+                alive = SimpleNamespace(is_alive=lambda: True)
+                self._subscriber_manager = SimpleNamespace(
+                    _subscriber_threads={
+                        ("camera-host", 5555): alive,
+                        ("camera-host", 5556): alive,
+                    }
+                )
+
+            def get_cam_config(self):
+                return live_config
+
+            def enable_head_rgbd_stream(self):
+                self.atomic_enable_calls += 1
+                self._subscriber_manager._subscriber_threads[("camera-host", 5560)] = (
+                    SimpleNamespace(is_alive=lambda: True)
+                )
+
+            def close(self):
+                self.closed = True
+
+        module_name = "unitree_lerobot.eval_robot.image_server.image_client"
+        fake_module = ModuleType(module_name)
+        fake_module.ImageClient = FakeImageClient
+        with (
+            mock.patch.dict(sys.modules, {module_name: fake_module}),
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.request_live_camera_config",
+                return_value=live_config,
+            ),
+        ):
+            camera = TeleimagerCamera(
+                "camera-host",
+                DepthEncodingContract(near_m=0.25, far_m=1.0),
+                prefer_atomic_rgbd=True,
+            )
+            atomic_client = FakeImageClient.instance
+            with self.assertLogs(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3",
+                level="WARNING",
+            ) as legacy_logs:
+                default_camera = TeleimagerCamera(
+                    "camera-host",
+                    DepthEncodingContract(near_m=0.25, far_m=1.0),
+                )
+            default_client = FakeImageClient.instance
+
+        self.assertEqual(camera._geometry_transport, "atomic")
+        self.assertEqual(atomic_client.atomic_enable_calls, 1)
+        self.assertTrue(atomic_client.kwargs["request_depth"])
+        self.assertNotIn("request_rgbd", atomic_client.kwargs)
+        self.assertIsNotNone(camera._head_subscriber)
+        self.assertIsNotNone(camera._depth_subscriber)
+        self.assertEqual(default_camera._geometry_transport, "legacy")
+        self.assertEqual(default_client.atomic_enable_calls, 0)
+        self.assertEqual(len(legacy_logs.output), 1)
+        self.assertIn("matching the training data collection transport", legacy_logs.output[0])
+        camera.close()
+        default_camera.close()
+
+    def test_geometry_camera_protocol_mismatch_selects_legacy_without_refusing(self):
+        live_config = {
+            "head_camera": {
+                "enable_zmq": True,
+                "enable_webrtc": False,
+                "fps": 30,
+                "image_shape": [480, 640],
+                "type": "realsense",
+                "enable_depth": True,
+                "binocular": False,
+                "zmq_port": 5555,
+                "depth_zmq_port": 5556,
+                "depth_scale_m_per_unit": 0.001,
+                "rgbd_protocol": "teleimager-rgbd-v2",
+                "rgbd_zmq_port": 5560,
+            }
+        }
+
+        class FakeImageClient:
+            instance = None
+
+            def __init__(self, **_kwargs):
+                type(self).instance = self
+                self.closed = False
+                self.atomic_enable_calls = 0
+                alive = SimpleNamespace(is_alive=lambda: True)
+                self._subscriber_manager = SimpleNamespace(
+                    _subscriber_threads={
+                        ("camera-host", 5555): alive,
+                        ("camera-host", 5556): alive,
+                    }
+                )
+
+            def get_cam_config(self):
+                return live_config
+
+            def enable_head_rgbd_stream(self):
+                self.atomic_enable_calls += 1
+
+            def close(self):
+                self.closed = True
+
+        module_name = "unitree_lerobot.eval_robot.image_server.image_client"
+        fake_module = ModuleType(module_name)
+        fake_module.ImageClient = FakeImageClient
+        with (
+            mock.patch.dict(sys.modules, {module_name: fake_module}),
+            mock.patch(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.request_live_camera_config",
+                return_value=live_config,
+            ),
+            self.assertLogs(
+                "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3",
+                level="WARNING",
+            ) as logs,
+        ):
+            camera = TeleimagerCamera(
+                "camera-host",
+                DepthEncodingContract(near_m=0.25, far_m=1.0),
+                prefer_atomic_rgbd=True,
+            )
+
+        self.assertEqual(camera._geometry_transport, "legacy")
+        self.assertEqual(FakeImageClient.instance.atomic_enable_calls, 0)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("selected legacy RGB+depth", logs.output[0])
+        camera.close()
+
     def test_image_client_missing_rgbd_port_closes_requester_and_manager(self):
         if image_client_module is None:
             self.skipTest(f"TeleImager client dependencies are unavailable: {image_client_import_error_message}")
@@ -3509,6 +3733,150 @@ class GrootG1DeploymentTests(unittest.TestCase):
             max_neighbor_depth_delta_m=0.05,
         )
         np.testing.assert_array_equal(images.surface_normals, expected)
+
+    def test_geometry_camera_uses_atomic_packet_sequence_and_paired_images(self):
+        bgr = np.zeros((480, 640, 3), dtype=np.uint8)
+        depth = np.full((480, 640), 625, dtype=np.uint16)
+        color_ok, color_jpeg = cv2.imencode(".jpg", bgr)
+        depth_ok, depth_png = cv2.imencode(".png", depth)
+        self.assertTrue(color_ok and depth_ok)
+        frame = TeleRgbdFrame(
+            sequence=9,
+            server_capture_monotonic_ns=123,
+            received_monotonic_ns=time.monotonic_ns(),
+            color_jpeg=color_jpeg.tobytes(),
+            aligned_depth_png=depth_png.tobytes(),
+        )
+
+        camera = object.__new__(TeleimagerCamera)
+        camera._requires_depth = True
+        camera._depth_encoding = DepthEncodingContract(near_m=0.25, far_m=1.0)
+        camera._surface_normal_encoding = None
+        camera._depth_scale_m_per_unit = 0.001
+        camera._geometry_transport = "atomic"
+        camera._atomic_ever_succeeded = False
+        camera._geometry_selection_logged = False
+        camera._last_rgbd_sequence = None
+        camera._last_rgbd_server_capture_ns = None
+        camera._reported_stream_fps = False
+        camera._rgbd_subscriber = SimpleNamespace(is_alive=lambda: True)
+        camera._head_subscriber = SimpleNamespace(is_alive=lambda: True)
+        camera._depth_subscriber = SimpleNamespace(is_alive=lambda: True)
+
+        class FakeClient:
+            def get_head_rgbd_frame(self):
+                return frame
+
+            def get_head_rgbd_fps(self):
+                return 30.0
+
+            def get_head_frame(self):
+                raise AssertionError("legacy RGB must not be read while atomic is healthy")
+
+            def get_head_depth_frame(self):
+                raise AssertionError("legacy depth must not be read while atomic is healthy")
+
+        camera._client = FakeClient()
+        camera.config = {
+            "head_camera": {
+                "image_shape": [480, 640],
+                "binocular": False,
+            }
+        }
+
+        with self.assertLogs(
+            "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3",
+            level="INFO",
+        ) as logs:
+            images = camera.read(timeout_s=0.05)
+
+        self.assertEqual(images.sequence, 9)
+        self.assertEqual(camera._geometry_transport, "atomic")
+        self.assertTrue(camera._atomic_ever_succeeded)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("selected atomic RGBD v1", logs.output[0])
+        expected = encode_depth_gray_rgb(
+            depth,
+            scale_m_per_unit=0.001,
+            near_m=0.25,
+            far_m=1.0,
+        )
+        np.testing.assert_array_equal(images.depth_gray, expected)
+
+    def test_geometry_camera_atomic_failure_sticks_to_legacy_without_log_spam(self):
+        bgr = np.zeros((480, 640, 3), dtype=np.uint8)
+        depth = np.full((480, 640), 625, dtype=np.uint16)
+        color_ok, color_jpeg = cv2.imencode(".jpg", bgr)
+        depth_ok, depth_png = cv2.imencode(".png", depth)
+        self.assertTrue(color_ok and depth_ok)
+
+        camera = object.__new__(TeleimagerCamera)
+        camera._requires_depth = True
+        camera._depth_encoding = DepthEncodingContract(near_m=0.25, far_m=1.0)
+        camera._surface_normal_encoding = None
+        camera._depth_scale_m_per_unit = 0.001
+        camera._geometry_transport = "atomic"
+        camera._atomic_ever_succeeded = True
+        camera._geometry_selection_logged = True
+        camera._last_rgbd_sequence = 9
+        camera._last_rgbd_server_capture_ns = 123
+        camera._last_color_received_ns = None
+        camera._last_depth_received_ns = None
+        camera._reported_stream_fps = True
+        camera._rgbd_subscriber = SimpleNamespace(is_alive=lambda: True)
+        camera._head_subscriber = SimpleNamespace(is_alive=lambda: True)
+        camera._depth_subscriber = SimpleNamespace(is_alive=lambda: True)
+
+        class FakeClient:
+            def __init__(self):
+                self.atomic_calls = 0
+                self.legacy_sequence = 0
+                self.received_ns = time.monotonic_ns()
+
+            def get_head_rgbd_frame(self):
+                self.atomic_calls += 1
+                raise ValueError("corrupt atomic packet")
+
+            def get_head_rgbd_fps(self):
+                return 30.0
+
+            def get_head_frame(self):
+                self.legacy_sequence += 1
+                self.received_ns = time.monotonic_ns()
+                return SimpleNamespace(
+                    jpg=color_jpeg.tobytes(),
+                    fps=30.0,
+                    received_monotonic_ns=self.received_ns,
+                )
+
+            def get_head_depth_frame(self):
+                return SimpleNamespace(
+                    jpg=depth_png.tobytes(),
+                    fps=30.0,
+                    received_monotonic_ns=self.received_ns,
+                )
+
+        camera._client = FakeClient()
+        camera.config = {
+            "head_camera": {
+                "image_shape": [480, 640],
+                "binocular": False,
+            }
+        }
+
+        with self.assertLogs(
+            "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3",
+            level="WARNING",
+        ) as logs:
+            first = camera.read(timeout_s=0.05)
+            second = camera.read(timeout_s=0.05)
+
+        self.assertIsNone(first.sequence)
+        self.assertIsNone(second.sequence)
+        self.assertEqual(camera._geometry_transport, "legacy")
+        self.assertEqual(camera._client.atomic_calls, 1)
+        fallback_logs = [message for message in logs.output if "permanently falling back" in message]
+        self.assertEqual(len(fallback_logs), 1)
 
     def test_geometry_camera_fails_closed_on_receive_timestamp_regression(self):
         received_ns = time.monotonic_ns()

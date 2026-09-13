@@ -322,7 +322,7 @@ def test_ftp_sim_validates_ftp_metadata_then_uses_combined_dfx_runtime():
         mock.patch(f"{module}.initialize_dds") as initialize_dds,
         mock.patch(f"{module}.G1InspireDfxStateReader", return_value=reader) as dfx_reader,
         mock.patch(f"{module}.G1InspireFtpStateReader") as ftp_reader,
-        mock.patch(f"{module}.TeleimagerCamera", return_value=camera),
+        mock.patch(f"{module}.TeleimagerCamera", return_value=camera) as camera_factory,
         mock.patch(f"{module}.infer_chunk", return_value=(chunk, 0.01)) as infer_chunk,
         mock.patch(f"{module}.chunk_delta_summary", return_value="synthetic preflight"),
     ):
@@ -336,6 +336,7 @@ def test_ftp_sim_validates_ftp_metadata_then_uses_combined_dfx_runtime():
     initialize_dds.assert_called_once_with(True, None)
     dfx_reader.assert_called_once_with(simulation=True)
     ftp_reader.assert_not_called()
+    assert camera_factory.call_args.kwargs["prefer_atomic_rgbd"] is False
     policy.reset.assert_called_once_with()
     policy.close.assert_called_once_with()
     reader.close.assert_called_once_with()

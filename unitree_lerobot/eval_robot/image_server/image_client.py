@@ -770,8 +770,26 @@ class ImageClient:
     def get_cam_config(self):
         return self._cam_config
 
-    def get_head_frame(self):
+    def enable_head_rgbd_stream(self) -> None:
+        """Add the optional atomic head RGBD subscription to this client.
+
+        Geometry policy clients use this after their legacy RGB and depth
+        subscriptions are established.  A failed optional subscription leaves
+        those legacy streams usable so callers can fall back without rebuilding
+        the process-wide subscriber manager.
+        """
+
         if self._request_rgbd:
+            return
+        port = self._cam_config['head_camera'].get('rgbd_zmq_port')
+        if port is None:
+            raise RuntimeError("Head camera has no rgbd_zmq_port")
+        self._subscriber_manager.subscribe(self._host, port, request_bgr=False)
+        self._request_rgbd = True
+        self._last_rgbd_fps = 0.0
+
+    def get_head_frame(self):
+        if self._request_rgbd and not self._request_depth:
             raise RuntimeError("This ImageClient requested RGBD; use get_head_rgbd_frame()")
         return self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'], request_bgr=self._request_bgr)
 

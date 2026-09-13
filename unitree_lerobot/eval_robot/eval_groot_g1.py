@@ -105,6 +105,10 @@ VOICE_STAY_HOLDING = "\x00voice-stay-holding"
 VOICE_RETURN_TO_START_UNAVAILABLE = "\x00voice-return-to-start-unavailable"
 RTC_MIN_MODEL_HORIZON = 32
 RTC_DELAY_HISTORY = 8
+# Manual/test-only capability gate. Production runs keep every profile and
+# modality on the established legacy TeleImager transport unless this source
+# constant is deliberately changed for a controlled experiment.
+EXPERIMENTAL_ATOMIC_RGBD_OPT_IN = False
 
 
 class OperatorRelease(Exception):
@@ -769,6 +773,16 @@ def resolve_runtime_end_effector(end_effector: str, simulation: bool) -> str:
             )
         return runtime.name
     return end_effector
+
+
+def _prefer_atomic_rgbd_for_camera(end_effector: str, *, requires_geometry: bool) -> bool:
+    """Select atomic pairing only for an explicitly enabled Inspire experiment."""
+
+    return (
+        EXPERIMENTAL_ATOMIC_RGBD_OPT_IN
+        and requires_geometry
+        and end_effector in {"inspire-dfx", "inspire-ftp"}
+    )
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -2998,10 +3012,17 @@ def run(args: argparse.Namespace) -> None:
         surface_normal_encoding = (
             visual_encoding if isinstance(visual_encoding, SurfaceNormalEncodingContract) else None
         )
+        prefer_atomic_rgbd = _prefer_atomic_rgbd_for_camera(
+            end_effector,
+            requires_geometry=(
+                depth_encoding is not None or surface_normal_encoding is not None
+            ),
+        )
         camera = TeleimagerCamera(
             image_host,
             depth_encoding=depth_encoding,
             surface_normal_encoding=surface_normal_encoding,
+            prefer_atomic_rgbd=prefer_atomic_rgbd,
         )
         head = camera.config["head_camera"]
         LOGGER.info(
