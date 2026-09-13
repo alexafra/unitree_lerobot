@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Subscriber-only Dex3 joint-position/range probe.
+"""Subscriber-only Dex3 or Inspire FTP hand-state/range probe.
 
-This tool creates only the two Dex3 state subscribers. It never constructs a
-command publisher and never contacts the camera or policy server.
+This tool creates only the two selected hand-state subscribers. It never
+constructs a command publisher and never contacts the camera or policy server.
 """
 
 from __future__ import annotations
@@ -17,45 +17,120 @@ from typing import Any
 
 import numpy as np
 
-from unitree_lerobot.eval_robot.groot_contract import (
-    LEFT_HAND_JOINT_NAMES,
-    LEFT_HAND_LOWER,
-    LEFT_HAND_UPPER,
-    RIGHT_HAND_JOINT_NAMES,
-    RIGHT_HAND_LOWER,
-    RIGHT_HAND_UPPER,
+from unitree_lerobot.eval_robot.g1_end_effectors import (
+    DEX3_PROFILE,
+    INSPIRE_FTP_PROFILE,
+    EndEffectorProfile,
 )
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import initialize_dds
 
 
-HAND_DOF = 7
 FRESHNESS_REFERENCE_S = 0.075
+PROBE_PROFILES = {
+    DEX3_PROFILE.name: DEX3_PROFILE,
+    INSPIRE_FTP_PROFILE.name: INSPIRE_FTP_PROFILE,
+}
+
+
+def _decode_dex3_state(message: Any) -> np.ndarray | None:
+    motor_state = getattr(message, "motor_state", None)
+    if motor_state is None or len(motor_state) < DEX3_PROFILE.hand_dof:
+        return None
+    try:
+        values = np.asarray(
+            [motor_state[index].q for index in range(DEX3_PROFILE.hand_dof)],
+            dtype=np.float64,
+        )
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+    if values.shape != (DEX3_PROFILE.hand_dof,) or not np.all(np.isfinite(values)):
+        return None
+    return values
+
+
+def _decode_inspire_ftp_state(message: Any) -> np.ndarray | None:
+    try:
+        raw = np.asarray(message.angle_act)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if raw.shape != (INSPIRE_FTP_PROFILE.hand_dof,) or raw.dtype.kind not in "iuf":
+        return None
+    values = np.ascontiguousarray(raw, dtype=np.float64)
+    if not np.all(np.isfinite(values)) or np.any(values < 0.0) or np.any(values > 1000.0):
+        return None
+    return values / 1000.0
+
+
+def _profile_and_decoder(end_effector: str):
+    try:
+        profile = PROBE_PROFILES[end_effector]
+    except KeyError as exc:
+        choices = ", ".join(PROBE_PROFILES)
+        raise ValueError(f"Unsupported end effector {end_effector!r}; expected one of: {choices}") from exc
+    decoder = _decode_dex3_state if profile is DEX3_PROFILE else _decode_inspire_ftp_state
+    return profile, decoder
+
+
+def _state_message_type(end_effector: str):
+    if end_effector == DEX3_PROFILE.name:
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandState_
+
+        return HandState_
+    if end_effector == INSPIRE_FTP_PROFILE.name:
+        try:
+            from inspire_sdkpy import inspire_dds
+        except ImportError as exc:
+            raise RuntimeError(
+                "Inspire FTP probing requires the vendor inspire_sdkpy package"
+            ) from exc
+        try:
+            return inspire_dds.inspire_hand_state
+        except AttributeError as exc:
+            raise RuntimeError(
+                "Installed inspire_sdkpy is missing the inspire_hand_state DDS type"
+            ) from exc
+    raise ValueError(f"Unsupported end effector {end_effector!r}")
 
 
 @dataclass
 class HandRange:
     name: str
+    hand_dof: int
+    callback_count: int = 0
     count: int = 0
+    rejected_count: int = 0
+    first_received_at: float | None = None
     received_at: float | None = None
     previous_received_at: float | None = None
     maximum_gap_s: float = 0.0
     gaps_over_freshness: list[float] = field(default_factory=list)
-    current: np.ndarray = field(default_factory=lambda: np.full(HAND_DOF, np.nan))
-    minimum: np.ndarray = field(default_factory=lambda: np.full(HAND_DOF, np.inf))
-    maximum: np.ndarray = field(default_factory=lambda: np.full(HAND_DOF, -np.inf))
+    current: np.ndarray = field(init=False)
+    minimum: np.ndarray = field(init=False)
+    maximum: np.ndarray = field(init=False)
 
-    def update(self, message: Any, received_at: float) -> None:
-        motor_state = getattr(message, "motor_state", None)
-        if motor_state is None or len(motor_state) < HAND_DOF:
+    def __post_init__(self) -> None:
+        if self.hand_dof <= 0:
+            raise ValueError("hand_dof must be positive")
+        self.current = np.full(self.hand_dof, np.nan)
+        self.minimum = np.full(self.hand_dof, np.inf)
+        self.maximum = np.full(self.hand_dof, -np.inf)
+
+    def update(self, values: np.ndarray | None, received_at: float) -> None:
+        self.callback_count += 1
+        if values is None:
+            self.rejected_count += 1
             return
-        values = np.asarray([motor_state[index].q for index in range(HAND_DOF)], dtype=np.float64)
-        if values.shape != (HAND_DOF,) or not np.all(np.isfinite(values)):
+        values = np.asarray(values, dtype=np.float64)
+        if values.shape != (self.hand_dof,) or not np.all(np.isfinite(values)):
+            self.rejected_count += 1
             return
         if self.received_at is not None:
             gap = received_at - self.received_at
             self.maximum_gap_s = max(self.maximum_gap_s, gap)
             if gap > FRESHNESS_REFERENCE_S:
                 self.gaps_over_freshness.append(gap)
+        if self.first_received_at is None:
+            self.first_received_at = received_at
         self.previous_received_at = self.received_at
         self.received_at = received_at
         self.count += 1
@@ -63,18 +138,53 @@ class HandRange:
         self.minimum = np.minimum(self.minimum, values)
         self.maximum = np.maximum(self.maximum, values)
 
+    def copy(self) -> HandRange:
+        result = HandRange(self.name, self.hand_dof)
+        result.callback_count = self.callback_count
+        result.count = self.count
+        result.rejected_count = self.rejected_count
+        result.first_received_at = self.first_received_at
+        result.received_at = self.received_at
+        result.previous_received_at = self.previous_received_at
+        result.maximum_gap_s = self.maximum_gap_s
+        result.gaps_over_freshness = list(self.gaps_over_freshness)
+        result.current = self.current.copy()
+        result.minimum = self.minimum.copy()
+        result.maximum = self.maximum.copy()
+        return result
+
+    @property
+    def mean_rate_hz(self) -> float:
+        if self.count < 2 or self.first_received_at is None or self.received_at is None:
+            return math.nan
+        elapsed = self.received_at - self.first_received_at
+        return (self.count - 1) / elapsed if elapsed > 0.0 else math.nan
+
+    @property
+    def latest_rate_hz(self) -> float:
+        if self.previous_received_at is None or self.received_at is None:
+            return math.nan
+        elapsed = self.received_at - self.previous_received_at
+        return 1.0 / elapsed if elapsed > 0.0 else math.nan
+
 
 class Dex3RangeProbe:
-    def __init__(self, network_interface: str):
-        from unitree_sdk2py.core.channel import ChannelSubscriber
-        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandState_
+    """Historical name retained for existing imports; supports both probe profiles."""
 
+    def __init__(self, network_interface: str, end_effector: str = "dex3"):
+        from unitree_sdk2py.core.channel import ChannelSubscriber
+
+        self.profile, self._decoder = _profile_and_decoder(end_effector)
+        message_type = _state_message_type(end_effector)
         initialize_dds(False, network_interface)
         self._lock = threading.Lock()
-        self.hands = {"left": HandRange("left"), "right": HandRange("right")}
+        self.hands = {
+            "left": HandRange("left", self.profile.hand_dof),
+            "right": HandRange("right", self.profile.hand_dof),
+        }
         self._subscribers = {
-            "left": ChannelSubscriber("rt/dex3/left/state", HandState_),
-            "right": ChannelSubscriber("rt/dex3/right/state", HandState_),
+            "left": ChannelSubscriber(self.profile.left_state_topic, message_type),
+            "right": ChannelSubscriber(self.profile.right_state_topic, message_type),
         }
         for name, subscriber in self._subscribers.items():
             subscriber.Init(handler=self._handler(name))
@@ -83,27 +193,16 @@ class Dex3RangeProbe:
         def receive(message: Any) -> None:
             if message is None:
                 return
+            received_at = time.monotonic()
+            values = self._decoder(message)
             with self._lock:
-                self.hands[name].update(message, time.monotonic())
+                self.hands[name].update(values, received_at)
 
         return receive
 
     def snapshot(self) -> dict[str, HandRange]:
         with self._lock:
-            result = {}
-            for name, hand in self.hands.items():
-                result[name] = HandRange(
-                    name=hand.name,
-                    count=hand.count,
-                    received_at=hand.received_at,
-                    previous_received_at=hand.previous_received_at,
-                    maximum_gap_s=hand.maximum_gap_s,
-                    gaps_over_freshness=list(hand.gaps_over_freshness),
-                    current=hand.current.copy(),
-                    minimum=hand.minimum.copy(),
-                    maximum=hand.maximum.copy(),
-                )
-            return result
+            return {name: hand.copy() for name, hand in self.hands.items()}
 
     def close(self) -> None:
         for subscriber in self._subscribers.values():
@@ -117,24 +216,38 @@ def _format_live(hand: HandRange, now: float) -> str:
     age = now - hand.received_at
     values = " ".join(f"{value:+.4f}" for value in hand.current)
     return (
-        f"{hand.name:>5}: n={hand.count:7d} age={age:6.3f}s "
-        f"max_gap={hand.maximum_gap_s:6.3f}s q=[{values}]"
+        f"{hand.name:>5}: n={hand.count:7d} rate={hand.mean_rate_hz:7.2f}Hz "
+        f"latest={hand.latest_rate_hz:7.2f}Hz age={age:6.3f}s "
+        f"max_gap={hand.maximum_gap_s:6.3f}s state=[{values}]"
     )
 
 
-def _print_mapping() -> None:
+def _print_mapping(profile: EndEffectorProfile) -> None:
+    print(
+        f"End effector: {profile.name}; value unit: {profile.value_unit}; "
+        "timing: accepted DDS callback receipt"
+    )
+    print(f"State topics: left={profile.left_state_topic} right={profile.right_state_topic}")
     print("Numeric motor IDs and repository labels (verify the physical finger independently):")
-    for side, names in (("left", LEFT_HAND_JOINT_NAMES), ("right", RIGHT_HAND_JOINT_NAMES)):
+    for side, names in (("left", profile.left_joint_names), ("right", profile.right_joint_names)):
         print(f"  {side}: " + ", ".join(f"{index}={name}" for index, name in enumerate(names)))
 
 
-def _print_summary(hand: HandRange, names: tuple[str, ...], lower: np.ndarray, upper: np.ndarray) -> None:
+def _print_summary(
+    hand: HandRange,
+    names: tuple[str, ...],
+    lower: np.ndarray,
+    upper: np.ndarray,
+    value_unit: str,
+) -> None:
     print(f"\n{hand.name.upper()} HAND SUMMARY")
     print(
-        f"samples={hand.count} max_gap={hand.maximum_gap_s:.6f}s "
+        f"callbacks={hand.callback_count} accepted={hand.count} rejected={hand.rejected_count} "
+        f"mean_rate={hand.mean_rate_hz:.3f}Hz max_gap={hand.maximum_gap_s:.6f}s "
         f"gaps_over_{FRESHNESS_REFERENCE_S:.3f}s={len(hand.gaps_over_freshness)}"
     )
-    print(" id  label                         min_q      max_q       span    nominal_lower nominal_upper")
+    print(f"values are {value_unit}")
+    print(" id  label                         minimum    maximum      span    nominal_lower nominal_upper")
     for index, name in enumerate(names):
         if hand.count:
             minimum = hand.minimum[index]
@@ -155,6 +268,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--network-interface", required=True, help="Robot DDS interface, for example enp0s1")
     parser.add_argument(
+        "--end-effector",
+        choices=tuple(PROBE_PROFILES),
+        default=DEX3_PROFILE.name,
+        help="Hand DDS transport to probe (default: dex3)",
+    )
+    parser.add_argument(
         "--duration",
         type=float,
         default=0.0,
@@ -173,8 +292,9 @@ def main() -> None:
 
     print("SUBSCRIBER ONLY: no DDS command publishers will be created.")
     print("Do not manually force a powered joint; use only a supported passive/test procedure.")
-    _print_mapping()
-    probe = Dex3RangeProbe(args.network_interface)
+    profile, _ = _profile_and_decoder(args.end_effector)
+    _print_mapping(profile)
+    probe = Dex3RangeProbe(args.network_interface, args.end_effector)
     started = time.monotonic()
     try:
         while args.duration == 0.0 or time.monotonic() - started < args.duration:
@@ -189,8 +309,20 @@ def main() -> None:
         snapshot = probe.snapshot()
         probe.close()
 
-    _print_summary(snapshot["left"], LEFT_HAND_JOINT_NAMES, LEFT_HAND_LOWER, LEFT_HAND_UPPER)
-    _print_summary(snapshot["right"], RIGHT_HAND_JOINT_NAMES, RIGHT_HAND_LOWER, RIGHT_HAND_UPPER)
+    _print_summary(
+        snapshot["left"],
+        profile.left_joint_names,
+        profile.left_lower,
+        profile.left_upper,
+        profile.value_unit,
+    )
+    _print_summary(
+        snapshot["right"],
+        profile.right_joint_names,
+        profile.right_lower,
+        profile.right_upper,
+        profile.value_unit,
+    )
 
 
 if __name__ == "__main__":
