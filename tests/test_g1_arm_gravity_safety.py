@@ -7,6 +7,7 @@ covered below with message/publisher fakes.
 
 from __future__ import annotations
 
+import ast
 import builtins
 from collections import deque
 import hashlib
@@ -313,6 +314,61 @@ class G1ArmGravityBackendIntegrationTests(unittest.TestCase):
         )
         self.assertFalse(
             zero_parser.parse_args([*required, "--no-gravity-feedforward"]).gravity_feedforward
+        )
+
+    def test_sim_arm_publish_uses_only_g1_lowcmd_slots_15_through_28(self):
+        robot_arm_path = (
+            Path(__file__).parents[1]
+            / "unitree_lerobot"
+            / "eval_robot"
+            / "robot_control"
+            / "robot_arm.py"
+        )
+        module = ast.parse(robot_arm_path.read_text(encoding="utf-8"))
+
+        def enum_values(class_name):
+            enum = next(
+                node
+                for node in module.body
+                if isinstance(node, ast.ClassDef) and node.name == class_name
+            )
+            return tuple(
+                ast.literal_eval(statement.value)
+                for statement in enum.body
+                if isinstance(statement, ast.Assign)
+            )
+
+        arm_indices = enum_values("G1_29_JointArmIndex")
+        self.assertEqual(arm_indices, tuple(range(15, 29)))
+        self.assertEqual(enum_values("G1_29_JointIndex")[:15], tuple(range(15)))
+
+        backend = self._backend(simulation=True)
+        backend._arm_indices = arm_indices
+        backend._arm_message = self._message(35)
+        untouched_indices = tuple(index for index in range(35) if index not in arm_indices)
+        untouched_before = {
+            index: vars(backend._arm_message.motor_cmd[index]).copy()
+            for index in untouched_indices
+        }
+        target = np.linspace(-0.35, 0.35, 14)
+
+        backend.set_target(target, backend._left_target, backend._right_target)
+        backend._publish_arm()
+
+        np.testing.assert_array_equal(
+            [backend._arm_message.motor_cmd[index].q for index in arm_indices],
+            target,
+        )
+        np.testing.assert_array_equal(
+            [backend._arm_message.motor_cmd[index].tau for index in arm_indices],
+            target + np.arange(14) + 0.25,
+        )
+        self.assertEqual(
+            {
+                index: vars(backend._arm_message.motor_cmd[index]).copy()
+                for index in untouched_indices
+            },
+            untouched_before,
         )
 
     def test_disabled_backend_rejects_nonboolean_before_dds_initialization(self):
