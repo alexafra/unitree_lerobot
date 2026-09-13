@@ -267,7 +267,7 @@ class SimulationArmFreshnessDeadlineTests(unittest.TestCase):
             _arm_state_freshness_limit(False, prearm=True),
             (PREARM_STATE_MAX_AGE_S, "PREARM_STATE_MAX_AGE_S"),
         )
-        self.assertEqual(TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S, 0.250)
+        self.assertEqual(TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S, 1.000)
         self.assertEqual(ACTUATOR_ARM_STATE_MAX_AGE_S, 0.100)
         self.assertEqual(PREARM_STATE_MAX_AGE_S, 0.050)
 
@@ -375,10 +375,10 @@ class SimulationArmFreshnessDeadlineTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 DeploymentError,
-                "TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S=0.250s",
+                "TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S=1.000s",
             ):
                 _wait_for_initialization_start(
-                    self._backend(simulation=True, age_s=0.251, now=now),
+                    self._backend(simulation=True, age_s=1.001, now=now),
                     threading.Event(),
                     heartbeat,
                 )

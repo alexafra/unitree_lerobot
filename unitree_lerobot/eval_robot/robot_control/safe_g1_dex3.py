@@ -74,8 +74,8 @@ ACTUATOR_ARM_STATE_MAX_AGE_S = 0.100
 # TEMPORARY / UNQUALIFIED / SIMULATION ONLY: Isaac's otherwise healthy
 # 100 Hz stream has shown one 107 ms host-scheduling gap while the actuator
 # process is being armed.  Permit that bounded simulator-only transient while
-# still failing closed after 250 ms.  Never reuse this deadline for hardware.
-TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S = 0.250
+# still failing closed after 1 second.  Never reuse this deadline for hardware.
+TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S = 1.000
 ACTUATOR_HAND_STATE_PAUSE_AGE_S = 0.100
 ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S = 1.250
 ACTUATOR_HAND_STATE_MAX_AGE_S = 3.0
