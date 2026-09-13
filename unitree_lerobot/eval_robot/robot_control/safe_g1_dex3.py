@@ -152,7 +152,11 @@ INSPIRE_FTP_WAIST_LIMIT_MARGIN_RAD = 0.02
 MAX_WAIST_DQ_RAD_S = 1.0
 MAX_WAIST_HOLD_ERROR_RAD = 0.05
 PREARM_STATIONARY_DWELL_S = 0.5
-PREARM_STATE_MAX_AGE_S = 0.05
+# Use the same bounded freshness deadline before authority takeover as during
+# real arm operation.  The former 50 ms pre-arm-only value caused nuisance
+# aborts on otherwise accepted 50 Hz-ish DDS delivery (for example, 52 ms),
+# while the runtime reader already qualifies samples through 100 ms.
+PREARM_STATE_MAX_AGE_S = ACTUATOR_ARM_STATE_MAX_AGE_S
 PREARM_MAX_ARM_DQ_RAD_S = 0.10
 PREARM_MAX_POSITION_DRIFT_RAD = 0.02
 PREARM_MIN_DISTINCT_SAMPLES = 5

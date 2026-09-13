@@ -291,7 +291,7 @@ class SimulationArmFreshnessDeadlineTests(unittest.TestCase):
         )
         self.assertEqual(TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S, 1.000)
         self.assertEqual(ACTUATOR_ARM_STATE_MAX_AGE_S, 0.100)
-        self.assertEqual(PREARM_STATE_MAX_AGE_S, 0.050)
+        self.assertEqual(PREARM_STATE_MAX_AGE_S, 0.100)
 
     def test_backend_passes_temporary_deadline_only_to_sim_reader(self):
         captured: list[dict[str, object]] = []
@@ -388,9 +388,9 @@ class SimulationArmFreshnessDeadlineTests(unittest.TestCase):
             )
             self.assertIsNotNone(state)
 
-            with self.assertRaisesRegex(DeploymentError, "PREARM_STATE_MAX_AGE_S=0.050s"):
+            with self.assertRaisesRegex(DeploymentError, "PREARM_STATE_MAX_AGE_S=0.100s"):
                 _wait_for_initialization_start(
-                    self._backend(simulation=False, age_s=0.051, now=now),
+                    self._backend(simulation=False, age_s=0.101, now=now),
                     threading.Event(),
                     heartbeat,
                 )
