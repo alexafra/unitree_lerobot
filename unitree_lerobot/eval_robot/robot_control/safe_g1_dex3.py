@@ -78,6 +78,9 @@ ACTUATOR_ARM_STATE_MAX_AGE_S = 0.100
 # still failing closed after 1 second.  Never reuse this deadline for hardware.
 TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S = 1.000
 ACTUATOR_HAND_STATE_PAUSE_AGE_S = 0.100
+# Inspire FTP feedback has an explicitly qualified wider live-deployment
+# pause window. Dex3 and Inspire DFX retain the existing 100 ms threshold.
+INSPIRE_FTP_HAND_STATE_PAUSE_AGE_S = 0.150
 # TEMPORARY / UNQUALIFIED / SIMULATION ONLY: tolerate the observed Isaac
 # hand-feedback scheduling gaps without weakening the physical-robot gate.
 TEMPORARY_UNQUALIFIED_SIM_HAND_STATE_PAUSE_AGE_S = 1.000
@@ -165,6 +168,10 @@ INITIALIZATION_HAND_SPEED_RAD_S = 0.50
 INITIALIZATION_MAX_ARM_STEP_RAD = INITIALIZATION_ARM_SPEED_RAD_S / PUBLISH_HZ
 INITIALIZATION_MAX_HAND_STEP_RAD = INITIALIZATION_HAND_SPEED_RAD_S / PUBLISH_HZ
 INITIALIZATION_MIN_MOVE_S = 0.50
+# Warmup2 deliberately approaches the first inferred policy target more slowly
+# than other guarded pose transitions.  This affects only the discarded
+# first-target warm-start; live policy actions remain scheduled at CONTROL_HZ.
+WARMUP2_SPEED_SCALE = 0.75
 INITIALIZATION_MAX_DURATION_S = 30.0
 INITIALIZATION_START_TIMEOUT_S = 3.0
 # Do not require a second stationary dwell after the operator has explicitly
@@ -234,11 +241,13 @@ def _arm_state_freshness_limit(
     return ACTUATOR_ARM_STATE_MAX_AGE_S, "ACTUATOR_ARM_STATE_MAX_AGE_S"
 
 
-def _hand_state_pause_age_limit(simulation: bool) -> float:
-    """Return the hand pause threshold without relaxing hardware."""
+def _hand_state_pause_age_limit(simulation: bool, end_effector: str) -> float:
+    """Return the profile-specific hand pause threshold."""
 
     if simulation:
         return TEMPORARY_UNQUALIFIED_SIM_HAND_STATE_PAUSE_AGE_S
+    if end_effector == "inspire-ftp":
+        return INSPIRE_FTP_HAND_STATE_PAUSE_AGE_S
     return ACTUATOR_HAND_STATE_PAUSE_AGE_S
 
 
@@ -1404,9 +1413,12 @@ def build_initialization_chunk(
     spec: InitializationSpec,
     *,
     allow_policy_warm_start: bool = False,
+    speed_scale: float = 1.0,
 ) -> ActionChunk:
     """Resolve measured targets and create a bounded smooth joint-space path."""
 
+    if not np.isfinite(speed_scale) or not 0.0 < speed_scale <= 1.0:
+        raise ValueError("speed_scale must be finite and in (0, 1]")
     validate_initialization_spec(spec, allow_policy_warm_start=allow_policy_warm_start)
     profile = get_end_effector_profile(spec.end_effector)
     validate_measured_state(
@@ -1444,9 +1456,13 @@ def build_initialization_chunk(
             np.asarray(spec.right_hand, dtype=np.float64).copy(),
         )
         max_steps = (
-            np.full(ARM_DOF, INITIALIZATION_MAX_ARM_STEP_RAD, dtype=np.float64),
-            profile.conditioned_step,
-            profile.conditioned_step,
+            np.full(
+                ARM_DOF,
+                INITIALIZATION_MAX_ARM_STEP_RAD * speed_scale,
+                dtype=np.float64,
+            ),
+            profile.conditioned_step * speed_scale,
+            profile.conditioned_step * speed_scale,
         )
         movement = any(np.any(target != measured) for measured, target in zip(current, targets, strict=True))
         steps = max(
@@ -1457,7 +1473,10 @@ def build_initialization_chunk(
             ),
         )
         if movement:
-            steps = max(steps, round(INITIALIZATION_MIN_MOVE_S * PUBLISH_HZ))
+            steps = max(
+                steps,
+                round(INITIALIZATION_MIN_MOVE_S * PUBLISH_HZ / speed_scale),
+            )
         while True:
             paths = tuple(
                 _smooth_initialization_path(measured, target, steps)
@@ -1500,7 +1519,11 @@ def build_initialization_chunk(
             else np.asarray(spec.right_hand, dtype=np.float64).copy()
         ),
     )
-    max_steps = (INITIALIZATION_MAX_ARM_STEP_RAD, INITIALIZATION_MAX_HAND_STEP_RAD, INITIALIZATION_MAX_HAND_STEP_RAD)
+    max_steps = (
+        INITIALIZATION_MAX_ARM_STEP_RAD * speed_scale,
+        INITIALIZATION_MAX_HAND_STEP_RAD * speed_scale,
+        INITIALIZATION_MAX_HAND_STEP_RAD * speed_scale,
+    )
     # A cubic smoothstep has a maximum slope of 1.5.  This initial estimate is
     # checked below against the actual discrete path before it can be used.
     movement = any(np.any(target != measured) for measured, target in zip(current, targets, strict=True))
@@ -1512,7 +1535,10 @@ def build_initialization_chunk(
         ),
     )
     if movement:
-        steps = max(steps, round(INITIALIZATION_MIN_MOVE_S * PUBLISH_HZ))
+        steps = max(
+            steps,
+            round(INITIALIZATION_MIN_MOVE_S * PUBLISH_HZ / speed_scale),
+        )
     while True:
         paths = tuple(
             _smooth_initialization_path(measured, target, steps)
@@ -1540,6 +1566,22 @@ def build_initialization_chunk(
     )
     _validate_moving_initialization_chunk(chunk, *current)
     return chunk
+
+
+def _build_policy_warm_start_chunk(
+    state: RobotState,
+    spec: InitializationSpec,
+    *,
+    allow_policy_warm_start: bool,
+) -> ActionChunk:
+    """Build only Warmup2 at its deliberately slower transition rate."""
+
+    return build_initialization_chunk(
+        state,
+        spec,
+        allow_policy_warm_start=allow_policy_warm_start,
+        speed_scale=WARMUP2_SPEED_SCALE,
+    )
 
 
 def initialize_dds(simulation: bool, network_interface: str | None) -> None:
@@ -2566,10 +2608,13 @@ class _G1Dex3CommandBackend:
     def _validate_prearm_takeover_state(self, state: RobotState) -> None:
         """Apply the existing pre-arm limits to a prospective takeover sample."""
 
-        state_age = time.monotonic() - state.captured_at
-        if not np.isfinite(state_age) or not 0.0 <= state_age <= PREARM_STATE_MAX_AGE_S:
+        arm_received_at = (
+            state.captured_at if state.arm_received_at is None else state.arm_received_at
+        )
+        arm_age = time.monotonic() - arm_received_at
+        if not np.isfinite(arm_age) or not 0.0 <= arm_age <= PREARM_STATE_MAX_AGE_S:
             raise DeploymentError(
-                f"Robot state age before arm takeover is {state_age:.3f}s; "
+                f"Arm state age before arm takeover is {arm_age:.3f}s; "
                 f"PREARM_STATE_MAX_AGE_S={PREARM_STATE_MAX_AGE_S:.3f}s"
             )
         arm_dq_joint = int(np.argmax(np.abs(state.arm_dq)))
@@ -2608,15 +2653,21 @@ class _G1Dex3CommandBackend:
         state = self._validate_runtime_state(self.reader.read(timeout_s=0.5))
         if not self.simulation:
             reference = state
-            last_captured_at = float("-inf")
+            last_arm_received_at = float("-inf")
             distinct_samples = 0
             deadline = time.monotonic() + PREARM_STATIONARY_DWELL_S
             while time.monotonic() < deadline:
                 state = self._validate_runtime_state(self.reader.read(timeout_s=0.1))
-                state_age = time.monotonic() - state.captured_at
-                if state_age > PREARM_STATE_MAX_AGE_S:
+                arm_received_at = (
+                    state.captured_at
+                    if state.arm_received_at is None
+                    else state.arm_received_at
+                )
+                arm_age = time.monotonic() - arm_received_at
+                if arm_age > PREARM_STATE_MAX_AGE_S:
                     raise DeploymentError(
-                        f"Robot state age is {state_age:.3f}s; PREARM_STATE_MAX_AGE_S={PREARM_STATE_MAX_AGE_S:.3f}s"
+                        f"Arm state age is {arm_age:.3f}s; "
+                        f"PREARM_STATE_MAX_AGE_S={PREARM_STATE_MAX_AGE_S:.3f}s"
                     )
                 joint = int(np.argmax(np.abs(state.arm_dq)))
                 velocity = float(state.arm_dq[joint])
@@ -2651,9 +2702,9 @@ class _G1Dex3CommandBackend:
                         f"{drift:+.4f} rad; PREARM_MAX_POSITION_DRIFT_RAD="
                         f"{PREARM_MAX_POSITION_DRIFT_RAD:.4f} rad"
                     )
-                if state.captured_at > last_captured_at:
+                if arm_received_at > last_arm_received_at:
                     distinct_samples += 1
-                    last_captured_at = state.captured_at
+                    last_arm_received_at = arm_received_at
                 time.sleep(0.005)
             if distinct_samples < PREARM_MIN_DISTINCT_SAMPLES:
                 raise DeploymentError(
@@ -3927,7 +3978,12 @@ def _ramp_real_arm_authority(
     refresh_hand_lease = profile.name == "inspire-dfx"
     if monitor_inspire_feedback:
         if hand_freshness_gate is None:
-            hand_freshness_gate = HandStateFreshnessGate()
+            hand_freshness_gate = HandStateFreshnessGate(
+                pause_age_s=_hand_state_pause_age_limit(
+                    backend.simulation,
+                    profile.name,
+                )
+            )
         initial_freshness = hand_freshness_gate.check(takeover_state)
         if not initial_freshness.ready:
             raise DeploymentError(
@@ -4203,13 +4259,15 @@ def _actuator_main(
         if profile.name == "dex3"
         else HandTrackingWatchdog(profile, emit_logs=False)
     )
-    hand_pause_age_s = _hand_state_pause_age_limit(simulation)
+    hand_pause_age_s = _hand_state_pause_age_limit(simulation, profile.name)
     if simulation:
+        physical_hand_pause_age_s = _hand_state_pause_age_limit(False, profile.name)
         LOGGER.warning(
             "TEMPORARY UNQUALIFIED SIMULATION hand-feedback pause deadline is %.3fs; "
-            "physical-robot ACTUATOR_HAND_STATE_PAUSE_AGE_S remains %.3fs",
+            "physical-robot %s hand-feedback pause deadline remains %.3fs",
             hand_pause_age_s,
-            ACTUATOR_HAND_STATE_PAUSE_AGE_S,
+            profile.name,
+            physical_hand_pause_age_s,
         )
     hand_freshness_gate = HandStateFreshnessGate(pause_age_s=hand_pause_age_s)
     dds_hold_timing: DdsHoldTimingAccumulator | None = None
@@ -4859,7 +4917,7 @@ def _actuator_main(
                         left_hand=backend._left_target.copy(),
                         right_hand=backend._right_target.copy(),
                     )
-                    warm_start_chunk = build_initialization_chunk(
+                    warm_start_chunk = _build_policy_warm_start_chunk(
                         command_start,
                         warm_start,
                         allow_policy_warm_start=profile.name != "dex3",

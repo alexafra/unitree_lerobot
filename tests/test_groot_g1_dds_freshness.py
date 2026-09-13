@@ -10,6 +10,7 @@ from unittest import mock
 import numpy as np
 
 from unitree_lerobot.eval_robot import eval_groot_g1
+from unitree_lerobot.eval_robot.g1_end_effectors import INSPIRE_FTP_PROFILE
 from unitree_lerobot.eval_robot.groot_client import DeploymentError
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     ACTUATOR_ARM_STATE_MAX_AGE_S,
@@ -20,6 +21,8 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     G1Dex3StateReader,
     HandStateFreshnessGate,
     INITIALIZATION_START_DWELL_S,
+    INSPIRE_FTP_HAND_STATE_PAUSE_AGE_S,
+    INSPIRE_FTP_REAL_MODE_MACHINE,
     PREARM_STATE_MAX_AGE_S,
     RobotState,
     SafeG1Dex3Actuator,
@@ -163,9 +166,13 @@ class HandFreshnessGateTests(unittest.TestCase):
         )
         self.assertTrue(result.ready)
 
-    def test_temporary_sim_pause_window_does_not_change_default_gate(self):
-        self.assertEqual(_hand_state_pause_age_limit(False), 0.100)
-        self.assertEqual(_hand_state_pause_age_limit(True), 1.000)
+    def test_pause_window_is_profile_specific_and_sim_remains_unchanged(self):
+        self.assertEqual(_hand_state_pause_age_limit(False, "dex3"), 0.100)
+        self.assertEqual(_hand_state_pause_age_limit(False, "inspire-dfx"), 0.100)
+        self.assertEqual(_hand_state_pause_age_limit(False, "inspire-ftp"), 0.150)
+        self.assertEqual(INSPIRE_FTP_HAND_STATE_PAUSE_AGE_S, 0.150)
+        for end_effector in ("dex3", "inspire-dfx", "inspire-ftp"):
+            self.assertEqual(_hand_state_pause_age_limit(True, end_effector), 1.000)
         self.assertEqual(TEMPORARY_UNQUALIFIED_SIM_HAND_STATE_PAUSE_AGE_S, 1.000)
 
         default_result = HandStateFreshnessGate().check(
@@ -173,7 +180,7 @@ class HandFreshnessGateTests(unittest.TestCase):
             now=40.0,
         )
         sim_gate = HandStateFreshnessGate(
-            pause_age_s=_hand_state_pause_age_limit(True)
+            pause_age_s=_hand_state_pause_age_limit(True, "inspire-ftp")
         )
         sim_result = sim_gate.check(
             _state(captured_at=40.0, left_at=39.5, right_at=40.0),
@@ -182,6 +189,61 @@ class HandFreshnessGateTests(unittest.TestCase):
         self.assertTrue(default_result.entered)
         self.assertFalse(default_result.ready)
         self.assertTrue(sim_result.ready)
+
+    def test_ftp_live_gate_accepts_120ms_and_pauses_after_150ms(self):
+        gate = HandStateFreshnessGate(
+            pause_age_s=_hand_state_pause_age_limit(False, "inspire-ftp")
+        )
+        accepted = gate.check(
+            _state(captured_at=49.88, left_at=49.88, right_at=50.0),
+            now=50.0,
+        )
+        self.assertTrue(accepted.ready)
+
+        paused = gate.check(
+            _state(captured_at=49.849, left_at=49.849, right_at=50.0),
+            now=50.0,
+        )
+        self.assertFalse(paused.ready)
+        self.assertTrue(paused.entered)
+        self.assertEqual(paused.stale_hands, ("left",))
+
+
+class PrearmTimestampSeparationTests(unittest.TestCase):
+    def test_ftp_prearm_checks_fresh_arm_separately_from_120ms_hand_state(self):
+        now = 80.0
+        hand_received_at = now - 0.120
+        backend = object.__new__(_G1Dex3CommandBackend)
+        backend.simulation = False
+        backend.profile = INSPIRE_FTP_PROFILE
+        backend._arm_target = np.zeros(14)
+        backend._left_target = np.zeros(6)
+        backend._right_target = np.zeros(6)
+        backend._waist_target = np.zeros(3)
+        state = RobotState(
+            captured_at=hand_received_at,
+            mode_machine=INSPIRE_FTP_REAL_MODE_MACHINE,
+            arm=np.zeros(14),
+            arm_dq=np.zeros(14),
+            left_hand=np.zeros(6),
+            right_hand=np.zeros(6),
+            waist=np.zeros(3),
+            waist_dq=np.zeros(3),
+            left_hand_received_at=hand_received_at,
+            right_hand_received_at=hand_received_at,
+            arm_received_at=now,
+        )
+
+        with mock.patch(
+            "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.time.monotonic",
+            return_value=now,
+        ):
+            backend._validate_prearm_takeover_state(state)
+
+        hand_gate = HandStateFreshnessGate(
+            pause_age_s=_hand_state_pause_age_limit(False, "inspire-ftp")
+        )
+        self.assertTrue(hand_gate.check(state, now=now).ready)
 
 
 class SplitReaderDeadlineTests(unittest.TestCase):
