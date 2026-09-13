@@ -6,6 +6,7 @@ import json
 import shutil
 import tempfile
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -38,6 +39,49 @@ from unitree_lerobot.utils.surface_normal_encoding import (  # noqa: E402
     SURFACE_NORMAL_OUTPUT_KEY,
     encode_surface_normals_rgb,
 )
+from data_editor.check_episode_health import (  # noqa: E402
+    CAMERA_EVIDENCE_NOTE,
+    health_header_text,
+    render_report,
+    scan_episode_health,
+)
+
+
+EPISODE_HEALTH_WARNING_STYLE = """
+    QLabel {
+        font-size: 14px;
+        font-weight: bold;
+        color: #664d03;
+        padding: 9px 12px;
+        border: 1px solid #ffca2c;
+        background-color: #fff3cd;
+        border-radius: 6px;
+    }
+"""
+
+EPISODE_HEALTH_CLEAN_STYLE = """
+    QLabel {
+        font-size: 14px;
+        font-weight: bold;
+        color: #0f5132;
+        padding: 9px 12px;
+        border: 1px solid #badbcc;
+        background-color: #d1e7dd;
+        border-radius: 6px;
+    }
+"""
+
+EPISODE_HEALTH_PENDING_STYLE = """
+    QLabel {
+        font-size: 14px;
+        font-weight: bold;
+        color: #084298;
+        padding: 9px 12px;
+        border: 1px solid #b6d4fe;
+        background-color: #cfe2ff;
+        border-radius: 6px;
+    }
+"""
 
 
 class ImageLabel(QLabel):
@@ -511,6 +555,16 @@ class DatasetPlayer(QWidget):
         self.measured_fps = None
         self.current_json_path = ""
         self.current_goal = ""
+        self._health_scan_generation = 0
+        self._health_scan_future = None
+        self._health_scan_closed = False
+        self._health_report_text = ""
+        # One worker keeps the Qt event loop responsive and avoids concurrent
+        # imports of the shared xr_teleoperate classifier.
+        self._health_scan_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="episode-health",
+        )
 
         self.init_ui()
 
@@ -558,6 +612,33 @@ class DatasetPlayer(QWidget):
         root_layout = QHBoxLayout()
         root_layout.addWidget(self.select_root_btn)
         root_layout.addWidget(self.root_dir_label, 1)
+
+        self.health_warning_label = QLabel("")
+        self.health_warning_label.setWordWrap(True)
+        self.health_warning_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.health_warning_label.setStyleSheet(EPISODE_HEALTH_WARNING_STYLE)
+        self.health_warning_label.hide()
+
+        self.health_details_btn = QPushButton("View Health Details")
+        self.health_details_btn.clicked.connect(self.show_episode_health_details)
+        self.health_details_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 13px;
+                font-weight: bold;
+                padding: 9px 12px;
+                border-radius: 6px;
+                background-color: #555555;
+                color: white;
+            }
+            QPushButton:hover:!disabled {
+                background-color: #444444;
+            }
+        """)
+        self.health_details_btn.hide()
+
+        health_layout = QHBoxLayout()
+        health_layout.addWidget(self.health_warning_label, 1)
+        health_layout.addWidget(self.health_details_btn)
 
         self.prev_btn = QPushButton("◀")
         self.next_btn = QPushButton("▶")
@@ -770,6 +851,7 @@ class DatasetPlayer(QWidget):
 
         center_layout = QVBoxLayout()
         center_layout.addLayout(root_layout)
+        center_layout.addLayout(health_layout)
         center_layout.addWidget(self.episode_label)
         center_layout.addLayout(episode_details_layout)
         center_layout.addWidget(self.info_label)
@@ -793,8 +875,139 @@ class DatasetPlayer(QWidget):
         else:
             super().keyPressEvent(event)
 
+    def closeEvent(self, event):
+        self._health_scan_closed = True
+        self._invalidate_episode_health_scan()
+        self._health_scan_executor.shutdown(wait=False, cancel_futures=True)
+        super().closeEvent(event)
+
     def update_root_dir_label(self):
         self.root_dir_label.setText(f"Current Dataset Path: {self.root_dir}")
+
+    def clear_episode_health_warning(self):
+        self._invalidate_episode_health_scan()
+        self._health_report_text = ""
+        self.health_warning_label.clear()
+        self.health_warning_label.setToolTip("")
+        self.health_warning_label.hide()
+        self.health_details_btn.hide()
+
+    def _invalidate_episode_health_scan(self):
+        self._health_scan_generation += 1
+        future = self._health_scan_future
+        self._health_scan_future = None
+        if future is not None:
+            future.cancel()
+
+    def _show_episode_health_banner(self, text, style, details=""):
+        self._health_report_text = details
+        self.health_warning_label.setStyleSheet(style)
+        self.health_warning_label.setText(text)
+        tooltip = (
+            "Read-only episode check. Use View Health Details for the stored evidence and per-episode reasons."
+            if details
+            else "Read-only episode scan in progress."
+        )
+        self.health_warning_label.setToolTip(tooltip)
+        self.health_warning_label.show()
+        if details:
+            self.health_details_btn.show()
+        else:
+            self.health_details_btn.hide()
+
+    def _apply_episode_health_error(self, error):
+        details = (
+            f"Episode health check failed:\n{error}\n\n{CAMERA_EVIDENCE_NOTE}\n\n"
+            "No episode data was changed by this check."
+        )
+        self._show_episode_health_banner(
+            "⚠ Episode health check unavailable — the editor did not infer that "
+            "unchanged-looking frames are healthy. View details for the checker error.",
+            EPISODE_HEALTH_WARNING_STYLE,
+            details,
+        )
+
+    def _apply_episode_health_scan(self, scan):
+        style = EPISODE_HEALTH_WARNING_STYLE if scan.findings else EPISODE_HEALTH_CLEAN_STYLE
+        self._show_episode_health_banner(
+            health_header_text(scan),
+            style,
+            render_report(scan),
+        )
+
+    def _schedule_episode_health_poll(self, future, generation, root_dir):
+        QTimer.singleShot(
+            50,
+            lambda: self._poll_episode_health_scan(future, generation, root_dir),
+        )
+
+    def _poll_episode_health_scan(self, future, generation, root_dir):
+        if (
+            self._health_scan_closed
+            or generation != self._health_scan_generation
+            or os.path.abspath(self.root_dir) != root_dir
+        ):
+            return
+        if not future.done():
+            self._schedule_episode_health_poll(future, generation, root_dir)
+            return
+        self._health_scan_future = None
+        try:
+            scan = future.result()
+        except Exception as error:
+            self._apply_episode_health_error(error)
+            return
+        self._apply_episode_health_scan(scan)
+
+    def mark_episode_health_stale(self, reason):
+        """Invalidate a prior green result before any on-disk editor mutation."""
+
+        self._invalidate_episode_health_scan()
+        details = (
+            f"{reason}\n\nThe previous health result no longer applies. "
+            "No automatic clean status will be shown after a failed edit."
+        )
+        self._show_episode_health_banner(
+            f"⚠ Episode health result is stale — {reason}",
+            EPISODE_HEALTH_WARNING_STYLE,
+            details,
+        )
+
+    def show_episode_health_details(self):
+        if not self._health_report_text:
+            return
+        message_box = QMessageBox(self)
+        message_box.setWindowTitle("Episode Health Details")
+        message_box.setIcon(QMessageBox.Warning)
+        message_box.setText(self.health_warning_label.text())
+        message_box.setInformativeText(
+            "Expand Show Details below for the scrollable, copyable read-only report."
+        )
+        message_box.setDetailedText(self._health_report_text)
+        message_box.setStandardButtons(QMessageBox.Close)
+        message_box.exec_()
+
+    def refresh_episode_health(self):
+        """Start a non-blocking dataset-wide, read-only quality scan."""
+
+        if not self.root_dir or not os.path.isdir(self.root_dir):
+            self.clear_episode_health_warning()
+            return
+
+        self._invalidate_episode_health_scan()
+        generation = self._health_scan_generation
+        root_dir = os.path.abspath(self.root_dir)
+        self._show_episode_health_banner(
+            "… Checking episode health (read-only). Playback remains available.",
+            EPISODE_HEALTH_PENDING_STYLE,
+        )
+        try:
+            future = self._health_scan_executor.submit(scan_episode_health, root_dir)
+        except Exception as error:
+            self._apply_episode_health_error(error)
+            return
+        self._health_scan_future = future
+        self._schedule_episode_health_poll(future, generation, root_dir)
 
     def set_playback_speed(self, speed_text):
         self.playback_speed = int(speed_text.removesuffix("x"))
@@ -966,6 +1179,7 @@ class DatasetPlayer(QWidget):
         self.episodes = self.find_episodes()
 
         if not self.episodes:
+            self.clear_episode_health_warning()
             self.clear_player_state("No episode_0001 / episode_0002 ... found in the current path")
             if show_message:
                 QMessageBox.warning(
@@ -975,6 +1189,7 @@ class DatasetPlayer(QWidget):
                 )
             return
 
+        self.refresh_episode_health()
         self.current_episode_index = 0
         self.load_episode(self.current_episode_index)
         self.is_playing = True
@@ -1411,18 +1626,25 @@ class DatasetPlayer(QWidget):
         if reply != QMessageBox.Yes:
             return
 
+        self.mark_episode_health_stale(
+            "trimming has started; the previous scan predates this disk change"
+        )
         self.is_playing = False
         self.update_play_button_text()
 
         try:
             self.delete_and_renumber_frames(delete_frame_ids)
             self.load_episode(self.current_episode_index)
+            self.refresh_episode_health()
             QMessageBox.information(
                 self,
                 "Done",
                 f"Trim completed.\n{delete_count} frames were deleted and the remaining frames were renumbered."
             )
         except Exception as e:
+            self.mark_episode_health_stale(
+                "trim failed after disk changes may have begun; inspect this episode before relying on it"
+            )
             QMessageBox.critical(self, "Error", f"Trim failed:\n{str(e)}")
 
     def delete_current_episode(self):
@@ -1441,6 +1663,9 @@ class DatasetPlayer(QWidget):
         if reply != QMessageBox.Yes:
             return
 
+        self.mark_episode_health_stale(
+            "episode deletion has started; the previous scan predates this disk change"
+        )
         self.is_playing = False
         self.update_play_button_text()
 
@@ -1456,12 +1681,14 @@ class DatasetPlayer(QWidget):
             self.episodes = self.find_episodes()
 
             if not self.episodes:
+                self.clear_episode_health_warning()
                 self.clear_player_state("No datasets remain in the current path")
                 QMessageBox.information(self, "Done", "The current dataset has been deleted.")
                 return
 
             next_index = min(current_index, len(self.episodes) - 1)
             self.load_episode(next_index)
+            self.refresh_episode_health()
             self.is_playing = True
             self.update_play_button_text()
             self.update_range_info()
@@ -1469,6 +1696,9 @@ class DatasetPlayer(QWidget):
             QMessageBox.information(self, "Done", "The current dataset has been deleted.")
 
         except Exception as e:
+            self.mark_episode_health_stale(
+                "episode deletion failed after disk changes may have begun; inspect the dataset before relying on it"
+            )
             QMessageBox.critical(self, "Error", f"Failed to delete the current dataset:\n{str(e)}")
 
     def delete_and_renumber_frames(

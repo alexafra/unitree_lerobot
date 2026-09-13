@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
 from unittest import mock
 
@@ -278,6 +279,149 @@ class DataEditorRgbdSurfaceNormalsTest(unittest.TestCase):
         load_depth.assert_not_called()
         load_normals.assert_not_called()
         self.assertIn("Visuals: Color only", player.info_label.setText.call_args.args[0])
+
+    def test_health_findings_show_header_and_enable_full_details(self):
+        player = object.__new__(self.editor.DatasetPlayer)
+        player.health_warning_label = mock.Mock()
+        player.health_details_btn = mock.Mock()
+        player._health_report_text = ""
+        scan = types.SimpleNamespace(findings=(object(),))
+
+        with (
+            mock.patch.object(
+                self.editor,
+                "health_header_text",
+                return_value="yellow warning",
+            ),
+            mock.patch.object(self.editor, "render_report", return_value="full reasons"),
+        ):
+            player._apply_episode_health_scan(scan)
+
+        player.health_warning_label.setText.assert_called_once_with("yellow warning")
+        self.assertEqual(player._health_report_text, "full reasons")
+        player.health_warning_label.setStyleSheet.assert_called_once_with(
+            self.editor.EPISODE_HEALTH_WARNING_STYLE
+        )
+        player.health_warning_label.show.assert_called_once_with()
+        player.health_details_btn.show.assert_called_once_with()
+
+    def test_clean_health_scan_shows_explicit_green_status(self):
+        player = object.__new__(self.editor.DatasetPlayer)
+        player.health_warning_label = mock.Mock()
+        player.health_details_btn = mock.Mock()
+        player._health_report_text = ""
+        scan = types.SimpleNamespace(findings=())
+
+        with (
+            mock.patch.object(self.editor, "health_header_text", return_value="clean status"),
+            mock.patch.object(self.editor, "render_report", return_value="clean report"),
+        ):
+            player._apply_episode_health_scan(scan)
+
+        player.health_warning_label.setText.assert_called_once_with("clean status")
+        self.assertEqual(player._health_report_text, "clean report")
+        player.health_warning_label.setStyleSheet.assert_called_once_with(
+            self.editor.EPISODE_HEALTH_CLEAN_STYLE
+        )
+        player.health_warning_label.show.assert_called_once_with()
+        player.health_details_btn.show.assert_called_once_with()
+
+    def test_stale_async_health_result_is_discarded(self):
+        player = object.__new__(self.editor.DatasetPlayer)
+        player.root_dir = "/new/root"
+        player._health_scan_closed = False
+        player._health_scan_generation = 2
+        player._apply_episode_health_scan = mock.Mock()
+        player._schedule_episode_health_poll = mock.Mock()
+        future = Future()
+        future.set_result(object())
+
+        player._poll_episode_health_scan(future, 1, "/old/root")
+
+        player._apply_episode_health_scan.assert_not_called()
+        player._schedule_episode_health_poll.assert_not_called()
+
+    def test_marking_health_stale_cancels_prior_scan_and_stays_yellow(self):
+        player = object.__new__(self.editor.DatasetPlayer)
+        player._health_scan_generation = 4
+        player._health_scan_future = mock.Mock()
+        player._show_episode_health_banner = mock.Mock()
+
+        player.mark_episode_health_stale("disk change started")
+
+        self.assertEqual(player._health_scan_generation, 5)
+        player._show_episode_health_banner.assert_called_once()
+        text, style, details = player._show_episode_health_banner.call_args.args
+        self.assertIn("stale", text)
+        self.assertEqual(style, self.editor.EPISODE_HEALTH_WARNING_STYLE)
+        self.assertIn("previous health result no longer applies", details)
+
+    def test_failed_trim_marks_health_stale_before_and_after_mutation(self):
+        player = object.__new__(self.editor.DatasetPlayer)
+        player.frame_keys = [0, 1]
+        player.range_slider = mock.Mock()
+        player.range_slider.get_selected_range.return_value = (0, 0)
+        player.current_episode_name = "episode_0001"
+        player.is_playing = True
+        player.update_play_button_text = mock.Mock()
+        calls = mock.Mock()
+        player.mark_episode_health_stale = calls.mark_stale
+        player.delete_and_renumber_frames = calls.trim
+        calls.trim.side_effect = RuntimeError("partial failure")
+
+        with (
+            mock.patch.object(self.editor.QMessageBox, "Yes", 1, create=True),
+            mock.patch.object(self.editor.QMessageBox, "No", 0, create=True),
+            mock.patch.object(
+                self.editor.QMessageBox,
+                "question",
+                return_value=1,
+                create=True,
+            ),
+            mock.patch.object(self.editor.QMessageBox, "critical", create=True),
+        ):
+            player.trim_selected_frames()
+
+        self.assertEqual(calls.mock_calls[0][0], "mark_stale")
+        self.assertEqual(calls.mock_calls[1], mock.call.trim([0]))
+        self.assertEqual(calls.mock_calls[2][0], "mark_stale")
+
+    def test_failed_episode_delete_marks_health_stale_before_and_after_mutation(self):
+        player = object.__new__(self.editor.DatasetPlayer)
+        player.episodes = ["episode_0001"]
+        player.current_episode_name = "episode_0001"
+        player.current_episode_index = 0
+        player.root_dir = "/selected/task"
+        player.is_playing = True
+        player.update_play_button_text = mock.Mock()
+        calls = mock.Mock()
+        player.mark_episode_health_stale = calls.mark_stale
+
+        def fail_delete(path):
+            calls.delete(path)
+            raise OSError("partial failure")
+
+        with (
+            mock.patch.object(self.editor.QMessageBox, "Yes", 1, create=True),
+            mock.patch.object(self.editor.QMessageBox, "Cancel", 0, create=True),
+            mock.patch.object(
+                self.editor.QMessageBox,
+                "question",
+                return_value=1,
+                create=True,
+            ),
+            mock.patch.object(self.editor.QMessageBox, "critical", create=True),
+            mock.patch.object(self.editor.os.path, "isdir", return_value=True),
+            mock.patch.object(self.editor.shutil, "rmtree", side_effect=fail_delete),
+        ):
+            player.delete_current_episode()
+
+        self.assertEqual(calls.mock_calls[0][0], "mark_stale")
+        self.assertEqual(
+            calls.mock_calls[1],
+            mock.call.delete("/selected/task/episode_0001"),
+        )
+        self.assertEqual(calls.mock_calls[2][0], "mark_stale")
 
     def test_trim_color_only_episode_without_depth(self):
         with tempfile.TemporaryDirectory() as temp_dir:
