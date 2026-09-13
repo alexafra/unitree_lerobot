@@ -23,9 +23,11 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     RobotState,
     SafeG1Dex3Actuator,
     TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S,
+    TEMPORARY_UNQUALIFIED_SIM_HAND_STATE_PAUSE_AGE_S,
     _G1Dex3CommandBackend,
     _actuator_main,
     _arm_state_freshness_limit,
+    _hand_state_pause_age_limit,
     _wait_for_initialization_start,
 )
 from unitree_lerobot.eval_robot.groot_contract import ActionChunk, InitializationSpec
@@ -159,6 +161,26 @@ class HandFreshnessGateTests(unittest.TestCase):
             now=20.0,
         )
         self.assertTrue(result.ready)
+
+    def test_temporary_sim_pause_window_does_not_change_default_gate(self):
+        self.assertEqual(_hand_state_pause_age_limit(False), 0.100)
+        self.assertEqual(_hand_state_pause_age_limit(True), 1.000)
+        self.assertEqual(TEMPORARY_UNQUALIFIED_SIM_HAND_STATE_PAUSE_AGE_S, 1.000)
+
+        default_result = HandStateFreshnessGate().check(
+            _state(captured_at=40.0, left_at=39.5, right_at=40.0),
+            now=40.0,
+        )
+        sim_gate = HandStateFreshnessGate(
+            pause_age_s=_hand_state_pause_age_limit(True)
+        )
+        sim_result = sim_gate.check(
+            _state(captured_at=40.0, left_at=39.5, right_at=40.0),
+            now=40.0,
+        )
+        self.assertTrue(default_result.entered)
+        self.assertFalse(default_result.ready)
+        self.assertTrue(sim_result.ready)
 
 
 class SplitReaderDeadlineTests(unittest.TestCase):
@@ -588,7 +610,9 @@ class ActivePauseIntegrationTests(unittest.TestCase):
             )
             backend = PausingBackend.instance
             self.assertTrue(backend.first_policy_target.wait(timeout=1.0))
-            backend.hand_age_s = ACTUATOR_HAND_STATE_PAUSE_AGE_S + 0.025
+            backend.hand_age_s = (
+                TEMPORARY_UNQUALIFIED_SIM_HAND_STATE_PAUSE_AGE_S + 0.025
+            )
 
             pause_seen = False
             deadline = time.monotonic() + 1.0

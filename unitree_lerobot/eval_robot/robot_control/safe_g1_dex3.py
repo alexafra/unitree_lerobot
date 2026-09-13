@@ -77,6 +77,9 @@ ACTUATOR_ARM_STATE_MAX_AGE_S = 0.100
 # still failing closed after 1 second.  Never reuse this deadline for hardware.
 TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S = 1.000
 ACTUATOR_HAND_STATE_PAUSE_AGE_S = 0.100
+# TEMPORARY / UNQUALIFIED / SIMULATION ONLY: tolerate the observed Isaac
+# hand-feedback scheduling gaps without weakening the physical-robot gate.
+TEMPORARY_UNQUALIFIED_SIM_HAND_STATE_PAUSE_AGE_S = 1.000
 ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S = 1.250
 ACTUATOR_HAND_STATE_MAX_AGE_S = 3.0
 ACTUATOR_HAND_RECOVERY_SAMPLES = 3
@@ -213,6 +216,14 @@ def _arm_state_freshness_limit(
     return ACTUATOR_ARM_STATE_MAX_AGE_S, "ACTUATOR_ARM_STATE_MAX_AGE_S"
 
 
+def _hand_state_pause_age_limit(simulation: bool) -> float:
+    """Return the hand pause threshold without relaxing hardware."""
+
+    if simulation:
+        return TEMPORARY_UNQUALIFIED_SIM_HAND_STATE_PAUSE_AGE_S
+    return ACTUATOR_HAND_STATE_PAUSE_AGE_S
+
+
 class RtcTerminalEvent(DeploymentError):
     """The child has already entered powered HOLD or completed its RTC budget."""
 
@@ -282,9 +293,10 @@ class HandFreshnessResult:
 
 
 class HandStateFreshnessGate:
-    """Turn short Dex3 delivery gaps into a bounded motion pause."""
+    """Turn short hand-state delivery gaps into a bounded motion pause."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, pause_age_s: float = ACTUATOR_HAND_STATE_PAUSE_AGE_S) -> None:
+        self.pause_age_s = float(pause_age_s)
         self._active = False
         self._started_at = 0.0
         self._fresh_samples = 0
@@ -332,7 +344,7 @@ class HandStateFreshnessGate:
         stale_hands = tuple(
             name
             for name, age_s in ages.items()
-            if age_s > ACTUATOR_HAND_STATE_PAUSE_AGE_S or name in lost_changed
+            if age_s > self.pause_age_s or name in lost_changed
         )
         max_age_s = max(ages.values())
         if stale_hands:
@@ -2919,7 +2931,7 @@ def _observe_hand_freshness(
             "context": context,
             "hands": result.stale_hands,
             "age_s": result.max_age_s,
-            "pause_age_s": ACTUATOR_HAND_STATE_PAUSE_AGE_S,
+            "pause_age_s": gate.pause_age_s,
             "operator_hold_age_s": ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
             "hard_age_s": ACTUATOR_HAND_STATE_MAX_AGE_S,
         }
@@ -3812,7 +3824,15 @@ def _actuator_main(
         if profile.name == "dex3"
         else HandTrackingWatchdog(profile, emit_logs=False)
     )
-    hand_freshness_gate = HandStateFreshnessGate()
+    hand_pause_age_s = _hand_state_pause_age_limit(simulation)
+    if simulation:
+        LOGGER.warning(
+            "TEMPORARY UNQUALIFIED SIMULATION hand-feedback pause deadline is %.3fs; "
+            "physical-robot ACTUATOR_HAND_STATE_PAUSE_AGE_S remains %.3fs",
+            hand_pause_age_s,
+            ACTUATOR_HAND_STATE_PAUSE_AGE_S,
+        )
+    hand_freshness_gate = HandStateFreshnessGate(pause_age_s=hand_pause_age_s)
     dds_hold_timing: DdsHoldTimingAccumulator | None = None
     active_timing: ActiveTimingRing | None = None
     active_timing_snapshot: dict[str, Any] | None = None
@@ -4138,7 +4158,7 @@ def _actuator_main(
                         "rtc_total_actions": int(rtc_total_actions),
                         "rtc_action_budget": int(rtc_action_budget),
                         "feedback_age_s": float(freshness.max_age_s),
-                        "pause_age_s": ACTUATOR_HAND_STATE_PAUSE_AGE_S,
+                        "pause_age_s": hand_freshness_gate.pause_age_s,
                         "operator_hold_age_s": ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
                         "hand_pause_generation": pause_generation,
                     }
