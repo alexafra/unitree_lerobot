@@ -150,6 +150,13 @@ INSPIRE_FTP_WAIST_LOWER_RAD = (-2.618, -0.52, -0.52)
 INSPIRE_FTP_WAIST_UPPER_RAD = (2.618, 0.52, 0.52)
 INSPIRE_FTP_WAIST_LIMIT_MARGIN_RAD = 0.02
 MAX_WAIST_DQ_RAD_S = 1.0
+# A single Unitree lowstate dq sample can spike above the soft waist limit even
+# when the measured waist position remains inside its hold tolerance.  Require
+# the soft violation to persist across distinct arm DDS samples spanning
+# 100 ms, while retaining an immediate ceiling for unmistakably fast motion.
+MAX_WAIST_DQ_DWELL_S = 0.100
+MAX_WAIST_DQ_MIN_DISTINCT_SAMPLES = 3
+HARD_MAX_WAIST_DQ_RAD_S = 3.0
 MAX_WAIST_HOLD_ERROR_RAD = 0.05
 PREARM_STATIONARY_DWELL_S = 0.5
 # Use the same bounded freshness deadline before authority takeover as during
@@ -2274,7 +2281,73 @@ class _G1Dex3CommandBackend:
             return
         waist, _waist_dq = self._require_mode5_waist_state(state)
         self._waist_target = waist.copy()
+        self._clear_waist_velocity_violation()
         self._apply_waist_hold_target()
+
+    def _clear_waist_velocity_violation(self) -> None:
+        self._waist_dq_violation_started_at = None
+        self._waist_dq_violation_peak = 0.0
+        self._waist_dq_violation_joint = None
+        self._waist_dq_violation_samples = 0
+        self._waist_dq_violation_last_arm_at = None
+
+    def _validate_mode5_waist_velocity(
+        self,
+        state: RobotState,
+        waist_dq: np.ndarray,
+    ) -> None:
+        joint = int(np.argmax(np.abs(waist_dq)))
+        velocity = float(waist_dq[joint])
+        if abs(velocity) >= HARD_MAX_WAIST_DQ_RAD_S:
+            raise DeploymentError(
+                f"Mode-5 waist velocity at {WAIST_JOINT_NAMES[joint]} is "
+                f"{velocity:+.3f} rad/s; HARD_MAX_WAIST_DQ_RAD_S="
+                f"{HARD_MAX_WAIST_DQ_RAD_S:.3f} rad/s"
+            )
+        if abs(velocity) <= MAX_WAIST_DQ_RAD_S:
+            self._clear_waist_velocity_violation()
+            return
+
+        now = time.monotonic()
+        arm_received_at = (
+            state.captured_at if state.arm_received_at is None else state.arm_received_at
+        )
+        started_at = getattr(self, "_waist_dq_violation_started_at", None)
+        if started_at is None or not np.isfinite(started_at) or now < started_at:
+            self._waist_dq_violation_started_at = now
+            self._waist_dq_violation_peak = velocity
+            self._waist_dq_violation_joint = joint
+            self._waist_dq_violation_samples = 1
+            self._waist_dq_violation_last_arm_at = arm_received_at
+            return
+
+        last_arm_at = getattr(self, "_waist_dq_violation_last_arm_at", None)
+        if last_arm_at is None or arm_received_at > last_arm_at:
+            self._waist_dq_violation_samples = int(
+                getattr(self, "_waist_dq_violation_samples", 0)
+            ) + 1
+            self._waist_dq_violation_last_arm_at = arm_received_at
+        peak = float(getattr(self, "_waist_dq_violation_peak", 0.0))
+        if abs(velocity) > abs(peak):
+            self._waist_dq_violation_peak = velocity
+            self._waist_dq_violation_joint = joint
+        duration_s = now - started_at
+        distinct_samples = int(getattr(self, "_waist_dq_violation_samples", 0))
+        if (
+            duration_s >= MAX_WAIST_DQ_DWELL_S
+            and distinct_samples >= MAX_WAIST_DQ_MIN_DISTINCT_SAMPLES
+        ):
+            peak = float(self._waist_dq_violation_peak)
+            peak_joint = int(self._waist_dq_violation_joint)
+            raise DeploymentError(
+                "Mode-5 waist velocity remained above "
+                f"MAX_WAIST_DQ_RAD_S={MAX_WAIST_DQ_RAD_S:.3f} rad/s for "
+                f"{duration_s:.3f}s (limit {MAX_WAIST_DQ_DWELL_S:.3f}s); "
+                f"distinct arm-state samples={distinct_samples} "
+                f"(minimum {MAX_WAIST_DQ_MIN_DISTINCT_SAMPLES}), "
+                f"latest {WAIST_JOINT_NAMES[joint]}={velocity:+.3f} rad/s, "
+                f"peak {WAIST_JOINT_NAMES[peak_joint]}={peak:+.3f} rad/s"
+            )
 
     _supports_cleanup_phases = True
 
@@ -2522,13 +2595,7 @@ class _G1Dex3CommandBackend:
             )
         if self._uses_mode5_waist_hold():
             waist, waist_dq = self._require_mode5_waist_state(state)
-            velocity_joint = int(np.argmax(np.abs(waist_dq)))
-            velocity = float(waist_dq[velocity_joint])
-            if abs(velocity) > MAX_WAIST_DQ_RAD_S:
-                raise DeploymentError(
-                    f"Mode-5 waist velocity at {WAIST_JOINT_NAMES[velocity_joint]} is "
-                    f"{velocity:+.3f} rad/s; MAX_WAIST_DQ_RAD_S={MAX_WAIST_DQ_RAD_S:.3f} rad/s"
-                )
+            self._validate_mode5_waist_velocity(state, waist_dq)
             waist_target = getattr(self, "_waist_target", None)
             if waist_target is not None:
                 joint = int(np.argmax(np.abs(waist - waist_target)))
