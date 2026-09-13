@@ -42,13 +42,10 @@ from unitree_lerobot.eval_robot.robot_control.g1_inspire_ftp import (
     InspireFtpPartialWriteError,
 )
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
-    HARD_MAX_WAIST_DQ_RAD_S,
     INSPIRE_FTP_REAL_MODE_MACHINE,
     INSPIRE_FTP_WAIST_INDICES,
     INSPIRE_FTP_WAIST_KD,
     INSPIRE_FTP_WAIST_KP,
-    MAX_WAIST_DQ_DWELL_S,
-    MAX_WAIST_DQ_MIN_DISTINCT_SAMPLES,
     MAX_WAIST_DQ_RAD_S,
     MAX_WAIST_HOLD_ERROR_RAD,
     QUALIFIED_REAL_MODE_MACHINE,
@@ -696,7 +693,6 @@ def _mode5_state(
     waist: np.ndarray | None = None,
     waist_dq: np.ndarray | None = None,
     mode_machine: int = INSPIRE_FTP_REAL_MODE_MACHINE,
-    arm_received_at: float | None = None,
 ) -> RobotState:
     return RobotState(
         captured_at=1.0,
@@ -707,7 +703,6 @@ def _mode5_state(
         right_hand=np.full(6, 0.7),
         waist=np.array([0.25, -0.04, 0.06]) if waist is None else waist,
         waist_dq=np.zeros(3) if waist_dq is None else waist_dq,
-        arm_received_at=arm_received_at,
     )
 
 
@@ -884,7 +879,7 @@ def test_ftp_mode5_waist_is_measured_held_and_unchanged_by_policy_or_release():
     np.testing.assert_array_equal(writes[2][2], second_arm)
 
 
-def test_ftp_mode5_waist_deviation_fails_closed():
+def test_ftp_mode5_runtime_allows_teleop_compatible_waist_motion():
     backend = _G1Dex3CommandBackend.__new__(_G1Dex3CommandBackend)
     backend.simulation = False
     backend.profile = INSPIRE_FTP_PROFILE
@@ -895,8 +890,10 @@ def test_ftp_mode5_waist_deviation_fails_closed():
 
     deviated = backend._waist_target.copy()
     deviated[1] += MAX_WAIST_HOLD_ERROR_RAD + 1e-6
-    with pytest.raises(DeploymentError, match="waist_roll.*MAX_WAIST_HOLD_ERROR_RAD"):
-        backend._validate_runtime_state(_mode5_state(waist=deviated))
+    runtime_moving = np.zeros(3)
+    runtime_moving[1] = MAX_WAIST_DQ_RAD_S + 1.0
+    state = _mode5_state(waist=deviated, waist_dq=runtime_moving)
+    assert backend._validate_runtime_state(state) is state
 
     moving = np.zeros(3)
     moving[2] = 0.101
@@ -908,118 +905,6 @@ def test_ftp_mode5_waist_deviation_fails_closed():
         pytest.raises(DeploymentError, match="Waist is not stationary.*waist_pitch"),
     ):
         backend._validate_prearm_takeover_state(_mode5_state(waist_dq=moving))
-
-
-def test_ftp_mode5_runtime_waist_velocity_requires_sustained_violation():
-    backend = _G1Dex3CommandBackend.__new__(_G1Dex3CommandBackend)
-    backend.simulation = False
-    backend.profile = INSPIRE_FTP_PROFILE
-    backend._waist_target = np.array([0.25, -0.04, 0.06])
-    moving = np.zeros(3)
-    moving[1] = MAX_WAIST_DQ_RAD_S + 1e-6
-
-    safe_module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.time.monotonic"
-    assert MAX_WAIST_DQ_MIN_DISTINCT_SAMPLES == 3
-    with mock.patch(
-        safe_module,
-        side_effect=(
-            10.0,
-            10.0 + MAX_WAIST_DQ_DWELL_S - 1e-6,
-            10.0 + MAX_WAIST_DQ_DWELL_S + 1e-6,
-        ),
-    ):
-        assert backend._validate_runtime_state(
-            _mode5_state(waist_dq=moving, arm_received_at=1.0)
-        )
-        assert backend._validate_runtime_state(
-            _mode5_state(waist_dq=moving, arm_received_at=2.0)
-        )
-        with pytest.raises(
-            DeploymentError,
-            match="MAX_WAIST_DQ_RAD_S.*waist_roll",
-        ):
-            backend._validate_runtime_state(
-                _mode5_state(waist_dq=moving, arm_received_at=3.0)
-            )
-
-
-def test_ftp_mode5_runtime_cached_waist_velocity_sample_cannot_trip_dwell():
-    backend = _G1Dex3CommandBackend.__new__(_G1Dex3CommandBackend)
-    backend.simulation = False
-    backend.profile = INSPIRE_FTP_PROFILE
-    backend._waist_target = np.array([0.25, -0.04, 0.06])
-    moving = np.zeros(3)
-    moving[1] = MAX_WAIST_DQ_RAD_S + 1e-6
-
-    safe_module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.time.monotonic"
-    with mock.patch(
-        safe_module,
-        side_effect=(10.0, 10.0 + MAX_WAIST_DQ_DWELL_S, 100.0),
-    ):
-        for _ in range(MAX_WAIST_DQ_MIN_DISTINCT_SAMPLES):
-            assert backend._validate_runtime_state(
-                _mode5_state(waist_dq=moving, arm_received_at=1.0)
-            )
-
-
-def test_ftp_mode5_runtime_waist_velocity_recovery_clears_dwell():
-    backend = _G1Dex3CommandBackend.__new__(_G1Dex3CommandBackend)
-    backend.simulation = False
-    backend.profile = INSPIRE_FTP_PROFILE
-    backend._waist_target = np.array([0.25, -0.04, 0.06])
-    moving = np.zeros(3)
-    moving[0] = MAX_WAIST_DQ_RAD_S + 1e-6
-
-    safe_module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.time.monotonic"
-    with mock.patch(
-        safe_module,
-        side_effect=(20.0, 20.01, 20.02),
-    ):
-        assert backend._validate_runtime_state(
-            _mode5_state(waist_dq=moving, arm_received_at=1.0)
-        )
-        assert backend._validate_runtime_state(_mode5_state(arm_received_at=2.0))
-        assert backend._validate_runtime_state(
-            _mode5_state(waist_dq=moving, arm_received_at=3.0)
-        )
-
-
-def test_ftp_mode5_runtime_hard_waist_velocity_trips_immediately():
-    backend = _G1Dex3CommandBackend.__new__(_G1Dex3CommandBackend)
-    backend.simulation = False
-    backend.profile = INSPIRE_FTP_PROFILE
-    backend._waist_target = np.array([0.25, -0.04, 0.06])
-    moving = np.zeros(3)
-    moving[2] = HARD_MAX_WAIST_DQ_RAD_S
-
-    with pytest.raises(
-        DeploymentError,
-        match="waist_pitch.*HARD_MAX_WAIST_DQ_RAD_S",
-    ):
-        backend._validate_runtime_state(_mode5_state(waist_dq=moving))
-
-
-@pytest.mark.parametrize(
-    ("profile", "simulation", "mode_machine"),
-    (
-        (DEX3_PROFILE, False, QUALIFIED_REAL_MODE_MACHINE),
-        (INSPIRE_FTP_PROFILE, True, INSPIRE_FTP_REAL_MODE_MACHINE),
-    ),
-)
-def test_runtime_waist_velocity_debounce_is_only_for_real_ftp_mode5(
-    profile,
-    simulation,
-    mode_machine,
-):
-    backend = _G1Dex3CommandBackend.__new__(_G1Dex3CommandBackend)
-    backend.simulation = simulation
-    backend.profile = profile
-    backend._waist_target = np.array([0.25, -0.04, 0.06])
-    moving = np.zeros(3)
-    moving[0] = HARD_MAX_WAIST_DQ_RAD_S + 1.0
-
-    state = _mode5_state(waist_dq=moving, mode_machine=mode_machine)
-    assert backend._validate_runtime_state(state) is state
 
 
 def test_ftp_release_reaches_zero_arm_weight_without_hand_refresh():
