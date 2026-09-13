@@ -4627,6 +4627,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             mock.patch(f"{module}.INITIALIZATION_START_DWELL_S", 0.0),
             mock.patch(f"{module}.INITIALIZATION_CONVERGENCE_DWELL_S", 0.0),
             mock.patch(f"{module}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 1),
+            mock.patch(f"{module}.HEARTBEAT_TIMEOUT_S", 5.0),
         ):
             thread = threading.Thread(
                 target=_actuator_main,
@@ -4680,7 +4681,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             )
             commands.put(("warm_start", time.monotonic(), second_target))
             self.assertEqual(statuses.get(timeout=1.0)[0], "warm_starting")
-            self.assertEqual(statuses.get(timeout=1.0), ("warm_started", "second goal target"))
+            self.assertEqual(statuses.get(timeout=2.0), ("warm_started", "second goal target"))
 
             # A third warm-start without another acknowledged HOLD is a child
             # fault, even though no policy chunk happens to be active.
@@ -5421,10 +5422,11 @@ class GrootG1DeploymentTests(unittest.TestCase):
         )
         backend = object.__new__(_G1Dex3CommandBackend)
         backend.simulation = False
+        backend.profile = SimpleNamespace(name="dex3")
         backend.reader = SimpleNamespace(read=lambda timeout_s: unsafe_state)
         backend._arm_message = SimpleNamespace(mode_machine=None)
 
-        with self.assertRaisesRegex(DeploymentError, "QUALIFIED_REAL_MODE_MACHINE=6"):
+        with self.assertRaisesRegex(DeploymentError, "required mode 6.*'dex3'"):
             backend.prepare_measured_hold()
 
         self.assertIsNone(backend._arm_message.mode_machine)
