@@ -167,7 +167,10 @@ INITIALIZATION_MAX_HAND_STEP_RAD = INITIALIZATION_HAND_SPEED_RAD_S / PUBLISH_HZ
 INITIALIZATION_MIN_MOVE_S = 0.50
 INITIALIZATION_MAX_DURATION_S = 30.0
 INITIALIZATION_START_TIMEOUT_S = 3.0
-INITIALIZATION_START_DWELL_S = 0.50
+# Do not require a second stationary dwell after the operator has explicitly
+# confirmed initialization.  The first fresh sample must still pass the
+# instantaneous arm/waist tracking and velocity gates below.
+INITIALIZATION_START_DWELL_S = 0.0
 INITIALIZATION_CONVERGENCE_TIMEOUT_S = 10.0
 INITIALIZATION_CONVERGENCE_DWELL_S = 0.50
 INITIALIZATION_MIN_DISTINCT_SAMPLES = 5
@@ -3572,6 +3575,8 @@ def _wait_for_initialization_start(
             and waist_dq <= INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S
         )
         if stationary:
+            if INITIALIZATION_START_DWELL_S <= 0.0:
+                return latest
             if stationary_since is None:
                 stationary_since = now
                 stationary_reference = latest
@@ -3609,11 +3614,13 @@ def _wait_for_initialization_start(
     if latest is None:
         raise DeploymentError("No fresh robot state arrived before initialization")
     arm_error, hand_error = _tracking_errors(backend, latest)
+    waist_error, waist_dq = _waist_hold_metrics(backend, latest)
     raise DeploymentError(
         "Robot did not become stationary at the held target before initialization: "
         f"arm error={arm_error:.3f} rad, hand error={hand_error:.3f} {profile.value_unit} "
         f"(hand convergence required={require_hand_tracking}), "
-        f"max arm dq={float(np.max(np.abs(latest.arm_dq))):.3f} rad/s"
+        f"max arm dq={float(np.max(np.abs(latest.arm_dq))):.3f} rad/s, "
+        f"waist error={waist_error:.3f} rad, max waist dq={waist_dq:.3f} rad/s"
     )
 
 

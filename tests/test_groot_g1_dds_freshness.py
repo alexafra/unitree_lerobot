@@ -19,6 +19,7 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     ACTUATOR_HAND_STATE_PAUSE_AGE_S,
     G1Dex3StateReader,
     HandStateFreshnessGate,
+    INITIALIZATION_START_DWELL_S,
     PREARM_STATE_MAX_AGE_S,
     RobotState,
     SafeG1Dex3Actuator,
@@ -266,6 +267,9 @@ class SplitReaderDeadlineTests(unittest.TestCase):
 
 
 class SimulationArmFreshnessDeadlineTests(unittest.TestCase):
+    def test_initialization_start_has_no_default_stationary_dwell(self):
+        self.assertEqual(INITIALIZATION_START_DWELL_S, 0.0)
+
     def test_deadline_selection_is_sim_only(self):
         self.assertEqual(
             _arm_state_freshness_limit(True, prearm=False),
