@@ -345,7 +345,10 @@ class G1InspireFtpStateReader:
         if simulation:
             raise DeploymentError("Inspire FTP simulation is not qualified in this guarded client")
         sdk = require_inspire_ftp_sdk()
-        from unitree_lerobot.eval_robot.robot_control.robot_arm import G1_29_JointArmIndex
+        from unitree_lerobot.eval_robot.robot_control.robot_arm import (
+            G1_29_JointArmIndex,
+            G1_29_JointIndex,
+        )
 
         self._arm_max_age_s = float(max_age_s)
         self._hand_max_age_s = float(max_age_s if hand_max_age_s is None else hand_max_age_s)
@@ -356,6 +359,11 @@ class G1InspireFtpStateReader:
             max_age_constant if hand_max_age_constant is None else hand_max_age_constant
         )
         self._arm_indices = tuple(int(index) for index in G1_29_JointArmIndex)
+        self._waist_indices = (
+            int(G1_29_JointIndex.kWaistYaw),
+            int(G1_29_JointIndex.kWaistRoll),
+            int(G1_29_JointIndex.kWaistPitch),
+        )
         if len(self._arm_indices) != ARM_DOF:
             raise DeploymentError(f"Expected {ARM_DOF} G1 arm indices, got {len(self._arm_indices)}")
         self._lock = threading.Lock()
@@ -462,6 +470,16 @@ class G1InspireFtpStateReader:
             [arm_message.motor_state[index].dq for index in self._arm_indices],
             dtype=np.float64,
         )
+        waist = np.asarray(
+            [arm_message.motor_state[index].q for index in self._waist_indices],
+            dtype=np.float64,
+        )
+        waist_dq = np.asarray(
+            [arm_message.motor_state[index].dq for index in self._waist_indices],
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(waist)) or not np.all(np.isfinite(waist_dq)):
+            raise DeploymentError("Mode-5 Inspire FTP waist q/dq contains NaN or infinity")
         validate_measured_state(
             arm,
             arm_dq,
@@ -480,6 +498,8 @@ class G1InspireFtpStateReader:
             arm_dq=arm_dq,
             left_hand=hand_q["left"],
             right_hand=hand_q["right"],
+            waist=waist,
+            waist_dq=waist_dq,
             left_hand_received_at=hand_updated_at["left"],
             right_hand_received_at=hand_updated_at["right"],
             arm_received_at=arm_updated_at,

@@ -42,6 +42,13 @@ from unitree_lerobot.eval_robot.robot_control.g1_inspire_ftp import (
     InspireFtpPartialWriteError,
 )
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
+    INSPIRE_FTP_REAL_MODE_MACHINE,
+    INSPIRE_FTP_WAIST_INDICES,
+    INSPIRE_FTP_WAIST_KD,
+    INSPIRE_FTP_WAIST_KP,
+    MAX_WAIST_DQ_RAD_S,
+    MAX_WAIST_HOLD_ERROR_RAD,
+    QUALIFIED_REAL_MODE_MACHINE,
     RobotState,
     _G1Dex3CommandBackend,
     _ramp_real_arm_authority,
@@ -202,7 +209,12 @@ def _sdk_modules() -> dict[str, ModuleType]:
         ),
         "unitree_lerobot.eval_robot.robot_control.robot_arm": _module(
             "unitree_lerobot.eval_robot.robot_control.robot_arm",
-            G1_29_JointArmIndex=tuple(range(14)),
+            G1_29_JointArmIndex=tuple(range(15, 29)),
+            G1_29_JointIndex=SimpleNamespace(
+                kWaistYaw=12,
+                kWaistRoll=13,
+                kWaistPitch=14,
+            ),
         ),
     }
 
@@ -435,9 +447,12 @@ def test_ftp_state_uses_independent_topics_and_normalizes_angle_codes():
     FakeSubscriber.instances.clear()
     with mock.patch.dict(sys.modules, _sdk_modules()):
         reader = G1InspireFtpStateReader(max_age_s=1.0)
+        motor_state = [SimpleNamespace(q=0.0, dq=0.0) for _ in range(35)]
+        for index, q in zip((12, 13, 14), (0.25, -0.04, 0.06), strict=True):
+            motor_state[index] = SimpleNamespace(q=q, dq=0.01)
         arm = SimpleNamespace(
-            mode_machine=6,
-            motor_state=[SimpleNamespace(q=0.0, dq=0.0) for _ in range(14)],
+            mode_machine=5,
+            motor_state=motor_state,
         )
         FakeSubscriber.instances["rt/lowstate"].handler(arm)
         FakeSubscriber.instances["rt/inspire_hand/state/l"].handler(
@@ -449,6 +464,9 @@ def test_ftp_state_uses_independent_topics_and_normalizes_angle_codes():
             SimpleNamespace(angle_act=[1000, 800, 600, 400, 200, 0])
         )
         state = reader.latest()
+        np.testing.assert_array_equal(state.arm, np.zeros(14))
+        np.testing.assert_allclose(state.waist, [0.25, -0.04, 0.06])
+        np.testing.assert_allclose(state.waist_dq, [0.01, 0.01, 0.01])
         np.testing.assert_allclose(state.left_hand, [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
         np.testing.assert_allclose(state.right_hand, [1.0, 0.8, 0.6, 0.4, 0.2, 0.0])
         right_received_at = state.right_hand_received_at
@@ -669,6 +687,228 @@ def test_ftp_backend_missing_sdk_fails_before_child_dds_initialization():
     initialize_dds.assert_not_called()
 
 
+def _mode5_state(
+    *,
+    waist: np.ndarray | None = None,
+    waist_dq: np.ndarray | None = None,
+    mode_machine: int = INSPIRE_FTP_REAL_MODE_MACHINE,
+) -> RobotState:
+    return RobotState(
+        captured_at=1.0,
+        mode_machine=mode_machine,
+        arm=np.zeros(14),
+        arm_dq=np.zeros(14),
+        left_hand=np.full(6, 0.8),
+        right_hand=np.full(6, 0.7),
+        waist=np.array([0.25, -0.04, 0.06]) if waist is None else waist,
+        waist_dq=np.zeros(3) if waist_dq is None else waist_dq,
+    )
+
+
+def _low_command() -> SimpleNamespace:
+    return SimpleNamespace(
+        mode_pr=-1,
+        mode_machine=-1,
+        crc=0,
+        motor_cmd=[
+            SimpleNamespace(mode=-1, q=-99.0, dq=-99.0, tau=-99.0, kp=-99.0, kd=-99.0)
+            for _ in range(35)
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("waist", "waist_dq", "message"),
+    (
+        (None, None, "requires measured waist q/dq"),
+        (np.array([0.0, np.nan, 0.0]), np.zeros(3), "NaN or infinity"),
+        (np.zeros(3), np.array([0.0, np.inf, 0.0]), "NaN or infinity"),
+        (np.array([2.599, 0.0, 0.0]), np.zeros(3), "waist_yaw.*outside the guarded"),
+        (np.array([0.0, 0.501, 0.0]), np.zeros(3), "waist_roll.*outside the guarded"),
+        (np.array([0.0, 0.0, -0.501]), np.zeros(3), "waist_pitch.*outside the guarded"),
+    ),
+)
+def test_ftp_mode5_invalid_waist_fails_before_command_resources_exist(
+    waist,
+    waist_dq,
+    message,
+):
+    base = _mode5_state()
+    initial = RobotState(
+        captured_at=base.captured_at,
+        mode_machine=base.mode_machine,
+        arm=base.arm,
+        arm_dq=base.arm_dq,
+        left_hand=base.left_hand,
+        right_hand=base.right_hand,
+        waist=waist,
+        waist_dq=waist_dq,
+    )
+    reader = SimpleNamespace(read=mock.Mock(return_value=initial), close=mock.Mock())
+    safe_module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+    ftp_module = "unitree_lerobot.eval_robot.robot_control.g1_inspire_ftp"
+    with (
+        mock.patch(f"{ftp_module}.require_inspire_ftp_sdk"),
+        mock.patch(f"{safe_module}.initialize_dds"),
+        mock.patch(f"{ftp_module}.G1InspireFtpStateReader", return_value=reader),
+        mock.patch.object(_G1Dex3CommandBackend, "_initialize_command_resources") as resources,
+        pytest.raises(DeploymentError, match=message),
+    ):
+        _G1Dex3CommandBackend(
+            False,
+            "eth-test",
+            gravity_feedforward=False,
+            end_effector="inspire-ftp",
+        )
+    resources.assert_not_called()
+    reader.close.assert_called_once_with()
+
+
+def test_ftp_mode5_and_dex3_mode6_gates_are_profile_specific():
+    backend = _G1Dex3CommandBackend.__new__(_G1Dex3CommandBackend)
+    backend.simulation = False
+    backend.profile = INSPIRE_FTP_PROFILE
+    backend._waist_target = np.array([0.25, -0.04, 0.06])
+    assert backend._qualified_real_mode_machine() == INSPIRE_FTP_REAL_MODE_MACHINE == 5
+    state = _mode5_state()
+    assert backend._validate_runtime_state(state) is state
+    with pytest.raises(DeploymentError, match="required mode 5"):
+        backend._validate_runtime_state(_mode5_state(mode_machine=QUALIFIED_REAL_MODE_MACHINE))
+
+    backend.profile = DEX3_PROFILE
+    assert backend._qualified_real_mode_machine() == QUALIFIED_REAL_MODE_MACHINE == 6
+    dex3_state = RobotState(
+        captured_at=1.0,
+        mode_machine=QUALIFIED_REAL_MODE_MACHINE,
+        arm=np.zeros(14),
+        arm_dq=np.zeros(14),
+        left_hand=np.zeros(7),
+        right_hand=np.zeros(7),
+    )
+    assert backend._validate_runtime_state(dex3_state) is dex3_state
+    with pytest.raises(DeploymentError, match="required mode 6"):
+        backend._validate_runtime_state(
+            RobotState(
+                captured_at=1.0,
+                mode_machine=INSPIRE_FTP_REAL_MODE_MACHINE,
+                arm=np.zeros(14),
+                arm_dq=np.zeros(14),
+                left_hand=np.zeros(7),
+                right_hand=np.zeros(7),
+            )
+        )
+
+
+def test_ftp_mode5_waist_is_measured_held_and_unchanged_by_policy_or_release():
+    backend = _G1Dex3CommandBackend.__new__(_G1Dex3CommandBackend)
+    backend.simulation = False
+    backend.profile = INSPIRE_FTP_PROFILE
+    backend._arm_indices = tuple(range(15, 29))
+    backend._waist_indices = INSPIRE_FTP_WAIST_INDICES
+    backend._arm_message = _low_command()
+    lower_body_before = [
+        vars(backend._arm_message.motor_cmd[index]).copy() for index in range(12)
+    ]
+    backend._waist_target = None
+    initial = _mode5_state()
+    backend._configure_messages(initial)
+
+    assert [
+        vars(backend._arm_message.motor_cmd[index]).copy() for index in range(12)
+    ] == lower_body_before
+
+    expected_waist = initial.waist.copy()
+    for offset, index in enumerate(INSPIRE_FTP_WAIST_INDICES):
+        command = backend._arm_message.motor_cmd[index]
+        assert command.mode == 1
+        assert command.q == expected_waist[offset]
+        assert command.dq == 0.0
+        assert command.tau == 0.0
+        assert command.kp == INSPIRE_FTP_WAIST_KP == 300.0
+        assert command.kd == INSPIRE_FTP_WAIST_KD == 3.0
+
+    writes: list[tuple[int, list[dict[str, float]], np.ndarray, list[dict[str, float]]]] = []
+
+    def write(message, timeout=None):
+        del timeout
+        writes.append(
+            (
+                int(message.mode_machine),
+                [vars(message.motor_cmd[index]).copy() for index in INSPIRE_FTP_WAIST_INDICES],
+                np.array([message.motor_cmd[index].q for index in backend._arm_indices]),
+                [vars(message.motor_cmd[index]).copy() for index in range(12)],
+            )
+        )
+        return True
+
+    backend._arm_gravity = None
+    backend._arm_publisher = SimpleNamespace(Write=write)
+    backend._crc = SimpleNamespace(Crc=lambda _message: 123)
+    backend._weight = 1.0
+    backend._authority_ramp_timing_enabled = False
+    backend._last_publish_timing_ms = {}
+    backend._has_published = False
+    backend._last_published_arm_q = None
+    backend._last_published_arm_tau = None
+
+    first_arm = np.linspace(-0.2, 0.2, 14)
+    second_arm = np.linspace(0.3, -0.3, 14)
+    backend.set_target(first_arm, np.zeros(6), np.ones(6))
+    np.testing.assert_array_equal(backend._waist_target, expected_waist)
+    backend._publish_arm(require_qualified_state=False)
+    backend.set_target(second_arm, np.ones(6), np.zeros(6))
+    np.testing.assert_array_equal(backend._waist_target, expected_waist)
+    backend._publish_arm(require_qualified_state=False)
+    backend._publish_last_arm_for_release()
+
+    assert [mode for mode, _waist, _arm, _lower in writes] == [5, 5, 5]
+    for _mode, waist_commands, _arm, lower_body in writes:
+        assert lower_body == lower_body_before
+        for offset, command in enumerate(waist_commands):
+            assert command == {
+                "mode": 1,
+                "q": expected_waist[offset],
+                "dq": 0.0,
+                "tau": 0.0,
+                "kp": 300.0,
+                "kd": 3.0,
+            }
+    np.testing.assert_array_equal(writes[0][2], first_arm)
+    np.testing.assert_array_equal(writes[1][2], second_arm)
+    np.testing.assert_array_equal(writes[2][2], second_arm)
+
+
+def test_ftp_mode5_waist_deviation_and_motion_fail_closed():
+    backend = _G1Dex3CommandBackend.__new__(_G1Dex3CommandBackend)
+    backend.simulation = False
+    backend.profile = INSPIRE_FTP_PROFILE
+    backend._arm_target = np.zeros(14)
+    backend._left_target = np.full(6, 0.8)
+    backend._right_target = np.full(6, 0.7)
+    backend._waist_target = np.array([0.25, -0.04, 0.06])
+
+    deviated = backend._waist_target.copy()
+    deviated[1] += MAX_WAIST_HOLD_ERROR_RAD + 1e-6
+    with pytest.raises(DeploymentError, match="waist_roll.*MAX_WAIST_HOLD_ERROR_RAD"):
+        backend._validate_runtime_state(_mode5_state(waist=deviated))
+
+    runtime_moving = np.zeros(3)
+    runtime_moving[0] = MAX_WAIST_DQ_RAD_S + 1e-6
+    with pytest.raises(DeploymentError, match="waist_yaw.*MAX_WAIST_DQ_RAD_S"):
+        backend._validate_runtime_state(_mode5_state(waist_dq=runtime_moving))
+
+    moving = np.zeros(3)
+    moving[2] = 0.101
+    with (
+        mock.patch(
+            "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3.time.monotonic",
+            return_value=1.0,
+        ),
+        pytest.raises(DeploymentError, match="Waist is not stationary.*waist_pitch"),
+    ):
+        backend._validate_prearm_takeover_state(_mode5_state(waist_dq=moving))
+
+
 def test_ftp_release_reaches_zero_arm_weight_without_hand_refresh():
     now = [20.0]
     events: list[tuple[str, float | None]] = []
@@ -726,7 +966,8 @@ def test_ftp_final_measured_reseed_is_used_before_first_write():
     assert INSPIRE_FTP_COMMAND_MAX_STEP == 0.2
 
 
-def test_ftp_authority_ramp_checks_freshness_reseeds_then_writes_hands_once():
+@pytest.mark.parametrize("settle_waist_dq", (0.0, 0.2))
+def test_ftp_authority_ramp_requires_stationary_waist(settle_waist_dq):
     now = [10.0]
     events: list[tuple[str, float]] = []
 
@@ -764,6 +1005,15 @@ def test_ftp_authority_ramp_checks_freshness_reseeds_then_writes_hands_once():
             self._arm_target = np.zeros(14)
             self._left_target = np.zeros(6)
             self._right_target = np.zeros(6)
+            self._waist_target = np.array([0.25, -0.04, 0.06])
+
+        @staticmethod
+        def _uses_mode5_waist_hold():
+            return True
+
+        @staticmethod
+        def _require_mode5_waist_state(state):
+            return state.waist, state.waist_dq
 
         @staticmethod
         def _validate_prearm_takeover_state(_state):
@@ -781,11 +1031,13 @@ def test_ftp_authority_ramp_checks_freshness_reseeds_then_writes_hands_once():
         def state(self):
             return RobotState(
                 captured_at=now[0],
-                mode_machine=6,
+                mode_machine=5,
                 arm=np.zeros(14),
                 arm_dq=np.zeros(14),
                 left_hand=np.full(6, 0.8),
                 right_hand=np.full(6, 0.7),
+                waist=self._waist_target.copy(),
+                waist_dq=np.array([0.0, settle_waist_dq, 0.0]),
                 left_hand_received_at=now[0],
                 right_hand_received_at=now[0],
                 arm_received_at=now[0],
@@ -809,7 +1061,11 @@ def test_ftp_authority_ramp_checks_freshness_reseeds_then_writes_hands_once():
         mock.patch(f"{module}.ARM_TAKEOVER_SETTLE_DWELL_S", 0.2),
         mock.patch(f"{module}.ARM_TAKEOVER_SETTLE_TIMEOUT_S", 0.5),
     ):
-        assert _ramp_real_arm_authority(Backend(), ClockedStop(), Heartbeat(), gate)
+        if settle_waist_dq == 0.0:
+            assert _ramp_real_arm_authority(Backend(), ClockedStop(), Heartbeat(), gate)
+        else:
+            with pytest.raises(DeploymentError, match="max waist dq=0.200"):
+                _ramp_real_arm_authority(Backend(), ClockedStop(), Heartbeat(), gate)
     assert gate.checks > 1
     assert [kind for kind, _at in events[:4]] == ["fresh", "reseed", "arm", "hands"]
     assert sum(kind == "hands" for kind, _at in events) == 1

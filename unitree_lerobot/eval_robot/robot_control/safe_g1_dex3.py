@@ -140,6 +140,16 @@ ACTION_REPLAN_RECOVERY_MAX_LOOP_GAP_S = 2.0 / PUBLISH_HZ
 # roll/pitch are locked (eval_robot/assets/g1/README.md). This matches the
 # embodiment used to collect and train the deployed policy.
 QUALIFIED_REAL_MODE_MACHINE = 6
+INSPIRE_FTP_REAL_MODE_MACHINE = 5
+INSPIRE_FTP_WAIST_INDICES = (12, 13, 14)
+WAIST_JOINT_NAMES = ("waist_yaw", "waist_roll", "waist_pitch")
+INSPIRE_FTP_WAIST_KP = 300.0
+INSPIRE_FTP_WAIST_KD = 3.0
+INSPIRE_FTP_WAIST_LOWER_RAD = (-2.618, -0.52, -0.52)
+INSPIRE_FTP_WAIST_UPPER_RAD = (2.618, 0.52, 0.52)
+INSPIRE_FTP_WAIST_LIMIT_MARGIN_RAD = 0.02
+MAX_WAIST_DQ_RAD_S = 1.0
+MAX_WAIST_HOLD_ERROR_RAD = 0.05
 PREARM_STATIONARY_DWELL_S = 0.5
 PREARM_STATE_MAX_AGE_S = 0.05
 PREARM_MAX_ARM_DQ_RAD_S = 0.10
@@ -267,6 +277,10 @@ class RobotState:
     arm_dq: np.ndarray
     left_hand: np.ndarray
     right_hand: np.ndarray
+    # Mode-5 Inspire uses an active 3-DoF waist. It remains outside the policy
+    # tensor, but live state is retained so arm_sdk can hold the measured pose.
+    waist: np.ndarray | None = None
+    waist_dq: np.ndarray | None = None
     # DDS hand messages have no qualified capture timestamp. These are local
     # monotonic callback-receipt times, kept separately so one cached hand sample
     # is not compared with a newer 100 Hz command or counted twice.
@@ -804,6 +818,10 @@ class ActiveTimingRing:
                 "left_hand_received_at": state.left_hand_received_at,
                 "right_hand_received_at": state.right_hand_received_at,
             }
+            if state.waist is not None:
+                state_payload["waist"] = np.asarray(state.waist, dtype=np.float64).tolist()
+            if state.waist_dq is not None:
+                state_payload["waist_dq"] = np.asarray(state.waist_dq, dtype=np.float64).tolist()
         targets = None
         if target_snapshot is not None:
             arm_target, left_target, right_target = target_snapshot
@@ -818,6 +836,9 @@ class ActiveTimingRing:
                 "left_hand": np.asarray(getattr(backend, "_left_target", []), dtype=np.float64).tolist(),
                 "right_hand": np.asarray(getattr(backend, "_right_target", []), dtype=np.float64).tolist(),
             }
+            waist_target = getattr(backend, "_waist_target", None)
+            if waist_target is not None:
+                targets["waist_hold"] = np.asarray(waist_target, dtype=np.float64).tolist()
         payload = {
             "schema_version": 1,
             "trigger": trigger,
@@ -2020,6 +2041,64 @@ TeleimagerColourCamera = TeleimagerCamera
 class _G1Dex3CommandBackend:
     """Profile-selected DDS publishers used only in the actuator child."""
 
+    def _qualified_real_mode_machine(self) -> int:
+        profile = getattr(self, "profile", DEX3_PROFILE)
+        return (
+            INSPIRE_FTP_REAL_MODE_MACHINE
+            if profile.name == "inspire-ftp"
+            else QUALIFIED_REAL_MODE_MACHINE
+        )
+
+    def _uses_mode5_waist_hold(self) -> bool:
+        profile = getattr(self, "profile", DEX3_PROFILE)
+        return not getattr(self, "simulation", False) and profile.name == "inspire-ftp"
+
+    def _require_mode5_waist_state(
+        self,
+        state: RobotState,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if state.waist is None or state.waist_dq is None:
+            raise DeploymentError(
+                "Mode-5 Inspire FTP requires measured waist q/dq for joints 12-14"
+            )
+        waist = np.asarray(state.waist, dtype=np.float64)
+        waist_dq = np.asarray(state.waist_dq, dtype=np.float64)
+        if waist.shape != (3,) or waist_dq.shape != (3,):
+            raise DeploymentError("Mode-5 Inspire FTP waist q/dq must each have shape (3,)")
+        if not np.all(np.isfinite(waist)) or not np.all(np.isfinite(waist_dq)):
+            raise DeploymentError("Mode-5 Inspire FTP waist q/dq contains NaN or infinity")
+        lower = np.asarray(INSPIRE_FTP_WAIST_LOWER_RAD) + INSPIRE_FTP_WAIST_LIMIT_MARGIN_RAD
+        upper = np.asarray(INSPIRE_FTP_WAIST_UPPER_RAD) - INSPIRE_FTP_WAIST_LIMIT_MARGIN_RAD
+        outside = np.flatnonzero((waist < lower) | (waist > upper))
+        if outside.size:
+            joint = int(outside[0])
+            raise DeploymentError(
+                f"Mode-5 Inspire FTP measured {WAIST_JOINT_NAMES[joint]}={waist[joint]:+.3f} "
+                f"rad is outside the guarded [{lower[joint]:+.3f}, {upper[joint]:+.3f}] rad range"
+            )
+        return waist, waist_dq
+
+    def _apply_waist_hold_target(self) -> None:
+        if not self._uses_mode5_waist_hold():
+            return
+        if self._waist_target is None:
+            raise DeploymentError("Mode-5 Inspire FTP waist hold has no measured target")
+        for offset, index in enumerate(self._waist_indices):
+            command = self._arm_message.motor_cmd[index]
+            command.mode = 1
+            command.q = float(self._waist_target[offset])
+            command.dq = 0.0
+            command.tau = 0.0
+            command.kp = INSPIRE_FTP_WAIST_KP
+            command.kd = INSPIRE_FTP_WAIST_KD
+
+    def _set_measured_waist_hold(self, state: RobotState) -> None:
+        if not self._uses_mode5_waist_hold():
+            return
+        waist, _waist_dq = self._require_mode5_waist_state(state)
+        self._waist_target = waist.copy()
+        self._apply_waist_hold_target()
+
     _supports_cleanup_phases = True
 
     def __init__(
@@ -2109,12 +2188,14 @@ class _G1Dex3CommandBackend:
 
                 self.reader = G1InspireFtpStateReader(**reader_kwargs)
             initial = self.reader.read(timeout_s=5.0)
-            if not simulation and initial.mode_machine != QUALIFIED_REAL_MODE_MACHINE:
+            qualified_mode = self._qualified_real_mode_machine()
+            if not simulation and initial.mode_machine != qualified_mode:
                 raise DeploymentError(
                     f"Real G1 mode_machine is {initial.mode_machine}; this adapter is qualified only "
-                    f"for mode {QUALIFIED_REAL_MODE_MACHINE} "
-                    "(g1_29dof_lock_waist_with_hand_rev_1_0)"
+                    f"for mode {qualified_mode} with end effector {self.profile.name!r}"
                 )
+            if self._uses_mode5_waist_hold():
+                self._require_mode5_waist_state(initial)
             self._initialize_command_resources(initial)
         except BaseException:
             self._close_constructed_resources(suppress_errors=True)
@@ -2123,13 +2204,30 @@ class _G1Dex3CommandBackend:
     def _initialize_command_resources(self, initial: RobotState) -> None:
         """Build every command resource without sending a DDS sample."""
 
-        from unitree_lerobot.eval_robot.robot_control.robot_arm import G1_29_JointArmIndex
+        from unitree_lerobot.eval_robot.robot_control.robot_arm import (
+            G1_29_JointArmIndex,
+            G1_29_JointIndex,
+        )
         from unitree_sdk2py.core.channel import ChannelPublisher
         from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
         from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
         from unitree_sdk2py.utils.crc import CRC
 
         self._arm_indices = tuple(int(index) for index in G1_29_JointArmIndex)
+        self._waist_indices = (
+            (
+                int(G1_29_JointIndex.kWaistYaw),
+                int(G1_29_JointIndex.kWaistRoll),
+                int(G1_29_JointIndex.kWaistPitch),
+            )
+            if self._uses_mode5_waist_hold()
+            else ()
+        )
+        if self._waist_indices and self._waist_indices != INSPIRE_FTP_WAIST_INDICES:
+            raise DeploymentError(
+                f"Unexpected mode-5 waist indices {self._waist_indices}; "
+                f"expected {INSPIRE_FTP_WAIST_INDICES}"
+            )
         arm_topic = "rt/lowcmd" if self.simulation else "rt/arm_sdk"
 
         # Construct every resource before the first Write. Partial failures are
@@ -2178,6 +2276,7 @@ class _G1Dex3CommandBackend:
         self._arm_target = initial.arm.copy()
         self._left_target = initial.left_hand.copy()
         self._right_target = initial.right_hand.copy()
+        self._waist_target: np.ndarray | None = None
         self._left_hand_publish_history: deque[PublishedHandTarget] = deque(maxlen=HAND_COMMAND_HISTORY_SIZE)
         self._right_hand_publish_history: deque[PublishedHandTarget] = deque(maxlen=HAND_COMMAND_HISTORY_SIZE)
         self._configure_messages(initial)
@@ -2217,6 +2316,11 @@ class _G1Dex3CommandBackend:
             command.kp = 40.0 if offset in wrist_offsets else 80.0
             command.kd = 1.5 if offset in wrist_offsets else 3.0
 
+        # Mode 5 makes yaw/roll/pitch active. Match the proven XR teleop
+        # behavior by holding the latest measured pose; these joints never
+        # enter the policy tensor and are never changed by set_target().
+        self._set_measured_waist_hold(initial)
+
         if getattr(self, "profile", DEX3_PROFILE).name != "dex3":
             return
         for message, indices in (
@@ -2233,11 +2337,31 @@ class _G1Dex3CommandBackend:
                 command.kd = 0.2
 
     def _validate_runtime_state(self, state: RobotState) -> RobotState:
-        if not self.simulation and state.mode_machine != QUALIFIED_REAL_MODE_MACHINE:
+        qualified_mode = self._qualified_real_mode_machine()
+        if not self.simulation and state.mode_machine != qualified_mode:
             raise DeploymentError(
-                f"Robot mode_machine changed from QUALIFIED_REAL_MODE_MACHINE="
-                f"{QUALIFIED_REAL_MODE_MACHINE} to {state.mode_machine}"
+                f"Robot mode_machine changed from required mode {qualified_mode} "
+                f"to {state.mode_machine} for end effector {self.profile.name!r}"
             )
+        if self._uses_mode5_waist_hold():
+            waist, waist_dq = self._require_mode5_waist_state(state)
+            velocity_joint = int(np.argmax(np.abs(waist_dq)))
+            velocity = float(waist_dq[velocity_joint])
+            if abs(velocity) > MAX_WAIST_DQ_RAD_S:
+                raise DeploymentError(
+                    f"Mode-5 waist velocity at {WAIST_JOINT_NAMES[velocity_joint]} is "
+                    f"{velocity:+.3f} rad/s; MAX_WAIST_DQ_RAD_S={MAX_WAIST_DQ_RAD_S:.3f} rad/s"
+                )
+            waist_target = getattr(self, "_waist_target", None)
+            if waist_target is not None:
+                joint = int(np.argmax(np.abs(waist - waist_target)))
+                error = float(waist[joint] - waist_target[joint])
+                if abs(error) > MAX_WAIST_HOLD_ERROR_RAD:
+                    raise DeploymentError(
+                        f"Mode-5 waist hold error at {WAIST_JOINT_NAMES[joint]} is "
+                        f"{error:+.3f} rad; MAX_WAIST_HOLD_ERROR_RAD="
+                        f"{MAX_WAIST_HOLD_ERROR_RAD:.3f} rad"
+                    )
         joint = int(np.argmax(np.abs(state.arm_dq)))
         velocity = float(state.arm_dq[joint])
         if abs(velocity) > MAX_ARM_DQ_RAD_S:
@@ -2256,6 +2380,7 @@ class _G1Dex3CommandBackend:
         reference_arm: np.ndarray,
         reference_left: np.ndarray,
         reference_right: np.ndarray,
+        reference_waist: np.ndarray | None = None,
     ) -> tuple[tuple[str, np.ndarray, tuple[str, ...]], ...]:
         groups = [("arm", state.arm - reference_arm, ARM_JOINT_NAMES)]
         profile = getattr(self, "profile", DEX3_PROFILE)
@@ -2266,6 +2391,13 @@ class _G1Dex3CommandBackend:
                     ("right hand", state.right_hand - reference_right, profile.right_joint_names),
                 )
             )
+        if self._uses_mode5_waist_hold():
+            waist, _waist_dq = self._require_mode5_waist_state(state)
+            if reference_waist is None:
+                reference_waist = self._waist_target
+            if reference_waist is None:
+                raise DeploymentError("Mode-5 Inspire FTP waist drift has no reference")
+            groups.append(("waist", waist - reference_waist, WAIST_JOINT_NAMES))
         return tuple(groups)
 
     def _validate_prearm_takeover_state(self, state: RobotState) -> None:
@@ -2285,6 +2417,15 @@ class _G1Dex3CommandBackend:
                 f"({ARM_JOINT_NAMES[arm_dq_joint]}): {arm_dq:+.3f} rad/s; "
                 f"PREARM_MAX_ARM_DQ_RAD_S={PREARM_MAX_ARM_DQ_RAD_S:.3f} rad/s"
             )
+        if self._uses_mode5_waist_hold():
+            _waist, waist_dq = self._require_mode5_waist_state(state)
+            waist_joint = int(np.argmax(np.abs(waist_dq)))
+            if abs(float(waist_dq[waist_joint])) > PREARM_MAX_ARM_DQ_RAD_S:
+                raise DeploymentError(
+                    f"Waist is not stationary before takeover at "
+                    f"{WAIST_JOINT_NAMES[waist_joint]}: {waist_dq[waist_joint]:+.3f} rad/s; "
+                    f"PREARM_MAX_ARM_DQ_RAD_S={PREARM_MAX_ARM_DQ_RAD_S:.3f} rad/s"
+                )
         drift_group, drift_joint, drift_name, drift = _largest_named_value(
             self._tracked_drift_groups(
                 state,
@@ -2322,12 +2463,23 @@ class _G1Dex3CommandBackend:
                         f"{velocity:+.3f} rad/s; "
                         f"PREARM_MAX_ARM_DQ_RAD_S={PREARM_MAX_ARM_DQ_RAD_S:.3f} rad/s"
                     )
+                if self._uses_mode5_waist_hold():
+                    _waist, waist_dq = self._require_mode5_waist_state(state)
+                    waist_joint = int(np.argmax(np.abs(waist_dq)))
+                    waist_velocity = float(waist_dq[waist_joint])
+                    if abs(waist_velocity) > PREARM_MAX_ARM_DQ_RAD_S:
+                        raise DeploymentError(
+                            f"Waist is not stationary at {WAIST_JOINT_NAMES[waist_joint]}: "
+                            f"{waist_velocity:+.3f} rad/s; PREARM_MAX_ARM_DQ_RAD_S="
+                            f"{PREARM_MAX_ARM_DQ_RAD_S:.3f} rad/s"
+                        )
                 group, joint, joint_name, drift = _largest_named_value(
                     self._tracked_drift_groups(
                         state,
                         reference.arm,
                         reference.left_hand,
                         reference.right_hand,
+                        reference.waist,
                     )
                 )
                 if abs(drift) > PREARM_MAX_POSITION_DRIFT_RAD:
@@ -2345,7 +2497,19 @@ class _G1Dex3CommandBackend:
                     f"Only {distinct_samples} distinct robot-state samples arrived during the pre-arm dwell; "
                     f"PREARM_MIN_DISTINCT_SAMPLES={PREARM_MIN_DISTINCT_SAMPLES}"
                 )
-        self._arm_message.mode_machine = state.mode_machine if self.simulation else QUALIFIED_REAL_MODE_MACHINE
+        self._set_measured_waist_hold(state)
+        if self._uses_mode5_waist_hold():
+            LOGGER.warning(
+                "Inspire FTP mode-5 waist hold prepared at measured q=%s on slots=%s "
+                "with kp=%.1f kd=%.1f; waist is not policy-controlled",
+                np.array2string(self._waist_target, precision=4),
+                self._waist_indices,
+                INSPIRE_FTP_WAIST_KP,
+                INSPIRE_FTP_WAIST_KD,
+            )
+        self._arm_message.mode_machine = (
+            state.mode_machine if self.simulation else self._qualified_real_mode_machine()
+        )
         self.set_target(state.arm, state.left_hand, state.right_hand)
         return state
 
@@ -2409,7 +2573,7 @@ class _G1Dex3CommandBackend:
             # before publishing.  Cleanup can skip the freshness dependency so
             # an attempted authority release is not defeated by the same state
             # fault that triggered it.
-            self._arm_message.mode_machine = QUALIFIED_REAL_MODE_MACHINE
+            self._arm_message.mode_machine = self._qualified_real_mode_machine()
             if require_qualified_state:
                 started_ns = time.monotonic_ns()
                 try:
@@ -2475,6 +2639,7 @@ class _G1Dex3CommandBackend:
             command = self._arm_message.motor_cmd[index]
             command.q = float(candidate_q[offset])
             command.tau = float(gravity_tau[offset])
+        self._apply_waist_hold_target()
         self._write_arm_message(
             require_qualified_state=require_qualified_state,
             require_prearm_takeover_state=require_prearm_takeover_state,
@@ -2494,6 +2659,7 @@ class _G1Dex3CommandBackend:
             command = self._arm_message.motor_cmd[index]
             command.q = float(self._last_published_arm_q[offset])
             command.tau = float(self._last_published_arm_tau[offset])
+        self._apply_waist_hold_target()
         self._write_arm_message(require_qualified_state=False)
 
     def _publish_hands(self) -> None:
@@ -3049,6 +3215,22 @@ def _tracking_errors(backend: _G1Dex3CommandBackend, state: RobotState) -> tuple
     return arm_error, hand_error
 
 
+def _waist_hold_metrics(
+    backend: _G1Dex3CommandBackend,
+    state: RobotState,
+) -> tuple[float, float]:
+    uses_waist_hold = getattr(backend, "_uses_mode5_waist_hold", None)
+    if not callable(uses_waist_hold) or not uses_waist_hold():
+        return 0.0, 0.0
+    waist, waist_dq = backend._require_mode5_waist_state(state)
+    if backend._waist_target is None:
+        raise DeploymentError("Mode-5 Inspire FTP waist hold has no measured target")
+    return (
+        float(np.max(np.abs(waist - backend._waist_target))),
+        float(np.max(np.abs(waist_dq))),
+    )
+
+
 def _enforce_arm_tracking(
     backend: _G1Dex3CommandBackend,
     state: RobotState,
@@ -3124,6 +3306,10 @@ def _position_drift(
                 np.max(np.abs(state.right_hand - reference.right_hand)),
             )
         )
+    if state.waist is not None or reference.waist is not None:
+        if state.waist is None or reference.waist is None:
+            raise DeploymentError("Waist state disappeared during a stability dwell")
+        values.append(np.max(np.abs(state.waist - reference.waist)))
     return float(max(values))
 
 
@@ -3202,11 +3388,14 @@ def _wait_for_initialization_start(
             context="initialization-start dwell",
         )
         arm_error, hand_error = _tracking_errors(backend, latest)
+        waist_error, waist_dq = _waist_hold_metrics(backend, latest)
 
         stationary = (
             (backend.simulation or float(np.max(np.abs(latest.arm_dq))) <= INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S)
             and arm_error <= INITIALIZATION_ARM_TOLERANCE_RAD
             and (not require_hand_tracking or hand_error <= INITIALIZATION_HAND_TOLERANCE_RAD)
+            and waist_error <= MAX_WAIST_HOLD_ERROR_RAD
+            and waist_dq <= INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S
         )
         if stationary:
             if stationary_since is None:
@@ -3337,10 +3526,13 @@ def _execute_initialization(
 
         if endpoint_deadline is not None:
             arm_error, hand_error = _tracking_errors(backend, state)
+            waist_error, waist_dq = _waist_hold_metrics(backend, state)
             in_tolerance = (
                 arm_error <= INITIALIZATION_ARM_TOLERANCE_RAD
                 and (not require_hand_tracking or hand_error <= INITIALIZATION_HAND_TOLERANCE_RAD)
                 and (backend.simulation or float(np.max(np.abs(state.arm_dq))) <= INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S)
+                and waist_error <= MAX_WAIST_HOLD_ERROR_RAD
+                and waist_dq <= INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S
             )
             if in_tolerance:
                 if converged_since is None:
@@ -3413,6 +3605,18 @@ def _execute_initialization(
                         f"INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S="
                         f"{INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S:.3f} rad/s"
                     )
+                if waist_error > MAX_WAIST_HOLD_ERROR_RAD:
+                    failed_gates.append(
+                        f"waist hold error={waist_error:.3f} rad > "
+                        f"MAX_WAIST_HOLD_ERROR_RAD="
+                        f"{MAX_WAIST_HOLD_ERROR_RAD:.3f} rad"
+                    )
+                if waist_dq > INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S:
+                    failed_gates.append(
+                        f"max waist dq={waist_dq:.3f} rad/s > "
+                        f"INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S="
+                        f"{INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S:.3f} rad/s"
+                    )
                 if not failed_gates:
                     dwell_elapsed = 0.0 if converged_since is None else max(0.0, now - converged_since)
                     failed_gates.append(
@@ -3432,6 +3636,7 @@ def _execute_initialization(
                     f"measured minus target={arm_delta:+.3f} rad; "
                     f"max arm dq={abs(arm_dq):.3f} rad/s at joint {arm_dq_joint} "
                     f"({ARM_JOINT_NAMES[arm_dq_joint]}); "
+                    f"waist hold error={waist_error:.3f} rad, max waist dq={waist_dq:.3f} rad/s; "
                     f"hand error={hand_error:.3f} {profile.value_unit} at {hand_group} joint {hand_joint} "
                     f"({hand_name}), measured minus target={hand_delta:+.3f} {profile.value_unit}; "
                     f"hand convergence required={require_hand_tracking}"
@@ -3666,11 +3871,13 @@ def _ramp_real_arm_authority(
     settle_started = ramp_completed_at
     settle_deadline = settle_started + ARM_TAKEOVER_SETTLE_TIMEOUT_S
     stationary_since: float | None = None
-    stationary_reference: np.ndarray | None = None
+    stationary_reference: RobotState | None = None
     distinct_samples = 0
     last_arm_received_at = float("-inf")
     last_arm_error = float("inf")
     last_arm_dq = float("inf")
+    last_waist_error = float("inf")
+    last_waist_dq = float("inf")
     while not stop_event.is_set() and time.monotonic() < settle_deadline:
         loop_started = time.monotonic()
         if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
@@ -3693,23 +3900,27 @@ def _ramp_real_arm_authority(
             raise DeploymentError("Arm state is not fresh enough to verify arm takeover")
         last_arm_error = float(np.max(np.abs(state.arm - backend._arm_target)))
         last_arm_dq = float(np.max(np.abs(state.arm_dq)))
+        last_waist_error, last_waist_dq = _waist_hold_metrics(backend, state)
         stationary = (
             last_arm_error <= INITIALIZATION_ARM_TOLERANCE_RAD
             and last_arm_dq <= INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S
+            and last_waist_error <= MAX_WAIST_HOLD_ERROR_RAD
+            and last_waist_dq <= INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S
         )
         if stationary:
             if stationary_since is None:
                 stationary_since = now
-                stationary_reference = state.arm.copy()
+                stationary_reference = state
                 distinct_samples = 0
                 last_arm_received_at = float("-inf")
             assert stationary_reference is not None
-            if (
-                float(np.max(np.abs(state.arm - stationary_reference)))
-                > INITIALIZATION_MAX_POSITION_DRIFT_RAD
-            ):
+            if _position_drift(
+                state,
+                stationary_reference,
+                include_hands=False,
+            ) > INITIALIZATION_MAX_POSITION_DRIFT_RAD:
                 stationary_since = now
-                stationary_reference = state.arm.copy()
+                stationary_reference = state
                 distinct_samples = 0
                 last_arm_received_at = float("-inf")
             if arm_received_at > last_arm_received_at:
@@ -3738,6 +3949,7 @@ def _ramp_real_arm_authority(
         raise DeploymentError(
             "Arm did not settle after matched-pose takeover: "
             f"arm error={last_arm_error:.3f} rad, max arm dq={last_arm_dq:.3f} rad/s, "
+            f"waist error={last_waist_error:.3f} rad, max waist dq={last_waist_dq:.3f} rad/s, "
             f"required dwell={ARM_TAKEOVER_SETTLE_DWELL_S:.3f}s"
         )
 
