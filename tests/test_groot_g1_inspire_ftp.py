@@ -353,12 +353,12 @@ def test_ftp_xr_home_and_return_to_start_are_profile_aware():
     )
     assert spec.end_effector == "inspire-ftp"
     expected_arm = np.zeros(14)
-    expected_arm[[3, 10]] = -0.10
+    expected_arm[[3, 10]] = -0.15
     np.testing.assert_array_equal(spec.arm, expected_arm)
     np.testing.assert_array_equal(spec.arm, INSPIRE_XR_HOME_ARM)
     assert spec.arm is not INSPIRE_XR_HOME_ARM
-    assert INSPIRE_XR_HOME_ELBOW_RAD == -0.10
-    assert "both elbows -0.10 rad" in spec.label
+    assert INSPIRE_XR_HOME_ELBOW_RAD == -0.15
+    assert "both elbows -0.15 rad" in spec.label
     np.testing.assert_array_equal(spec.left_hand, np.ones(6))
     np.testing.assert_array_equal(spec.right_hand, np.ones(6))
 

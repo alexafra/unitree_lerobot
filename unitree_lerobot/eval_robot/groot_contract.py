@@ -115,10 +115,10 @@ INITIAL_POSE_SCHEMA_VERSION = 1
 
 # Inspire hands hang slightly lower than Dex3 at the historical all-zero XR
 # staging pose.  A small, symmetric negative elbow offset raises each palm by
-# about 23 mm in the checked-in G1 URDF while leaving shoulders and wrists at
+# about 34 mm in the checked-in G1 URDF while leaving shoulders and wrists at
 # the established XR zero target.  Arm ordering is left 7 then right 7, so the
 # elbow entries are 3 and 10.
-INSPIRE_XR_HOME_ELBOW_RAD = -0.10
+INSPIRE_XR_HOME_ELBOW_RAD = -0.15
 INSPIRE_XR_HOME_ARM = np.zeros(ARM_DOF, dtype=np.float64)
 INSPIRE_XR_HOME_ARM[[3, 10]] = INSPIRE_XR_HOME_ELBOW_RAD
 INSPIRE_XR_HOME_ARM.flags.writeable = False

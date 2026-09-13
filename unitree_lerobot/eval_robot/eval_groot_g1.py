@@ -1557,7 +1557,7 @@ def confirm_initialization(
         if spec.end_effector != "dex3":
             warning += (
                 " Inspire XR-home leaves both shoulders and wrists at joint zero, targets both "
-                "elbows to -0.10 rad for a slightly raised carry pose, and targets all six "
+                "elbows to -0.15 rad for a slightly raised carry pose, and targets all six "
                 "channels of each Inspire hand to normalized one (fully open); this can drop "
                 "held objects, so both hands must be empty."
             )
