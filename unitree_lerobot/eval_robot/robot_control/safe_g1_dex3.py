@@ -5714,15 +5714,30 @@ class SafeG1Dex3Actuator:
         self._initialized = True
         self._holding = True
 
-    def assert_healthy(self) -> None:
+    def assert_healthy(self) -> bool:
+        """Raise on actuator failure and report whether status output was logged.
+
+        Existing callers may ignore the return value. Interactive prompt loops
+        use it to redraw a named confirmation after asynchronous actuator
+        warnings have written over the terminal's final line.
+        """
+
         immediate = self.immediate_control_requested()
         if immediate is not None:
             raise ImmediateControlEvent(immediate)
         issue = None
+        terminal_output_emitted = False
         try:
             while True:
                 kind, value = self._status_queue.get_nowait()
                 if self._record_auxiliary_status(kind, value):
+                    terminal_output_emitted = terminal_output_emitted or kind in {
+                        "hand_state_pause",
+                        "hand_state_recovery_progress",
+                        "hand_state_operator_hold",
+                        "hand_state_recovered",
+                        "rtc_obsolete",
+                    }
                     continue
                 if kind == "fault":
                     issue = f"fault: {value}"
@@ -5750,6 +5765,7 @@ class SafeG1Dex3Actuator:
             if self._immediate_release_requested.is_set():
                 raise ImmediateControlEvent("release")
             raise DeploymentError("Actuator process stopped")
+        return terminal_output_emitted
 
     def warmup_pose(self, spec: InitializationSpec) -> None:
         """Move to one guarded non-policy pose and remain in powered HOLD."""

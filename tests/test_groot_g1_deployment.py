@@ -1616,13 +1616,39 @@ class GrootG1DeploymentTests(unittest.TestCase):
         ):
             _confirm_while_armed(actuator, "ready", "RUN")
 
+    def test_armed_confirmation_redraws_named_prompt_after_status_output(self):
+        prompt = "[WAITING FOR RUN] Press r (no Enter); s STOP; q release: "
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            # True means assert_healthy consumed status that wrote a terminal
+            # log line; the prompt must immediately become visible again.
+            assert_healthy=mock.Mock(return_value=True),
+        )
+        stdin = io.StringIO("r\n")
+        with (
+            mock.patch.object(sys, "stdin", stdin),
+            mock.patch(
+                "unitree_lerobot.eval_robot.eval_groot_g1.select.select",
+                return_value=([stdin], [], []),
+            ),
+            mock.patch("builtins.print") as printed,
+        ):
+            _confirm_while_armed(actuator, "ready", "RUN")
+
+        prompt_calls = [
+            call
+            for call in printed.call_args_list
+            if call.args and isinstance(call.args[0], str) and call.args[0].endswith(prompt)
+        ]
+        self.assertEqual(len(prompt_calls), 2)
+
     def test_pre_initialization_stop_stays_at_gate_until_r_without_calling_hold(self):
         master_fd, slave_fd = pty.openpty()
         stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
         original = termios.tcgetattr(slave_fd)
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
-        prompt = "Press r to INITIALIZE (no Enter); s STOP; q release: "
-        keys_sent = False
+        prompt = "[WAITING FOR INITIALIZE] Press r (no Enter); s STOP; q release: "
+        prompt_count = 0
         actuator = SimpleNamespace(
             heartbeat=mock.Mock(),
             assert_healthy=mock.Mock(),
@@ -1632,16 +1658,20 @@ class GrootG1DeploymentTests(unittest.TestCase):
         )
 
         def write_stop_then_continue(*args, **_kwargs):
-            nonlocal keys_sent
-            if args and args[0] == prompt and not keys_sent:
-                keys_sent = True
-                os.write(master_fd, b"sr")
+            nonlocal prompt_count
+            if args and args[0] == prompt:
+                prompt_count += 1
+                # The first r is already queued when STOP returns. It must be
+                # quarantined; only the new r after the second visible prompt
+                # may advance the gate.
+                os.write(master_fd, b"sr" if prompt_count == 1 else b"r")
 
         try:
             with (
                 mock.patch.object(sys, "stdin", stdin),
                 mock.patch("builtins.print", side_effect=write_stop_then_continue) as printed,
                 mock.patch(f"{module}._finish_operator_stop") as finish_stop,
+                self.assertLogs("eval_groot_g1", level="WARNING") as captured_logs,
             ):
                 _confirm_while_armed(
                     actuator,
@@ -1651,8 +1681,11 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 )
 
             prompt_calls = [call for call in printed.call_args_list if call.args == (prompt,)]
-            self.assertTrue(keys_sent)
+            self.assertEqual(prompt_count, 2)
             self.assertEqual(len(prompt_calls), 2)
+            self.assertTrue(
+                any("Discarded 1 buffered r key" in line for line in captured_logs.output)
+            )
             actuator.request_immediate_hold.assert_called_once_with()
             actuator.hold.assert_not_called()
             finish_stop.assert_not_called()
@@ -5153,6 +5186,23 @@ class GrootG1DeploymentTests(unittest.TestCase):
             "unhealthy.*fault.*arm DDS write failed",
         ):
             actuator.assert_healthy()
+
+    def test_assert_healthy_reports_when_auxiliary_status_wrote_terminal_output(self):
+        actuator = object.__new__(SafeG1Dex3Actuator)
+        actuator._status_queue = queue.Queue()
+        actuator._status_queue.put(("hand_state_pause", {"max_age_s": 0.2}))
+        actuator._process = SimpleNamespace(is_alive=lambda: True)
+        actuator._immediate_hold_requested = threading.Event()
+        actuator._immediate_release_requested = threading.Event()
+        actuator._hand_state_paused = False
+        actuator._last_hand_state_event = None
+
+        with self.assertLogs(
+            "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3",
+            level="WARNING",
+        ):
+            self.assertIs(actuator.assert_healthy(), True)
+        self.assertIs(actuator.assert_healthy(), False)
 
 
 if __name__ == "__main__":

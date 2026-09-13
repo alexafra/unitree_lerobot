@@ -83,6 +83,11 @@ LOGGER = logging.getLogger("eval_groot_g1")
 LOCAL_POLICY_HOSTS = {"127.0.0.1", "localhost"}
 OPERATOR_CONFIRMATION_TIMEOUT_S = 180.0
 ALT_ESCAPE_WINDOW_S = 0.1
+# A confirmation key belongs to the prompt that is visible after this quiet
+# boundary.  This prevents keyboard repeat or a rapid extra ``r`` from a
+# completed stage from authorizing the next distinct motion stage.
+CONFIRMATION_INPUT_QUIET_S = 0.1
+CONFIRMATION_PROMPT_REFRESH_S = 5.0
 GOAL_MODE_TOGGLE = "\t"
 RETURN_TO_START = "\x1b[Z"
 PREVIEW_WINDOWS = (
@@ -332,9 +337,13 @@ def _readline_before_authority(
         print()
         raise DeploymentError("Operator input requires an interactive POSIX terminal") from exc
 
-    print(prompt, end="", flush=True)
     entered = bytearray()
     try:
+        if confirmation_mode:
+            buffered_control = _wait_for_confirmation_input_boundary(fd)
+            if buffered_control is not None:
+                return buffered_control
+        print(prompt, end="", flush=True)
         while True:
             if external_pending is not None and external_pending():
                 print()
@@ -385,6 +394,64 @@ def _confirm_before_authority(prompt: str) -> str:
     """Return ``continue``/``stop`` from one r/s key; q raises release."""
 
     return _readline_before_authority(prompt, confirmation_mode=True)
+
+
+def _wait_for_confirmation_input_boundary(
+    fd: int,
+    actuator: SafeG1Dex3Actuator | None = None,
+) -> str | None:
+    """Quarantine queued input before exposing a new confirmation prompt.
+
+    An affirmative key is valid only after the terminal has been quiet and the
+    new named prompt is visible.  Buffered release/STOP keys remain fail-safe:
+    they are honored rather than flushed with the stale affirmative input.
+    """
+
+    quiet_deadline = time.monotonic() + CONFIRMATION_INPUT_QUIET_S
+    discarded_affirmative = 0
+    while True:
+        if actuator is not None:
+            actuator.heartbeat()
+            actuator.assert_healthy()
+        remaining = quiet_deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        try:
+            readable, _, _ = select.select([fd], [], [], min(0.05, remaining))
+        except (OSError, TypeError, ValueError) as exc:
+            raise DeploymentError("Could not establish a clean confirmation-input boundary") from exc
+        if not readable:
+            continue
+        value = os.read(fd, 1)
+        if value == b"":
+            raise DeploymentError("stdin closed while waiting for operator confirmation")
+        # Require a new quiet interval after every queued byte. Keyboard
+        # auto-repeat therefore cannot straddle two confirmation stages.
+        quiet_deadline = time.monotonic() + CONFIRMATION_INPUT_QUIET_S
+        if value in {b"q", b"Q", b"\x11"}:
+            if actuator is None:
+                raise OperatorRelease
+            actuator.request_immediate_release()
+            return "q"
+        if value in {b"s", b"S"}:
+            if actuator is not None:
+                try:
+                    actuator.request_immediate_hold()
+                except DeploymentError:
+                    # Before initialization the child is already publishing
+                    # its measured target, so STOP remains idempotent.
+                    pass
+            return "stop"
+        if value in {b"r", b"R"}:
+            discarded_affirmative += 1
+    if discarded_affirmative:
+        LOGGER.warning(
+            "Discarded %d buffered r key(s) at a confirmation-stage boundary; "
+            "press r only after the named prompt is visible",
+            discarded_affirmative,
+            extra={"terminal_yellow": True},
+        )
+    return None
 
 
 def _run_blocking_motion_with_immediate_release(
@@ -867,7 +934,8 @@ def confirm_actuation(
         print(f"Task {task_name!r}: {instruction}")
         required = "ACTUATE"
     response = _confirm_before_authority(
-        f"Press r to confirm {required} and create command publishers (no Enter); s/q cancels: "
+        f"[WAITING FOR {required}] Press r to create command publishers "
+        "(no Enter); s/q cancels: "
     )
     if response != "continue":
         raise OperatorRelease
@@ -898,9 +966,13 @@ def _readline_while_armed(
         )
     LOGGER.warning("stdin is not a TTY; armed input is line-buffered and immediate keys are unavailable")
     print(prompt, end="", flush=True)
+    next_prompt_refresh_at = time.monotonic() + CONFIRMATION_PROMPT_REFRESH_S
     while True:
         actuator.heartbeat()
-        actuator.assert_healthy()
+        status_output = actuator.assert_healthy() is True
+        if confirmation_mode and status_output:
+            print(f"\n{prompt}", end="", flush=True)
+            next_prompt_refresh_at = time.monotonic() + CONFIRMATION_PROMPT_REFRESH_S
         if external_pending is not None and external_pending():
             print()
             return VOICE_INPUT_AVAILABLE
@@ -915,6 +987,10 @@ def _readline_while_armed(
             print()
             raise DeploymentError("Armed input requires an interactive stdin terminal") from exc
         if not readable:
+            now = time.monotonic()
+            if confirmation_mode and now >= next_prompt_refresh_at:
+                print(f"\n{prompt}", end="", flush=True)
+                next_prompt_refresh_at = now + CONFIRMATION_PROMPT_REFRESH_S
             continue
         raw_response = sys.stdin.readline()
         if raw_response == "":
@@ -968,17 +1044,27 @@ def _readline_with_immediate_prompt_controls(
         print()
         raise DeploymentError("Armed input requires an interactive POSIX terminal") from exc
 
-    # Display the prompt only after ICANON is disabled. Otherwise a fast key
-    # pressed as the prompt appears can enter the old canonical input buffer
-    # and remain unavailable until Enter is pressed.
-    print(prompt, end="", flush=True)
     entered = bytearray()
     escape_prefix: bytes | None = None
     escape_prefix_at: float | None = None
     try:
+        if confirmation_mode:
+            buffered_control = _wait_for_confirmation_input_boundary(fd, actuator)
+            if buffered_control is not None:
+                return buffered_control
+        # Display the prompt only after ICANON is disabled and queued input has
+        # crossed the quiet boundary. A fast key cannot remain hidden in the
+        # old canonical buffer or silently authorize this new stage.
+        print(prompt, end="", flush=True)
+        next_prompt_refresh_at = time.monotonic() + CONFIRMATION_PROMPT_REFRESH_S
         while True:
             actuator.heartbeat()
-            actuator.assert_healthy()
+            status_output = actuator.assert_healthy() is True
+            if confirmation_mode and status_output:
+                # Auxiliary actuator status was just rendered on the shared
+                # terminal. Put the named gate back on the final line.
+                print(f"\n{prompt}", end="", flush=True)
+                next_prompt_refresh_at = time.monotonic() + CONFIRMATION_PROMPT_REFRESH_S
             if external_pending is not None and external_pending():
                 print()
                 return VOICE_INPUT_AVAILABLE
@@ -993,6 +1079,13 @@ def _readline_with_immediate_prompt_controls(
                 print()
                 raise DeploymentError("Could not poll the armed operator terminal") from exc
             if not readable:
+                now = time.monotonic()
+                if confirmation_mode and now >= next_prompt_refresh_at:
+                    # Child-process DDS warnings share this terminal and may
+                    # leave the no-newline prompt above them. Periodically
+                    # redraw the complete named stage while waiting.
+                    print(f"\n{prompt}", end="", flush=True)
+                    next_prompt_refresh_at = now + CONFIRMATION_PROMPT_REFRESH_S
                 continue
             value = os.read(fd, 1)
             if value == b"":
@@ -1099,7 +1192,7 @@ def _confirm_while_armed(
         try:
             response = _readline_while_armed(
                 actuator,
-                f"Press r to {required} (no Enter); s STOP; q release: ",
+                f"[WAITING FOR {required}] Press r (no Enter); s STOP; q release: ",
                 timeout_s=OPERATOR_CONFIRMATION_TIMEOUT_S,
                 confirmation_mode=True,
             )
@@ -1504,7 +1597,7 @@ def _confirm_goal_transition(
     try:
         response = _readline_while_armed(
             actuator,
-            f"Press r to {required} (no Enter); s STOP; q release: ",
+            f"[WAITING FOR {required}] Press r (no Enter); s STOP; q release: ",
             timeout_s=OPERATOR_CONFIRMATION_TIMEOUT_S,
             confirmation_mode=True,
         )
