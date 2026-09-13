@@ -1556,8 +1556,10 @@ def confirm_initialization(
     if spec.mode == "xr-home":
         if spec.end_effector != "dex3":
             warning += (
-                " XR-home targets all 14 arm joints to zero and all six channels of each Inspire "
-                "hand to normalized one (fully open); this can drop held objects, so both hands must be empty."
+                " Inspire XR-home leaves both shoulders and wrists at joint zero, targets both "
+                "elbows to -0.10 rad for a slightly raised carry pose, and targets all six "
+                "channels of each Inspire hand to normalized one (fully open); this can drop "
+                "held objects, so both hands must be empty."
             )
         else:
             warning += (

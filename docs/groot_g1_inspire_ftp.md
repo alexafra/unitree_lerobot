@@ -119,9 +119,10 @@ refresh a right-hand target. A successful DDS Write means only that the local
 middleware call returned `True`; it is not an acknowledgement from the bridge
 or physical hand.
 
-`xr-home` preserves the original explicit Inspire startup convention: arm
-targets are all zero and both hands are all one (fully open). The move follows a
-bounded interpolation, but it can drop an object. Both hands must be empty.
+`xr-home` uses an Inspire-specific staging pose: shoulders and wrists remain at
+joint zero, both elbows target `-0.10 rad` to raise the lower Inspire hands
+slightly, and both hands are all one (fully open). The move follows a bounded
+interpolation, but it can drop an object. Both hands must be empty.
 Return-to-Start is allowed for Inspire only when this fixed `xr-home` target was
 selected. Warmup1 remains disabled because the Dex3 training-frame pose is not
 an FTP pose.

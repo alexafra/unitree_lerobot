@@ -93,12 +93,13 @@ laboratory choices, not manufacturer-qualified limits or safety certification.
    `g1_body29_hand14.urdf` used by Inspire teleop. The unchanged hand command is
    refreshed throughout ramp and settle so DFX's roughly one-second lease does
    not expire.
-6. The command above explicitly selects XR-home, preserving the original Inspire
-   teleop startup pose: all 14 arm targets are zero and all six normalized
-   channels of each hand are one (fully open). The guarded client interpolates
-   to it instead of issuing a discontinuous startup command. It can drop an
-   object, so both hands must be empty. `--initialization measured` remains the
-   default no-home-motion alternative.
+6. The command above explicitly selects the Inspire XR-home staging pose:
+   shoulders and wrists remain at joint zero, both elbows target `-0.10 rad` to
+   raise the hands slightly, and all six normalized channels of each hand are
+   one (fully open). The guarded client interpolates to it instead of issuing a
+   discontinuous startup command. It can drop an object, so both hands must be
+   empty. `--initialization measured` remains the default no-home-motion
+   alternative.
 7. Warmup1 is disabled because there is no reviewed 26D training-frame home. At
    INITIALIZE, RUN, and WARMUP2, `r` advances after inspection. Because no
    qualified Inspire hand tracking-error threshold exists, endpoint completion

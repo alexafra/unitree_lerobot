@@ -23,6 +23,7 @@ from unitree_lerobot.eval_robot.groot_contract import (
     COLOUR_VIDEO_KEYS,
     EXPECTED_ACTION_OUTPUT_CONTRACT,
     EXPECTED_EGO_VIEW_SHAPE,
+    INSPIRE_XR_HOME_ARM,
     InitializationSpec,
     TASKS,
     load_initialization_spec,
@@ -275,7 +276,8 @@ def _xr_home_is_profile_aware_and_inspire_opens_both_hands_with_a_bounded_path()
     )
     assert inspire.end_effector == "inspire-dfx"
     assert "fully open" in inspire.label
-    np.testing.assert_array_equal(inspire.arm, np.zeros(14))
+    np.testing.assert_array_equal(inspire.arm, INSPIRE_XR_HOME_ARM)
+    assert inspire.arm is not INSPIRE_XR_HOME_ARM
     np.testing.assert_array_equal(inspire.left_hand, np.ones(6))
     np.testing.assert_array_equal(inspire.right_hand, np.ones(6))
     assert inspire.left_hand is not INSPIRE_DFX_PROFILE.home
@@ -291,7 +293,7 @@ def _xr_home_is_profile_aware_and_inspire_opens_both_hands_with_a_bounded_path()
     )
     path = build_initialization_chunk(state, inspire)
     assert path.end_effector == "inspire-dfx"
-    np.testing.assert_array_equal(path.arm[-1], np.zeros(14))
+    np.testing.assert_array_equal(path.arm[-1], INSPIRE_XR_HOME_ARM)
     np.testing.assert_array_equal(path.left_hand[-1], np.ones(6))
     np.testing.assert_array_equal(path.right_hand[-1], np.ones(6))
     left_steps = np.diff(np.vstack((state.left_hand, path.left_hand)), axis=0)
@@ -302,13 +304,24 @@ def _xr_home_is_profile_aware_and_inspire_opens_both_hands_with_a_bounded_path()
     wrong_home = InitializationSpec(
         mode="xr-home",
         label="wrong Inspire home",
-        arm=np.zeros(14),
+        arm=np.array(INSPIRE_XR_HOME_ARM, copy=True),
         left_hand=np.zeros(6),
         right_hand=np.zeros(6),
         end_effector="inspire-dfx",
     )
     with _CASE.assertRaisesRegex(DeploymentError, r"fully open \(normalized one\)"):
         validate_initialization_spec(wrong_home)
+
+    wrong_arm = InitializationSpec(
+        mode="xr-home",
+        label="old all-zero Inspire arm home",
+        arm=np.zeros(14),
+        left_hand=np.ones(6),
+        right_hand=np.ones(6),
+        end_effector="inspire-dfx",
+    )
+    with _CASE.assertRaisesRegex(DeploymentError, "symmetric elbow-lift pose"):
+        validate_initialization_spec(wrong_arm)
 
 
 def _inspire_metadata_requires_native_26d_shapes_and_layouts() -> None:

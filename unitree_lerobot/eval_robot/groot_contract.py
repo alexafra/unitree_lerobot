@@ -113,6 +113,16 @@ CONTROL_HZ = 30.0
 INITIALIZATION_MODES = ("measured", "xr-home", "pose-file")
 INITIAL_POSE_SCHEMA_VERSION = 1
 
+# Inspire hands hang slightly lower than Dex3 at the historical all-zero XR
+# staging pose.  A small, symmetric negative elbow offset raises each palm by
+# about 23 mm in the checked-in G1 URDF while leaving shoulders and wrists at
+# the established XR zero target.  Arm ordering is left 7 then right 7, so the
+# elbow entries are 3 and 10.
+INSPIRE_XR_HOME_ELBOW_RAD = -0.10
+INSPIRE_XR_HOME_ARM = np.zeros(ARM_DOF, dtype=np.float64)
+INSPIRE_XR_HOME_ARM[[3, 10]] = INSPIRE_XR_HOME_ELBOW_RAD
+INSPIRE_XR_HOME_ARM.flags.writeable = False
+
 # These are deliberately fixed deployment ceilings, not tuning flags.  They need
 # hardware qualification before being relaxed.
 # CHANGEDSAFETY: original local adapter default was 0.05 rad; current is 0.10 rad.
@@ -797,7 +807,7 @@ def validate_initialization_spec(
             if profile.home is None:
                 raise DeploymentError(f"{profile.name} has no configured XR-home hand target")
             expected = (
-                ("arm", spec.arm, np.zeros(ARM_DOF, dtype=np.float64)),
+                ("arm", spec.arm, INSPIRE_XR_HOME_ARM),
                 ("left hand", spec.left_hand, profile.home),
                 ("right hand", spec.right_hand, profile.home),
             )
@@ -810,7 +820,11 @@ def validate_initialization_spec(
                     or not np.all(np.isfinite(values))
                     or not np.array_equal(values, required)
                 ):
-                    semantics = "joint zero" if name == "arm" else "fully open (normalized one)"
+                    semantics = (
+                        "the configured symmetric elbow-lift pose"
+                        if name == "arm"
+                        else "fully open (normalized one)"
+                    )
                     raise DeploymentError(
                         f"{profile.name} XR-home {name} target must be exactly {semantics}"
                     )
@@ -968,9 +982,10 @@ def load_initialization_spec(
 ) -> InitializationSpec:
     """Load one explicit initialization choice without consulting robot state.
 
-    ``xr-home`` faithfully reproduces the profile's XR startup targets: fourteen
-    arm zeros and either seven zeros per Dex3 hand or six normalized ones (fully
-    open) per Inspire hand. ``pose-file`` is deliberately task-bound and is
+    ``xr-home`` uses the historical joint-zero arm target for Dex3 and the
+    fixed, slightly raised elbow staging target for Inspire. Hands use either
+    seven zeros per Dex3 hand or six normalized ones (fully open) per Inspire
+    hand. ``pose-file`` is deliberately task-bound and is
     available only for the qualified Dex3 contract; its hand policy is either
     explicit for both hands or preserves both measured hand poses.
     """
@@ -1004,9 +1019,16 @@ def load_initialization_spec(
             label=(
                 "XR joint-zero home (arms and both Dex3 hands)"
                 if profile.name == "dex3"
-                else f"XR home (zero arms; both {profile.name} hands fully open)"
+                else (
+                    "Inspire XR home (shoulders/wrists zero; both elbows "
+                    f"{INSPIRE_XR_HOME_ELBOW_RAD:+.2f} rad; both {profile.name} hands fully open)"
+                )
             ),
-            arm=np.zeros(ARM_DOF, dtype=np.float64),
+            arm=(
+                np.zeros(ARM_DOF, dtype=np.float64)
+                if profile.name == "dex3"
+                else np.array(INSPIRE_XR_HOME_ARM, dtype=np.float64, copy=True)
+            ),
             left_hand=np.array(profile.home, dtype=np.float64, copy=True),
             right_hand=np.array(profile.home, dtype=np.float64, copy=True),
             end_effector=profile.name,

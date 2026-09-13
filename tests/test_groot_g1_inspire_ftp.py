@@ -32,6 +32,8 @@ from unitree_lerobot.eval_robot.groot_contract import (
     COLOUR_VIDEO_KEYS,
     EXPECTED_ACTION_OUTPUT_CONTRACT,
     EXPECTED_EGO_VIEW_SHAPE,
+    INSPIRE_XR_HOME_ARM,
+    INSPIRE_XR_HOME_ELBOW_RAD,
     load_initialization_spec,
     validate_policy_metadata,
 )
@@ -350,7 +352,13 @@ def test_ftp_xr_home_and_return_to_start_are_profile_aware():
         end_effector="inspire-ftp",
     )
     assert spec.end_effector == "inspire-ftp"
-    np.testing.assert_array_equal(spec.arm, np.zeros(14))
+    expected_arm = np.zeros(14)
+    expected_arm[[3, 10]] = -0.10
+    np.testing.assert_array_equal(spec.arm, expected_arm)
+    np.testing.assert_array_equal(spec.arm, INSPIRE_XR_HOME_ARM)
+    assert spec.arm is not INSPIRE_XR_HOME_ARM
+    assert INSPIRE_XR_HOME_ELBOW_RAD == -0.10
+    assert "both elbows -0.10 rad" in spec.label
     np.testing.assert_array_equal(spec.left_hand, np.ones(6))
     np.testing.assert_array_equal(spec.right_hand, np.ones(6))
 
