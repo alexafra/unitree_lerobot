@@ -29,6 +29,7 @@ import json
 import dataclasses
 import shutil
 import tempfile
+import time
 import numpy as np
 from pathlib import Path
 from PIL import Image
@@ -331,10 +332,13 @@ class JsonDataset:
 
             depth_path = os.path.join(episode_path, relative_path)
 
-            depth_u16 = cv2.imread(
-                depth_path,
-                cv2.IMREAD_UNCHANGED,
-            )
+            depth_u16 = None
+            for attempt in range(3):
+                depth_u16 = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+                if depth_u16 is not None:
+                    break
+                if attempt < 2:
+                    time.sleep(0.05)
 
             if depth_u16 is None:
                 raise RuntimeError(f"Failed to read depth image: {depth_path}")

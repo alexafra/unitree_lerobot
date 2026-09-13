@@ -40,6 +40,7 @@ def _load_converter_with_lerobot_stubs():
     video_utils = types.ModuleType("lerobot.datasets.video_utils")
     video_utils.encode_video_frames = mock.Mock()
     cv2 = types.ModuleType("cv2")
+    cv2.IMREAD_UNCHANGED = -1
     tyro = types.ModuleType("tyro")
 
     stubs = {
@@ -198,6 +199,73 @@ class SurfaceNormalConverterVideoTest(unittest.TestCase):
         self.assertEqual(contract["encoding"], "camera_xyz_uint8")
         write_info.assert_called_once_with(dataset.meta.info, dataset.meta.root)
         dataset.finalize.assert_called_once_with()
+
+    def test_depth_read_retries_transient_failure_without_real_sleep(self):
+        dataset = object.__new__(self.converter.JsonDataset)
+        dataset.camera_to_image_key = {
+            self.converter.DEPTH_COLOR_SOURCE_KEY: "observation.images.ego_view"
+        }
+        dataset.depth_near_m = 0.25
+        dataset.depth_far_m = 1.0
+        expected_depth = np.array([[250, 500], [750, 1_000]], dtype=np.uint16)
+        episode_data = {
+            "info": {"depth": {"scale_m_per_unit": 0.001}},
+            "data": [{"idx": 0, "depths": {self.converter.DEPTH_SOURCE_KEY: "depth.png"}}],
+        }
+
+        with (
+            mock.patch.object(
+                self.converter.cv2,
+                "imread",
+                side_effect=[None, None, expected_depth],
+                create=True,
+            ) as imread,
+            mock.patch.object(self.converter.time, "sleep") as sleep,
+        ):
+            images = dataset._parse_depth_derived_images(
+                "/raw/episode_0000",
+                episode_data,
+                include_depth=True,
+                include_surface_normals=False,
+            )
+
+        self.assertEqual(imread.call_count, 3)
+        imread.assert_called_with("/raw/episode_0000/depth.png", -1)
+        self.assertEqual(sleep.call_args_list, [mock.call(0.05), mock.call(0.05)])
+        self.assertEqual(len(images[self.converter.DEPTH_OUTPUT_KEY]), 1)
+
+    def test_depth_read_raises_after_three_failures_without_real_sleep(self):
+        dataset = object.__new__(self.converter.JsonDataset)
+        dataset.camera_to_image_key = {
+            self.converter.DEPTH_COLOR_SOURCE_KEY: "observation.images.ego_view"
+        }
+        episode_data = {
+            "info": {"depth": {"scale_m_per_unit": 0.001}},
+            "data": [{"idx": 7, "depths": {self.converter.DEPTH_SOURCE_KEY: "depth.png"}}],
+        }
+
+        with (
+            mock.patch.object(
+                self.converter.cv2,
+                "imread",
+                return_value=None,
+                create=True,
+            ) as imread,
+            mock.patch.object(self.converter.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"Failed to read depth image: /raw/episode_0000/depth\.png",
+            ),
+        ):
+            dataset._parse_depth_derived_images(
+                "/raw/episode_0000",
+                episode_data,
+                include_depth=True,
+                include_surface_normals=False,
+            )
+
+        self.assertEqual(imread.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(0.05), mock.call(0.05)])
 
 
 if __name__ == "__main__":
