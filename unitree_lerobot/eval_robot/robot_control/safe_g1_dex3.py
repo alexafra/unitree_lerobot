@@ -71,6 +71,11 @@ LOGGER = logging.getLogger(__name__)
 
 STATE_MAX_AGE_S = 0.25
 ACTUATOR_ARM_STATE_MAX_AGE_S = 0.100
+# TEMPORARY / UNQUALIFIED / SIMULATION ONLY: Isaac's otherwise healthy
+# 100 Hz stream has shown one 107 ms host-scheduling gap while the actuator
+# process is being armed.  Permit that bounded simulator-only transient while
+# still failing closed after 250 ms.  Never reuse this deadline for hardware.
+TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S = 0.250
 ACTUATOR_HAND_STATE_PAUSE_AGE_S = 0.100
 ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S = 1.250
 ACTUATOR_HAND_STATE_MAX_AGE_S = 3.0
@@ -189,6 +194,23 @@ TELEIMAGER_CONFIG_TIMEOUT_S = 1.0
 RGBD_MAX_RECEIVE_AGE_S = 0.15
 ACTIVE_TIMING_RING_CAPACITY = 3_000
 ACTIVE_TIMING_SLOW_LATENESS_MS = (20.0, 50.0, 100.0)
+
+
+def _arm_state_freshness_limit(
+    simulation: bool,
+    *,
+    prearm: bool,
+) -> tuple[float, str]:
+    """Return the explicit arm-state deadline without relaxing hardware."""
+
+    if simulation:
+        return (
+            TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S,
+            "TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S",
+        )
+    if prearm:
+        return PREARM_STATE_MAX_AGE_S, "PREARM_STATE_MAX_AGE_S"
+    return ACTUATOR_ARM_STATE_MAX_AGE_S, "ACTUATOR_ARM_STATE_MAX_AGE_S"
 
 
 class RtcTerminalEvent(DeploymentError):
@@ -2034,6 +2056,17 @@ class _G1Dex3CommandBackend:
             )
         initialize_dds(simulation, network_interface)
         self.simulation = simulation
+        arm_max_age_s, arm_max_age_constant = _arm_state_freshness_limit(
+            simulation,
+            prearm=False,
+        )
+        if simulation:
+            LOGGER.warning(
+                "TEMPORARY UNQUALIFIED SIMULATION arm-state freshness deadline is %.3fs; "
+                "physical-robot ACTUATOR_ARM_STATE_MAX_AGE_S remains %.3fs",
+                arm_max_age_s,
+                ACTUATOR_ARM_STATE_MAX_AGE_S,
+            )
         self.reader: Any | None = None
         self._arm_publisher: Any | None = None
         self._left_publisher: Any | None = None
@@ -2042,9 +2075,9 @@ class _G1Dex3CommandBackend:
         try:
             reader_kwargs = {
                 "simulation": simulation,
-                "max_age_s": ACTUATOR_ARM_STATE_MAX_AGE_S,
+                "max_age_s": arm_max_age_s,
                 "hand_max_age_s": ACTUATOR_HAND_STATE_MAX_AGE_S,
-                "max_age_constant": "ACTUATOR_ARM_STATE_MAX_AGE_S",
+                "max_age_constant": arm_max_age_constant,
                 "hand_max_age_constant": "ACTUATOR_HAND_STATE_MAX_AGE_S",
             }
             if self.profile.name == "dex3":
@@ -3139,8 +3172,16 @@ def _wait_for_initialization_start(
                 stop_event.wait(max(0.0, period - elapsed))
                 continue
         arm_received_at = latest.captured_at if latest.arm_received_at is None else latest.arm_received_at
-        if now - arm_received_at > PREARM_STATE_MAX_AGE_S:
-            raise DeploymentError("Arm state is not fresh enough to start initialization")
+        arm_max_age_s, arm_max_age_constant = _arm_state_freshness_limit(
+            backend.simulation,
+            prearm=True,
+        )
+        arm_age_s = now - arm_received_at
+        if arm_age_s > arm_max_age_s:
+            raise DeploymentError(
+                f"Arm state age {arm_age_s:.3f}s is not fresh enough to start initialization; "
+                f"{arm_max_age_constant}={arm_max_age_s:.3f}s"
+            )
         _enforce_tracking(
             backend,
             latest,

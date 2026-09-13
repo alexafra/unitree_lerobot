@@ -10,6 +10,7 @@ from unittest import mock
 import numpy as np
 
 from unitree_lerobot.eval_robot import eval_groot_g1
+from unitree_lerobot.eval_robot.groot_client import DeploymentError
 from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     ACTUATOR_ARM_STATE_MAX_AGE_S,
     ACTUATOR_HAND_RECOVERY_SAMPLES,
@@ -18,10 +19,14 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     ACTUATOR_HAND_STATE_PAUSE_AGE_S,
     G1Dex3StateReader,
     HandStateFreshnessGate,
+    PREARM_STATE_MAX_AGE_S,
     RobotState,
     SafeG1Dex3Actuator,
+    TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S,
     _G1Dex3CommandBackend,
     _actuator_main,
+    _arm_state_freshness_limit,
+    _wait_for_initialization_start,
 )
 from unitree_lerobot.eval_robot.groot_contract import ActionChunk, InitializationSpec
 
@@ -236,6 +241,147 @@ class SplitReaderDeadlineTests(unittest.TestCase):
             ),
         ):
             reader.latest()
+
+
+class SimulationArmFreshnessDeadlineTests(unittest.TestCase):
+    def test_deadline_selection_is_sim_only(self):
+        self.assertEqual(
+            _arm_state_freshness_limit(True, prearm=False),
+            (
+                TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S,
+                "TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S",
+            ),
+        )
+        self.assertEqual(
+            _arm_state_freshness_limit(True, prearm=True),
+            (
+                TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S,
+                "TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S",
+            ),
+        )
+        self.assertEqual(
+            _arm_state_freshness_limit(False, prearm=False),
+            (ACTUATOR_ARM_STATE_MAX_AGE_S, "ACTUATOR_ARM_STATE_MAX_AGE_S"),
+        )
+        self.assertEqual(
+            _arm_state_freshness_limit(False, prearm=True),
+            (PREARM_STATE_MAX_AGE_S, "PREARM_STATE_MAX_AGE_S"),
+        )
+        self.assertEqual(TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S, 0.250)
+        self.assertEqual(ACTUATOR_ARM_STATE_MAX_AGE_S, 0.100)
+        self.assertEqual(PREARM_STATE_MAX_AGE_S, 0.050)
+
+    def test_backend_passes_temporary_deadline_only_to_sim_reader(self):
+        captured: list[dict[str, object]] = []
+
+        class Reader:
+            def __init__(self, **kwargs):
+                captured.append(kwargs)
+
+            @staticmethod
+            def read(timeout_s):
+                self.assertEqual(timeout_s, 5.0)
+                now = time.monotonic()
+                return RobotState(
+                    captured_at=now,
+                    mode_machine=6,
+                    arm=np.zeros(14),
+                    arm_dq=np.zeros(14),
+                    left_hand=np.zeros(7),
+                    right_hand=np.zeros(7),
+                )
+
+            @staticmethod
+            def close():
+                pass
+
+        module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+        for simulation, expected_age, expected_name in (
+            (
+                True,
+                TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S,
+                "TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S",
+            ),
+            (False, ACTUATOR_ARM_STATE_MAX_AGE_S, "ACTUATOR_ARM_STATE_MAX_AGE_S"),
+        ):
+            with (
+                self.subTest(simulation=simulation),
+                mock.patch(f"{module}.initialize_dds"),
+                mock.patch(f"{module}.G1Dex3StateReader", Reader),
+                mock.patch.object(_G1Dex3CommandBackend, "_initialize_command_resources"),
+            ):
+                backend = _G1Dex3CommandBackend(
+                    simulation,
+                    None if simulation else "eth-test",
+                    gravity_feedforward=False,
+                )
+                self.assertEqual(captured[-1]["max_age_s"], expected_age)
+                self.assertEqual(captured[-1]["max_age_constant"], expected_name)
+                self.assertEqual(
+                    captured[-1]["hand_max_age_s"],
+                    ACTUATOR_HAND_STATE_MAX_AGE_S,
+                )
+                backend._close_constructed_resources(suppress_errors=False)
+
+    @staticmethod
+    def _backend(*, simulation: bool, age_s: float, now: float):
+        class Backend:
+            def __init__(self):
+                self.simulation = simulation
+                self._arm_target = np.zeros(14)
+                self._left_target = np.zeros(7)
+                self._right_target = np.zeros(7)
+
+            def state(self):
+                received_at = now - age_s
+                return RobotState(
+                    captured_at=received_at,
+                    mode_machine=0,
+                    arm=self._arm_target.copy(),
+                    arm_dq=np.zeros(14),
+                    left_hand=self._left_target.copy(),
+                    right_hand=self._right_target.copy(),
+                    arm_received_at=received_at,
+                )
+
+            @staticmethod
+            def publish():
+                pass
+
+        return Backend()
+
+    def test_initialization_gate_allows_sim_transient_but_not_hardware(self):
+        now = 100.0
+        module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+        heartbeat = SimpleNamespace(value=now, get_lock=lambda: threading.Lock())
+        with (
+            mock.patch(f"{module}.time.monotonic", return_value=now),
+            mock.patch(f"{module}.INITIALIZATION_START_DWELL_S", 0.0),
+            mock.patch(f"{module}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 1),
+        ):
+            state = _wait_for_initialization_start(
+                self._backend(simulation=True, age_s=0.150, now=now),
+                threading.Event(),
+                heartbeat,
+            )
+            self.assertIsNotNone(state)
+
+            with self.assertRaisesRegex(DeploymentError, "PREARM_STATE_MAX_AGE_S=0.050s"):
+                _wait_for_initialization_start(
+                    self._backend(simulation=False, age_s=0.051, now=now),
+                    threading.Event(),
+                    heartbeat,
+                )
+
+            with self.assertRaisesRegex(
+                DeploymentError,
+                "TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S=0.250s",
+            ):
+                _wait_for_initialization_start(
+                    self._backend(simulation=True, age_s=0.251, now=now),
+                    threading.Event(),
+                    heartbeat,
+                )
 
 
 class InFlightInferenceFenceTests(unittest.TestCase):
