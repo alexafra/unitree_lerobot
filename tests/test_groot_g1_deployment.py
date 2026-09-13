@@ -3637,7 +3637,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertTrue(FakeRequester.instance.closed)
         self.assertTrue(manager.closed)
 
-    def test_geometry_camera_encodes_legacy_aligned_depth_and_requires_new_frames(self):
+    def test_geometry_camera_encodes_legacy_aligned_depth_and_reuses_fresh_frames(self):
         bgr = np.zeros((480, 640, 3), dtype=np.uint8)
         depth = np.full((480, 640), 625, dtype=np.uint16)
         color_ok, color_jpeg = cv2.imencode(".jpg", bgr)
@@ -3688,8 +3688,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
             far_m=1.0,
         )
         np.testing.assert_array_equal(images.depth_gray, expected)
-        with self.assertRaisesRegex(TimeoutError, "not new"):
-            camera.read(timeout_s=0.015)
+        repeated = camera.read(timeout_s=0.015)
+        np.testing.assert_array_equal(repeated.rgb, images.rgb)
+        np.testing.assert_array_equal(repeated.depth_gray, images.depth_gray)
 
     def test_geometry_camera_encodes_legacy_aligned_depth_as_surface_normals(self):
         bgr = np.zeros((480, 640, 3), dtype=np.uint8)

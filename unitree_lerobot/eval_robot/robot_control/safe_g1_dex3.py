@@ -1915,6 +1915,11 @@ class TeleimagerCamera:
         self._last_depth_received_ns: int | None = None
         self._last_rgbd_sequence: int | None = None
         self._last_rgbd_server_capture_ns: int | None = None
+        self._last_rgbd_received_ns: int | None = None
+        self._cached_legacy_rgb: np.ndarray | None = None
+        self._cached_legacy_depth_gray: np.ndarray | None = None
+        self._cached_legacy_surface_normals: np.ndarray | None = None
+        self._cached_atomic_images: CameraImages | None = None
         self._geometry_transport = "legacy"
         self._atomic_ever_succeeded = False
         self._geometry_selection_logged = False
@@ -2071,6 +2076,19 @@ class TeleimagerCamera:
         except ValueError as exc:
             raise DeploymentError(f"Could not encode aligned depth geometry: {exc}") from exc
 
+    @staticmethod
+    def _copy_camera_images(images: CameraImages) -> CameraImages:
+        """Return a detached observation without exposing cached mutable arrays."""
+
+        return CameraImages(
+            rgb=images.rgb.copy(),
+            depth_gray=None if images.depth_gray is None else images.depth_gray.copy(),
+            surface_normals=(
+                None if images.surface_normals is None else images.surface_normals.copy()
+            ),
+            sequence=images.sequence,
+        )
+
     def _read_atomic_geometry(self, timeout_s: float) -> CameraImages:
         deadline = time.monotonic() + timeout_s
         last_error: Exception | None = None
@@ -2078,51 +2096,76 @@ class TeleimagerCamera:
             try:
                 self._assert_atomic_subscriber_alive()
                 frame = self._client.get_head_rgbd_frame()
-                if frame is None:
-                    raise TimeoutError("TeleImager atomic RGBD transport has no fresh packet")
                 try:
                     measured_fps = float(self._client.get_head_rgbd_fps())
                 except (TypeError, ValueError) as exc:
                     raise TimeoutError("TeleImager atomic RGBD stream FPS is not numeric") from exc
-                if not np.isfinite(measured_fps) or measured_fps <= 0.0:
+                cached_images = getattr(self, "_cached_atomic_images", None)
+                if not np.isfinite(measured_fps):
+                    raise TimeoutError("TeleImager atomic RGBD stream FPS is not finite")
+                if measured_fps <= 0.0 and cached_images is None:
                     raise TimeoutError(
                         "TeleImager atomic RGBD stream has not established a live rolling FPS"
                     )
-                if frame.received_monotonic_ns is None:
-                    raise DeploymentError("TeleImager atomic RGBD packet has no local receive timestamp")
-                age_s = (
-                    time.monotonic_ns() - int(frame.received_monotonic_ns)
-                ) / 1_000_000_000.0
+
+                if frame is not None:
+                    if frame.received_monotonic_ns is None:
+                        raise DeploymentError(
+                            "TeleImager atomic RGBD packet has no local receive timestamp"
+                        )
+                    received_ns = int(frame.received_monotonic_ns)
+                    previous_sequence = getattr(self, "_last_rgbd_sequence", None)
+                    previous_received_ns = getattr(self, "_last_rgbd_received_ns", None)
+                    if previous_sequence is not None and frame.sequence < previous_sequence:
+                        raise DeploymentError(
+                            "TeleImager atomic RGBD sequence regressed from "
+                            f"{previous_sequence} to {frame.sequence}"
+                        )
+                    if previous_received_ns is not None and received_ns < previous_received_ns:
+                        raise DeploymentError(
+                            "TeleImager atomic RGBD receive timestamp regressed; "
+                            "restart the policy runner"
+                        )
+                    previous_capture_ns = getattr(self, "_last_rgbd_server_capture_ns", None)
+                    if frame.sequence == previous_sequence:
+                        if frame.server_capture_monotonic_ns != previous_capture_ns:
+                            raise DeploymentError(
+                                "TeleImager atomic RGBD reused a sequence with different "
+                                "capture metadata"
+                            )
+                        # Do not refresh the cached age when an identical packet is reread.
+                    else:
+                        if (
+                            previous_capture_ns is not None
+                            and frame.server_capture_monotonic_ns <= previous_capture_ns
+                        ):
+                            raise DeploymentError(
+                                "TeleImager atomic RGBD server capture timestamp regressed"
+                            )
+                        rgb = _decode_color_jpeg_rgb(frame.color_jpeg, self.config)
+                        depth_u16 = _decode_depth_png_u16(frame.aligned_depth_png)
+                        depth_gray, surface_normals = self._encode_geometry(depth_u16)
+                        cached_images = CameraImages(
+                            rgb=rgb,
+                            depth_gray=depth_gray,
+                            surface_normals=surface_normals,
+                            sequence=frame.sequence,
+                        )
+                        self._cached_atomic_images = cached_images
+                        self._last_rgbd_sequence = frame.sequence
+                        self._last_rgbd_server_capture_ns = frame.server_capture_monotonic_ns
+                        self._last_rgbd_received_ns = received_ns
+
+                cached_images = getattr(self, "_cached_atomic_images", None)
+                cached_received_ns = getattr(self, "_last_rgbd_received_ns", None)
+                if cached_images is None or cached_received_ns is None:
+                    raise TimeoutError("TeleImager atomic RGBD transport has no complete packet")
+                age_s = (time.monotonic_ns() - cached_received_ns) / 1_000_000_000.0
                 if age_s < 0.0 or age_s > RGBD_MAX_RECEIVE_AGE_S:
                     raise TimeoutError(
                         f"TeleImager atomic RGBD packet is stale ({age_s:.3f}s old); "
                         f"RGBD_MAX_RECEIVE_AGE_S={RGBD_MAX_RECEIVE_AGE_S:.3f}s"
                     )
-                previous_sequence = getattr(self, "_last_rgbd_sequence", None)
-                if previous_sequence is not None:
-                    if frame.sequence < previous_sequence:
-                        raise DeploymentError(
-                            "TeleImager atomic RGBD sequence regressed from "
-                            f"{previous_sequence} to {frame.sequence}"
-                        )
-                    if frame.sequence == previous_sequence:
-                        raise TimeoutError(
-                            f"TeleImager atomic RGBD sequence {frame.sequence} is not new"
-                        )
-                previous_capture_ns = getattr(self, "_last_rgbd_server_capture_ns", None)
-                if (
-                    previous_capture_ns is not None
-                    and frame.server_capture_monotonic_ns <= previous_capture_ns
-                ):
-                    raise DeploymentError(
-                        "TeleImager atomic RGBD server capture timestamp did not advance"
-                    )
-
-                rgb = _decode_color_jpeg_rgb(frame.color_jpeg, self.config)
-                depth_u16 = _decode_depth_png_u16(frame.aligned_depth_png)
-                depth_gray, surface_normals = self._encode_geometry(depth_u16)
-                self._last_rgbd_sequence = frame.sequence
-                self._last_rgbd_server_capture_ns = frame.server_capture_monotonic_ns
                 self._atomic_ever_succeeded = True
                 self._reported_stream_fps = True
                 if not getattr(self, "_geometry_selection_logged", False):
@@ -2132,12 +2175,7 @@ class TeleimagerCamera:
                         measured_fps,
                     )
                     self._geometry_selection_logged = True
-                return CameraImages(
-                    rgb=rgb,
-                    depth_gray=depth_gray,
-                    surface_normals=surface_normals,
-                    sequence=frame.sequence,
-                )
+                return self._copy_camera_images(cached_images)
             except TimeoutError as exc:
                 last_error = exc
                 time.sleep(0.005)
@@ -2155,50 +2193,82 @@ class TeleimagerCamera:
                 depth_frame = self._client.get_head_depth_frame()
                 frames = (("RGB", color_frame), ("aligned-depth", depth_frame))
                 measured_fps: dict[str, float] = {}
-                received_ns: dict[str, int] = {}
                 now_ns = time.monotonic_ns()
                 for name, frame in frames:
                     try:
                         measured_fps[name] = float(getattr(frame, "fps", 0.0))
                     except (TypeError, ValueError) as exc:
                         raise TimeoutError(f"TeleImager {name} stream FPS is not numeric") from exc
-                    if not np.isfinite(measured_fps[name]) or measured_fps[name] <= 0.0:
+                    if not np.isfinite(measured_fps[name]):
+                        raise TimeoutError(f"TeleImager {name} stream FPS is not finite")
+                    has_cached_component = (
+                        getattr(self, "_cached_legacy_rgb", None) is not None
+                        if name == "RGB"
+                        else self._last_depth_received_ns is not None
+                    )
+                    if measured_fps[name] <= 0.0 and not has_cached_component:
                         raise TimeoutError(
                             f"TeleImager {name} stream has not established a live rolling FPS"
                         )
                     timestamp = getattr(frame, "received_monotonic_ns", None)
                     if timestamp is None:
+                        payload = getattr(frame, "jpg", None)
+                        if payload:
+                            raise DeploymentError(
+                                f"TeleImager {name} frame has no local receive timestamp"
+                            )
+                        continue
+                    received_ns = int(timestamp)
+                    previous_received_ns = (
+                        self._last_color_received_ns
+                        if name == "RGB"
+                        else self._last_depth_received_ns
+                    )
+                    if previous_received_ns is not None and received_ns < previous_received_ns:
                         raise DeploymentError(
-                            f"TeleImager {name} frame has no local receive timestamp"
+                            f"TeleImager {name} receive timestamp regressed; restart the policy runner"
                         )
-                    received_ns[name] = int(timestamp)
-                    age_s = (now_ns - received_ns[name]) / 1_000_000_000.0
+                    if previous_received_ns == received_ns:
+                        continue
+                    if name == "RGB":
+                        self._cached_legacy_rgb = decode_color_0_rgb(frame, self.config)
+                        self._last_color_received_ns = received_ns
+                    else:
+                        depth_bytes = getattr(frame, "jpg", None)
+                        if not depth_bytes:
+                            raise TimeoutError("TeleImager aligned-depth stream has no PNG")
+                        depth_u16 = _decode_depth_png_u16(depth_bytes)
+                        depth_gray, surface_normals = self._encode_geometry(depth_u16)
+                        self._cached_legacy_depth_gray = depth_gray
+                        self._cached_legacy_surface_normals = surface_normals
+                        self._last_depth_received_ns = received_ns
+
+                cached_rgb = getattr(self, "_cached_legacy_rgb", None)
+                color_received_ns = getattr(self, "_last_color_received_ns", None)
+                depth_received_ns = getattr(self, "_last_depth_received_ns", None)
+                if cached_rgb is None or color_received_ns is None:
+                    raise TimeoutError("TeleImager RGB cache has no valid frame")
+                if depth_received_ns is None:
+                    raise TimeoutError("TeleImager aligned-depth cache has no valid frame")
+                for name, received_ns in (
+                    ("RGB", color_received_ns),
+                    ("aligned-depth", depth_received_ns),
+                ):
+                    age_s = (now_ns - received_ns) / 1_000_000_000.0
                     if age_s < 0.0 or age_s > RGBD_MAX_RECEIVE_AGE_S:
                         raise TimeoutError(
                             f"TeleImager {name} frame is stale ({age_s:.3f}s old); "
                             f"RGBD_MAX_RECEIVE_AGE_S={RGBD_MAX_RECEIVE_AGE_S:.3f}s"
                         )
-
-                previous = {
-                    "RGB": self._last_color_received_ns,
-                    "aligned-depth": self._last_depth_received_ns,
-                }
-                for name in ("RGB", "aligned-depth"):
-                    if previous[name] is not None and received_ns[name] < previous[name]:
-                        raise DeploymentError(
-                            f"TeleImager {name} receive timestamp regressed; restart the policy runner"
-                        )
-                    if previous[name] == received_ns[name]:
-                        raise TimeoutError(f"TeleImager {name} frame is not new")
-
-                rgb = decode_color_0_rgb(color_frame, self.config)
-                depth_bytes = getattr(depth_frame, "jpg", None)
-                if not depth_bytes:
-                    raise TimeoutError("TeleImager aligned-depth stream has no fresh PNG")
-                depth_u16 = _decode_depth_png_u16(depth_bytes)
-                depth_gray, surface_normals = self._encode_geometry(depth_u16)
-                self._last_color_received_ns = received_ns["RGB"]
-                self._last_depth_received_ns = received_ns["aligned-depth"]
+                cached_images = CameraImages(
+                    rgb=cached_rgb,
+                    depth_gray=getattr(self, "_cached_legacy_depth_gray", None),
+                    surface_normals=getattr(
+                        self,
+                        "_cached_legacy_surface_normals",
+                        None,
+                    ),
+                )
                 if not self._reported_stream_fps:
                     self._reported_stream_fps = True
                     if not getattr(self, "_geometry_selection_logged", False):
@@ -2209,11 +2279,7 @@ class TeleimagerCamera:
                             measured_fps["aligned-depth"],
                         )
                         self._geometry_selection_logged = True
-                return CameraImages(
-                    rgb=rgb,
-                    depth_gray=depth_gray,
-                    surface_normals=surface_normals,
-                )
+                return self._copy_camera_images(cached_images)
             except TimeoutError as exc:
                 last_error = exc
                 time.sleep(0.005)

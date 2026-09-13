@@ -20,7 +20,7 @@ python -m teleimager.image_server --rs
 
 The runner requires a fresh response from TeleImager's configuration server, `head_camera.enable_zmq`, and an advertised 30 FPS. A colour-only checkpoint uses the existing JPEG stream. It verifies each fresh JPEG against `head_camera.image_shape`, applies the configured binocular `color_0` crop, and converts BGR to RGB.
 
-For a checkpoint whose exact video keys are `ego_view, depth_gray_view`, the runner automatically requires the updated atomic RGBD stream:
+Geometry checkpoints currently use the independent legacy RGB and aligned-depth streams. An experimental atomic RGBD implementation is present but remains disabled by default; enabling it also requires the live server to advertise:
 
 ```yaml
 head_camera:
@@ -29,9 +29,9 @@ head_camera:
   rgbd_zmq_port: 5560
 ```
 
-Each RGBD packet contains one JPEG and one aligned uint16 depth PNG from the same RealSense capture, with one sequence number. The client rejects corrupt packets, repeated sequences, and a sequence regression caused by a server restart. It reads the live RealSense scale from TeleImager and applies the checkpoint dataset's saved fixed-metric `depth_encoding` (`near_m`, `far_m`, invalid zero and replicated grayscale channels). It does not use `raw_depth_0`, does not encode video during deployment, and does not require a lossless aligned-depth sidecar in the LeRobot dataset.
+Each atomic RGBD packet contains one JPEG and one aligned uint16 depth PNG from the same RealSense capture, with one sequence number. At observation time the camera adapter samples its latest valid caches: legacy mode caches RGB and aligned depth independently, while atomic mode caches the latest complete pair. A cached component or pair may be reused only while its original local receipt is at most 150 ms old. Re-reading an identical atomic sequence never refreshes that age. Corrupt packets and timestamp or sequence regressions still fail closed.
 
-Neither path trusts the requester's local-YAML fallback or silently reuses a cached frame after transport timeout.
+The client reads the live RealSense scale and applies the checkpoint dataset's saved fixed-metric `depth_encoding` (`near_m`, `far_m`, invalid zero and replicated grayscale channels). It does not use `raw_depth_0`, encode video during deployment, or require a lossless aligned-depth sidecar in the LeRobot dataset. Neither geometry path trusts the requester's local-YAML fallback. Legacy receipt timestamps do not prove that independently published RGB and depth came from the same sensor capture; the disabled atomic path provides that stronger pairing contract.
 
 ## 2. Start GR00T on the GPU PC
 
