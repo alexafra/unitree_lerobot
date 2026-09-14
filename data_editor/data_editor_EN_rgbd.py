@@ -34,8 +34,20 @@ REPOSITORY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPOSITORY_ROOT not in sys.path:
     sys.path.insert(0, REPOSITORY_ROOT)
 
+from unitree_lerobot.utils.camera_calibration import (  # noqa: E402
+    validate_realsense_rgbd_calibration,
+)
+from unitree_lerobot.utils.depth_encoding import (  # noqa: E402
+    DEFAULT_DEPTH_FAR_M,
+    DEFAULT_DEPTH_NEAR_M,
+    DEFAULT_DEPTH_SCALE_M_PER_UNIT,
+    canonicalize_depth_scale_m_per_unit,
+    encode_depth_gray_rgb,
+)
 from unitree_lerobot.utils.surface_normal_encoding import (  # noqa: E402
     DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+    PinholeIntrinsics,
+    REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
     SURFACE_NORMAL_OUTPUT_KEY,
     encode_surface_normals_rgb,
 )
@@ -128,9 +140,8 @@ class ImageLabel(QLabel):
             self.setText(f"{self._title}\nNo image")
 
 
-DEFAULT_DEPTH_SCALE_M_PER_UNIT = 0.001
-DEPTH_NEAR_M = 0.25
-DEPTH_FAR_M = 1.0
+DEPTH_NEAR_M = DEFAULT_DEPTH_NEAR_M
+DEPTH_FAR_M = DEFAULT_DEPTH_FAR_M
 
 
 def calculate_measured_fps(data_items):
@@ -156,28 +167,51 @@ def calculate_measured_fps(data_items):
 
 
 def resolve_depth_scale_m_per_unit(json_obj):
-    """Read the episode depth scale, falling back only when it is absent."""
+    """Validate the recorded scale spelling and return canonical ``0.001``."""
 
-    stored_scale = (
-        json_obj.get("info", {})
-        .get("depth", {})
-        .get("scale_m_per_unit")
-    )
-    if stored_scale is None:
-        return DEFAULT_DEPTH_SCALE_M_PER_UNIT
-
+    depth_info = json_obj.get("info", {}).get("depth", {})
+    if not isinstance(depth_info, dict):
+        depth_info = {}
+    stored_scale = depth_info.get("scale_m_per_unit")
     try:
-        depth_scale_m_per_unit = float(stored_scale)
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            f"depth scale must be numeric, got {stored_scale!r}"
-        ) from error
+        if stored_scale is not None:
+            canonicalize_depth_scale_m_per_unit(stored_scale, name="depth scale")
+        reported_scale = depth_info.get("scale_reported_m_per_unit")
+        if reported_scale is not None:
+            canonicalize_depth_scale_m_per_unit(
+                reported_scale,
+                name="reported depth scale",
+            )
+    except ValueError as error:
+        raise ValueError(str(error)) from error
+    return DEFAULT_DEPTH_SCALE_M_PER_UNIT
 
-    if not np.isfinite(depth_scale_m_per_unit) or depth_scale_m_per_unit <= 0:
-        raise ValueError(
-            f"depth scale must be positive and finite, got {stored_scale!r}"
-        )
-    return depth_scale_m_per_unit
+
+def resolve_surface_normal_intrinsics(json_obj):
+    """Use recorded K, or the known robot/camera mapping for legacy episodes."""
+
+    info = json_obj.get("info", {})
+    if not isinstance(info, dict):
+        info = {}
+    depth_info = info.get("depth", {})
+    if not isinstance(depth_info, dict):
+        depth_info = {}
+    calibration = depth_info.get("calibration")
+    if calibration is None:
+        end_effector = info.get("end_effector")
+        if isinstance(end_effector, dict) and end_effector.get("type") == "inspire":
+            return REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480
+        return DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480
+    validated = validate_realsense_rgbd_calibration(calibration)
+    color = validated["color"]
+    return PinholeIntrinsics(
+        width=color["width"],
+        height=color["height"],
+        fx=color["fx"],
+        fy=color["fy"],
+        cx=color["cx"],
+        cy=color["cy"],
+    )
 
 
 def resolve_display_depth_scale(json_obj, color_only=False):
@@ -198,17 +232,13 @@ def depth_to_gray_rgb(
 
         depth = cv2.cvtColor(depth, cv2.COLOR_BGR2GRAY)
 
-    valid_mask = np.isfinite(depth) & (depth > 0)
-    depth_m = depth.astype(np.float32) * depth_scale_m_per_unit
-    normalized = np.clip(
-        (depth_m - DEPTH_NEAR_M) / (DEPTH_FAR_M - DEPTH_NEAR_M),
-        0.0,
-        1.0,
+    depth_scale_m_per_unit = canonicalize_depth_scale_m_per_unit(depth_scale_m_per_unit)
+    return encode_depth_gray_rgb(
+        depth,
+        scale_m_per_unit=depth_scale_m_per_unit,
+        near_m=DEPTH_NEAR_M,
+        far_m=DEPTH_FAR_M,
     )
-
-    gray = np.zeros(depth.shape, dtype=np.uint8)
-    gray[valid_mask] = 1 + np.round(254 * normalized[valid_mask]).astype(np.uint8)
-    return np.repeat(gray[..., None], 3, axis=-1)
 
 
 def load_depth_pixmap(
@@ -243,19 +273,21 @@ def load_depth_pixmap(
 def aligned_depth_to_surface_normals_rgb(
     depth,
     depth_scale_m_per_unit=DEFAULT_DEPTH_SCALE_M_PER_UNIT,
+    intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
 ):
     """Derive the training/deployment surface-normal view from aligned depth."""
 
     return encode_surface_normals_rgb(
         depth,
-        scale_m_per_unit=depth_scale_m_per_unit,
-        intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+        scale_m_per_unit=canonicalize_depth_scale_m_per_unit(depth_scale_m_per_unit),
+        intrinsics=intrinsics,
     )
 
 
 def load_surface_normals_pixmap(
     image_path,
     depth_scale_m_per_unit=DEFAULT_DEPTH_SCALE_M_PER_UNIT,
+    intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
 ):
     """Load aligned ``depth_0`` and derive its shared surface-normal encoding."""
 
@@ -269,6 +301,7 @@ def load_surface_normals_pixmap(
     normals_rgb = aligned_depth_to_surface_normals_rgb(
         aligned_depth,
         depth_scale_m_per_unit,
+        intrinsics,
     )
 
     height, width, channels = normals_rgb.shape
@@ -548,6 +581,7 @@ class DatasetPlayer(QWidget):
         self.depth_scale_m_per_unit = (
             None if self.color_only else DEFAULT_DEPTH_SCALE_M_PER_UNIT
         )
+        self.surface_normal_intrinsics = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480
 
         self.is_playing = True
         self.play_selection_only = False
@@ -1135,6 +1169,7 @@ class DatasetPlayer(QWidget):
         self.depth_scale_m_per_unit = (
             None if self.color_only else DEFAULT_DEPTH_SCALE_M_PER_UNIT
         )
+        self.surface_normal_intrinsics = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480
         self.play_selection_only = False
 
         self.episode_label.setText("Current Episode: None")
@@ -1369,9 +1404,11 @@ class DatasetPlayer(QWidget):
                 json_obj,
                 color_only=self.color_only,
             )
+            if not self.color_only:
+                self.surface_normal_intrinsics = resolve_surface_normal_intrinsics(json_obj)
         except ValueError as error:
             self.clear_player_state(
-                f"Invalid depth scale in {json_path}: {error}"
+                f"Invalid depth geometry metadata in {json_path}: {error}"
             )
             return
 
@@ -1534,6 +1571,7 @@ class DatasetPlayer(QWidget):
                     pixmap = load_surface_normals_pixmap(
                         image_path,
                         self.depth_scale_m_per_unit,
+                        self.surface_normal_intrinsics,
                     )
                 else:
                     pixmap = QPixmap(image_path)

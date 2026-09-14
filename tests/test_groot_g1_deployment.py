@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import io
 import json
 import os
@@ -120,6 +121,7 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     build_initialization_chunk,
     decode_color_0_rgb,
     request_live_camera_config,
+    _validate_live_head_config,
 )
 from unitree_lerobot.eval_robot.training_start_pose import (
     DEX3_TRAINING_START_JOINTS_RAD,
@@ -131,9 +133,14 @@ from unitree_lerobot.eval_robot.training_start_pose import (
     training_start_source,
     training_start_spec,
 )
+from unitree_lerobot.utils.camera_calibration import (
+    D435I_254322071415_CALIBRATION,
+    calibration_identity,
+)
 from unitree_lerobot.utils.depth_encoding import encode_depth_gray_rgb
 from unitree_lerobot.utils.surface_normal_encoding import (
     DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+    REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
     encode_surface_normals_rgb,
     surface_normals_encoding_metadata,
 )
@@ -3017,6 +3024,69 @@ class GrootG1DeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(DeploymentError, "surface-normal encoding for orientation"):
             validate_policy_metadata(malformed, requires_surface_normals=True)
 
+    def test_policy_metadata_parses_calibration_tagged_surface_normal_intrinsics(self):
+        identity = calibration_identity(
+            D435I_254322071415_CALIBRATION,
+            source="episode.info.depth.calibration",
+        )
+        metadata = {
+            "protocol_version": 1,
+            "embodiment_tag": "new_embodiment",
+            "action_output_contract": EXPECTED_ACTION_OUTPUT_CONTRACT,
+            "dataset_contract": {
+                "robot_type": EXPECTED_ROBOT_TYPE,
+                "fps": 30.0,
+                "observation_state_names": EXPECTED_JOINT_NAMES,
+                "action_names": EXPECTED_JOINT_NAMES,
+                "ego_view_shape": EXPECTED_EGO_VIEW_SHAPE,
+                "video_shapes": {
+                    "ego_view": EXPECTED_EGO_VIEW_SHAPE,
+                    "surface_normals_view": EXPECTED_DEPTH_VIEW_SHAPE,
+                },
+                "surface_normals_encoding": surface_normals_encoding_metadata(
+                    intrinsics=REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
+                    camera_calibration=identity,
+                ),
+            },
+        }
+
+        contract = validate_policy_metadata(metadata, requires_surface_normals=True)
+
+        self.assertEqual(
+            contract,
+            SurfaceNormalEncodingContract(
+                intrinsics=REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
+                max_neighbor_depth_delta_m=0.05,
+                camera_calibration=identity,
+            ),
+        )
+
+    def test_policy_metadata_keeps_legacy_surface_normal_contract_untagged(self):
+        encoding = surface_normals_encoding_metadata()
+        self.assertNotIn("camera_calibration", encoding)
+        metadata = {
+            "protocol_version": 1,
+            "embodiment_tag": "new_embodiment",
+            "action_output_contract": EXPECTED_ACTION_OUTPUT_CONTRACT,
+            "dataset_contract": {
+                "robot_type": EXPECTED_ROBOT_TYPE,
+                "fps": 30.0,
+                "observation_state_names": EXPECTED_JOINT_NAMES,
+                "action_names": EXPECTED_JOINT_NAMES,
+                "ego_view_shape": EXPECTED_EGO_VIEW_SHAPE,
+                "video_shapes": {
+                    "ego_view": EXPECTED_EGO_VIEW_SHAPE,
+                    "surface_normals_view": EXPECTED_DEPTH_VIEW_SHAPE,
+                },
+                "surface_normals_encoding": encoding,
+            },
+        }
+
+        contract = validate_policy_metadata(metadata, requires_surface_normals=True)
+
+        self.assertIsNone(contract.camera_calibration)
+        self.assertEqual(contract.intrinsics, DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480)
+
     def test_policy_metadata_requires_the_explicit_g1_training_tag(self):
         metadata = {
             "protocol_version": 1,
@@ -3650,6 +3720,107 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertIn("matching the training data collection transport", legacy_logs.output[0])
         camera.close()
         default_camera.close()
+
+    def test_live_geometry_scale_is_float32_validated_then_canonicalized(self):
+        live_config = {
+            "head_camera": {
+                "enable_zmq": True,
+                "fps": 30,
+                "image_shape": [480, 640],
+                "type": "realsense",
+                "enable_depth": True,
+                "binocular": False,
+                "zmq_port": 5555,
+                "depth_zmq_port": 5556,
+                "depth_scale_m_per_unit": 0.0010000000474974513,
+                "depth_scale_reported_m_per_unit": 0.0010000000474974513,
+            }
+        }
+
+        _, _, scale = _validate_live_head_config(live_config, requires_depth=True)
+
+        self.assertEqual(scale, 0.001)
+        live_config["head_camera"]["depth_scale_reported_m_per_unit"] = 0.0005
+        with self.assertRaisesRegex(DeploymentError, "canonical 0.001"):
+            _validate_live_head_config(live_config, requires_depth=True)
+
+    def test_tagged_surface_normal_contract_requires_matching_live_calibration(self):
+        identity = calibration_identity(
+            D435I_254322071415_CALIBRATION,
+            source="episode.info.depth.calibration",
+        )
+        encoding = SurfaceNormalEncodingContract(
+            intrinsics=REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
+            max_neighbor_depth_delta_m=0.05,
+            camera_calibration=identity,
+        )
+        live_config = {
+            "head_camera": {
+                "enable_zmq": True,
+                "fps": 30,
+                "image_shape": [480, 640],
+                "type": "realsense",
+                "enable_depth": True,
+                "binocular": False,
+                "zmq_port": 5555,
+                "depth_zmq_port": 5556,
+                "depth_scale_m_per_unit": 0.001,
+                "depth_scale_reported_m_per_unit": 0.0010000000474974513,
+                "calibration": D435I_254322071415_CALIBRATION,
+            }
+        }
+
+        _, _, scale = _validate_live_head_config(
+            live_config,
+            requires_depth=True,
+            surface_normal_encoding=encoding,
+        )
+        self.assertEqual(scale, 0.001)
+
+        missing = copy.deepcopy(live_config)
+        del missing["head_camera"]["calibration"]
+        with self.assertRaisesRegex(DeploymentError, "requires a valid advertised"):
+            _validate_live_head_config(
+                missing,
+                requires_depth=True,
+                surface_normal_encoding=encoding,
+            )
+
+        mismatched = copy.deepcopy(live_config)
+        mismatched["head_camera"]["calibration"]["camera"]["serial"] = "other"
+        with self.assertRaisesRegex(DeploymentError, "fingerprint does not match"):
+            _validate_live_head_config(
+                mismatched,
+                requires_depth=True,
+                surface_normal_encoding=encoding,
+            )
+
+    def test_legacy_surface_normal_contract_does_not_require_live_calibration(self):
+        encoding = SurfaceNormalEncodingContract(
+            intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+            max_neighbor_depth_delta_m=0.05,
+        )
+        live_config = {
+            "head_camera": {
+                "enable_zmq": True,
+                "fps": 30,
+                "image_shape": [480, 640],
+                "type": "realsense",
+                "enable_depth": True,
+                "binocular": False,
+                "zmq_port": 5555,
+                "depth_zmq_port": 5556,
+                "depth_scale_m_per_unit": 0.001,
+            }
+        }
+
+        _, _, scale = _validate_live_head_config(
+            live_config,
+            requires_depth=True,
+            surface_normal_encoding=encoding,
+        )
+
+        self.assertEqual(scale, 0.001)
 
     def test_geometry_camera_protocol_mismatch_selects_legacy_without_refusing(self):
         live_config = {

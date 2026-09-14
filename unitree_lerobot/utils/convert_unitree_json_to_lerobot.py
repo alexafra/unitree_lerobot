@@ -9,6 +9,7 @@ Script Json to Lerobot.
 # --depth-near-m Fixed near bound used for depth normalization
 # --depth-far-m  Fixed far bound used for depth normalization
 # --include-surface-normals Include camera-frame normals derived from aligned depth_0
+# --camera-calibration-profile Named calibration for legacy raw data without recorded metadata
 
 python unitree_lerobot/utils/convert_unitree_json_to_lerobot.py \
     --raw-dir $HOME/datasets/g1_grabcube_double_hand \
@@ -22,6 +23,7 @@ python unitree_lerobot/utils/convert_unitree_json_to_lerobot.py \
 
 import os
 import av
+import copy
 import cv2
 import tqdm
 import tyro
@@ -41,6 +43,13 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import write_info
 
 from unitree_lerobot.utils.constants import ROBOT_CONFIGS
+from unitree_lerobot.utils.camera_calibration import (
+    NAMED_CAMERA_CALIBRATIONS,
+    RECORDED_CAMERA_CALIBRATION_SOURCE,
+    CameraCalibrationIdentity,
+    calibration_identity,
+    validate_realsense_rgbd_calibration,
+)
 from unitree_lerobot.utils.depth_encoding import (
     DEFAULT_DEPTH_FAR_M,
     DEFAULT_DEPTH_NEAR_M,
@@ -49,13 +58,14 @@ from unitree_lerobot.utils.depth_encoding import (
     DEPTH_ENCODING,
     DEPTH_OUTPUT_KEY,
     DEPTH_SOURCE_KEY,
+    canonicalize_depth_scale_m_per_unit,
     encode_depth_gray_rgb,
 )
 from unitree_lerobot.utils.surface_normal_encoding import (
     DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
     DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M,
-    SURFACE_NORMAL_OUTPUT_KEY,
     PinholeIntrinsics,
+    SURFACE_NORMAL_OUTPUT_KEY,
     encode_surface_normals_rgb,
     surface_normals_encoding_metadata,
 )
@@ -71,6 +81,100 @@ class DatasetConfig:
 
 
 DEFAULT_DATASET_CONFIG = DatasetConfig()
+LEGACY_UNTAGGED_CAMERA_CALIBRATION_PROFILE = "legacy-untagged"
+CameraCalibrationProfile = Literal[
+    "legacy-untagged",
+    "d435i-254322071415",
+]
+
+
+def _intrinsics_from_calibration(calibration: dict) -> PinholeIntrinsics:
+    validated = validate_realsense_rgbd_calibration(calibration)
+    color = validated["color"]
+    return PinholeIntrinsics(
+        width=color["width"],
+        height=color["height"],
+        fx=color["fx"],
+        fy=color["fy"],
+        cx=color["cx"],
+        cy=color["cy"],
+    )
+
+
+def _resolve_recorded_camera_calibration(
+    episodes: list[dict],
+    episode_paths: list[Path],
+) -> dict | None:
+    """Return one validated calibration or reject a heterogeneous raw dataset."""
+
+    records = []
+    for path, episode in zip(episode_paths, episodes, strict=True):
+        if not isinstance(episode, dict):
+            raise ValueError(f"Episode JSON at {path} must be an object")
+        info = episode.get("info", {})
+        if not isinstance(info, dict):
+            raise ValueError(f"Episode info at {path} must be an object")
+        depth_info = info.get("depth", {})
+        if not isinstance(depth_info, dict):
+            raise ValueError(f"Episode info.depth at {path} must be an object")
+        records.append(depth_info.get("calibration"))
+    present = [record is not None for record in records]
+    if not any(present):
+        return None
+    if not all(present):
+        missing = [str(path) for path, has_record in zip(episode_paths, present, strict=True) if not has_record]
+        raise ValueError(
+            "Raw dataset mixes calibration-tagged and legacy episodes; every episode must carry "
+            f"the same info.depth.calibration or none may carry it. Missing: {missing!r}"
+        )
+
+    validated_records = []
+    for path, record in zip(episode_paths, records, strict=True):
+        try:
+            validated_records.append(validate_realsense_rgbd_calibration(record))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid info.depth.calibration in {path}: {exc}") from exc
+
+    first = validated_records[0]
+    for path, record in zip(episode_paths[1:], validated_records[1:], strict=True):
+        if record != first:
+            raise ValueError(
+                "Raw dataset contains heterogeneous camera calibrations: "
+                f"{path} does not match fingerprint {first['fingerprint']}"
+            )
+    return first
+
+
+def _resolve_canonical_episode_depth_scale(depth_info: object, *, episode_path: str) -> float:
+    """Validate recorded SDK spellings, but always return the shared constant."""
+
+    if not isinstance(depth_info, dict):
+        depth_info = {}
+    stored_scale = depth_info.get("scale_m_per_unit")
+    if stored_scale is None:
+        print(
+            f"Warning: depth scale missing for {episode_path}; "
+            f"assuming canonical {DEFAULT_DEPTH_SCALE_M_PER_UNIT} m/unit"
+        )
+    else:
+        try:
+            canonicalize_depth_scale_m_per_unit(
+                stored_scale,
+                name=f"{episode_path} info.depth.scale_m_per_unit",
+            )
+        except ValueError as exc:
+            raise ValueError(f"Invalid depth scale in {episode_path}: {exc}") from exc
+
+    reported_scale = depth_info.get("scale_reported_m_per_unit")
+    if reported_scale is not None:
+        try:
+            canonicalize_depth_scale_m_per_unit(
+                reported_scale,
+                name=f"{episode_path} info.depth.scale_reported_m_per_unit",
+            )
+        except ValueError as exc:
+            raise ValueError(f"Invalid reported depth scale in {episode_path}: {exc}") from exc
+    return DEFAULT_DEPTH_SCALE_M_PER_UNIT
 
 
 def encode_lossless_geometry_video(
@@ -145,6 +249,9 @@ class JsonDataset:
         include_surface_normals: bool = False,
         surface_normal_intrinsics: PinholeIntrinsics = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
         surface_normal_max_neighbor_depth_delta_m: float = (DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M),
+        camera_calibration_profile: CameraCalibrationProfile = (
+            LEGACY_UNTAGGED_CAMERA_CALIBRATION_PROFILE
+        ),
     ) -> None:
         """
         Initialize the dataset for loading and processing HDF5 files containing robot manipulation data.
@@ -165,7 +272,31 @@ class JsonDataset:
         self.depth_far_m = depth_far_m
         self.include_surface_normals = include_surface_normals
         self.surface_normal_intrinsics = surface_normal_intrinsics
+        self.camera_calibration: dict | None = None
+        self.camera_calibration_identity: CameraCalibrationIdentity | None = None
         self.surface_normal_max_neighbor_depth_delta_m = surface_normal_max_neighbor_depth_delta_m
+        if camera_calibration_profile != LEGACY_UNTAGGED_CAMERA_CALIBRATION_PROFILE:
+            if camera_calibration_profile not in NAMED_CAMERA_CALIBRATIONS:
+                raise ValueError(f"Unknown camera calibration profile {camera_calibration_profile!r}")
+            selected_profile_calibration = NAMED_CAMERA_CALIBRATIONS[camera_calibration_profile]
+            selected_profile_identity = calibration_identity(
+                selected_profile_calibration,
+                source=f"converter.profile.{camera_calibration_profile}",
+            )
+            selected_profile_intrinsics = _intrinsics_from_calibration(
+                selected_profile_calibration
+            )
+            if surface_normal_intrinsics not in {
+                DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+                selected_profile_intrinsics,
+            }:
+                raise ValueError(
+                    f"Explicit camera calibration profile {camera_calibration_profile!r} "
+                    "conflicts with the supplied anonymous surface-normal intrinsics"
+                )
+        else:
+            selected_profile_calibration = None
+            selected_profile_identity = None
         # Validate the complete geometry contract before reading any frames.
         surface_normals_encoding_metadata(
             intrinsics=surface_normal_intrinsics,
@@ -175,6 +306,43 @@ class JsonDataset:
         # Initialize paths and cache
         self._init_paths()
         self._init_cache()
+        if include_depth or include_surface_normals:
+            recorded_calibration = _resolve_recorded_camera_calibration(
+                self.episodes_data_cached,
+                self.episode_paths,
+            )
+            if recorded_calibration is not None:
+                recorded_identity = calibration_identity(
+                    recorded_calibration,
+                    source=RECORDED_CAMERA_CALIBRATION_SOURCE,
+                )
+                recorded_intrinsics = _intrinsics_from_calibration(recorded_calibration)
+                if (
+                    selected_profile_identity is not None
+                    and selected_profile_identity.fingerprint != recorded_identity.fingerprint
+                ):
+                    raise ValueError(
+                        f"Explicit camera calibration profile {camera_calibration_profile!r} "
+                        f"({selected_profile_identity.fingerprint}) conflicts with recorded "
+                        f"calibration {recorded_identity.fingerprint}"
+                    )
+                if surface_normal_intrinsics not in {
+                    DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+                    recorded_intrinsics,
+                }:
+                    raise ValueError(
+                        "Recorded camera calibration conflicts with the supplied anonymous "
+                        "surface-normal intrinsics"
+                    )
+                self.surface_normal_intrinsics = recorded_intrinsics
+                self.camera_calibration = copy.deepcopy(recorded_calibration)
+                self.camera_calibration_identity = recorded_identity
+            elif selected_profile_calibration is not None:
+                self.surface_normal_intrinsics = _intrinsics_from_calibration(
+                    selected_profile_calibration
+                )
+                self.camera_calibration = copy.deepcopy(selected_profile_calibration)
+                self.camera_calibration_identity = selected_profile_identity
         self.json_state_data_name = ROBOT_CONFIGS[robot_type].json_state_data_name
         self.json_action_data_name = ROBOT_CONFIGS[robot_type].json_action_data_name
         self.camera_to_image_key = ROBOT_CONFIGS[robot_type].camera_to_image_key
@@ -306,17 +474,10 @@ class JsonDataset:
         images = defaultdict(list)
 
         depth_info = episode_data.get("info", {}).get("depth", {})
-
-        stored_scale = depth_info.get("scale_m_per_unit")
-
-        if stored_scale is None:
-            depth_scale = DEFAULT_DEPTH_SCALE_M_PER_UNIT
-            print(f"Warning: depth scale missing for {episode_path}; assuming {depth_scale} m/unit")
-        else:
-            depth_scale = float(stored_scale)
-
-        if not np.isfinite(depth_scale) or depth_scale <= 0:
-            raise ValueError(f"Invalid depth scale in {episode_path}: {depth_scale}")
+        depth_scale = _resolve_canonical_episode_depth_scale(
+            depth_info,
+            episode_path=episode_path,
+        )
 
         # depth_0 is aligned with color_0.
         rgb_camera_key = self.camera_to_image_key.get(DEPTH_COLOR_SOURCE_KEY)
@@ -583,17 +744,23 @@ def populate_dataset(
     include_surface_normals: bool = False,
     surface_normal_intrinsics: PinholeIntrinsics = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
     surface_normal_max_neighbor_depth_delta_m: float = DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M,
+    camera_calibration_profile: CameraCalibrationProfile = (
+        LEGACY_UNTAGGED_CAMERA_CALIBRATION_PROFILE
+    ),
+    json_dataset: JsonDataset | None = None,
 ) -> LeRobotDataset:
-    json_dataset = JsonDataset(
-        raw_dir,
-        robot_type,
-        include_depth=include_depth,
-        depth_near_m=depth_near_m,
-        depth_far_m=depth_far_m,
-        include_surface_normals=include_surface_normals,
-        surface_normal_intrinsics=surface_normal_intrinsics,
-        surface_normal_max_neighbor_depth_delta_m=surface_normal_max_neighbor_depth_delta_m,
-    )
+    if json_dataset is None:
+        json_dataset = JsonDataset(
+            raw_dir,
+            robot_type,
+            include_depth=include_depth,
+            depth_near_m=depth_near_m,
+            depth_far_m=depth_far_m,
+            include_surface_normals=include_surface_normals,
+            surface_normal_intrinsics=surface_normal_intrinsics,
+            surface_normal_max_neighbor_depth_delta_m=surface_normal_max_neighbor_depth_delta_m,
+            camera_calibration_profile=camera_calibration_profile,
+        )
     for i in tqdm.tqdm(range(len(json_dataset))):
         episode = json_dataset.get_item(i)
 
@@ -639,6 +806,9 @@ def json_to_lerobot(
     surface_normals_cx: float = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480.cx,
     surface_normals_cy: float = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480.cy,
     surface_normals_max_neighbor_depth_delta_m: float = DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M,
+    camera_calibration_profile: CameraCalibrationProfile = (
+        LEGACY_UNTAGGED_CAMERA_CALIBRATION_PROFILE
+    ),
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ):
     if (HF_LEROBOT_HOME / repo_id).exists():
@@ -652,11 +822,22 @@ def json_to_lerobot(
         cx=surface_normals_cx,
         cy=surface_normals_cy,
     )
-    # Validate even when the feature is disabled so invalid explicit CLI values
-    # fail deterministically rather than being silently ignored.
+    json_dataset = JsonDataset(
+        raw_dir,
+        robot_type,
+        include_depth=include_depth,
+        depth_near_m=depth_near_m,
+        depth_far_m=depth_far_m,
+        include_surface_normals=include_surface_normals,
+        surface_normal_intrinsics=surface_normal_intrinsics,
+        surface_normal_max_neighbor_depth_delta_m=surface_normals_max_neighbor_depth_delta_m,
+        camera_calibration_profile=camera_calibration_profile,
+    )
+    resolved_surface_normal_intrinsics = json_dataset.surface_normal_intrinsics
     surface_normal_metadata = surface_normals_encoding_metadata(
-        intrinsics=surface_normal_intrinsics,
+        intrinsics=resolved_surface_normal_intrinsics,
         max_neighbor_depth_delta_m=surface_normals_max_neighbor_depth_delta_m,
+        camera_calibration=json_dataset.camera_calibration_identity,
     )
 
     dataset = create_empty_dataset(
@@ -667,7 +848,7 @@ def json_to_lerobot(
         has_velocity=False,
         include_depth=include_depth,
         include_surface_normals=include_surface_normals,
-        surface_normal_intrinsics=surface_normal_intrinsics,
+        surface_normal_intrinsics=resolved_surface_normal_intrinsics,
         dataset_config=dataset_config,
     )
     if include_depth:
@@ -683,6 +864,16 @@ def json_to_lerobot(
         }
     if include_surface_normals:
         dataset.meta.info["surface_normals_encoding"] = surface_normal_metadata
+    if json_dataset.camera_calibration is not None:
+        dataset.meta.info["camera_calibration"] = copy.deepcopy(
+            json_dataset.camera_calibration
+        )
+        if (
+            json_dataset.camera_calibration_identity is None
+            or dataset.meta.info["camera_calibration"]["fingerprint"]
+            != json_dataset.camera_calibration_identity.fingerprint
+        ):
+            raise RuntimeError("Resolved camera calibration identity is internally inconsistent")
     # ``LeRobotDataset.finalize`` closes writers but does not write info.json.
     # Persist custom geometry contracts before frame conversion so they survive
     # image-mode datasets and interrupted conversions as well as video mode.
@@ -696,8 +887,10 @@ def json_to_lerobot(
         depth_near_m=depth_near_m,
         depth_far_m=depth_far_m,
         include_surface_normals=include_surface_normals,
-        surface_normal_intrinsics=surface_normal_intrinsics,
+        surface_normal_intrinsics=resolved_surface_normal_intrinsics,
         surface_normal_max_neighbor_depth_delta_m=surface_normals_max_neighbor_depth_delta_m,
+        camera_calibration_profile=camera_calibration_profile,
+        json_dataset=json_dataset,
     )
     dataset.finalize()
 

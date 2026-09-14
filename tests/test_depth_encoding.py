@@ -4,10 +4,43 @@ import unittest
 
 import numpy as np
 
-from unitree_lerobot.utils.depth_encoding import encode_depth_gray_rgb
+from unitree_lerobot.utils.depth_encoding import (
+    CANONICAL_DEPTH_SCALE_M_PER_UNIT,
+    DEFAULT_DEPTH_NEAR_M,
+    canonicalize_depth_scale_m_per_unit,
+    encode_depth_gray_rgb,
+)
 
 
 class DepthEncodingTest(unittest.TestCase):
+    def test_production_default_range_remains_025_to_1m(self):
+        self.assertEqual(DEFAULT_DEPTH_NEAR_M, 0.25)
+
+    def test_realsense_float32_scale_spelling_canonicalizes_to_exact_constant(self):
+        reported = 0.0010000000474974513
+
+        canonical = canonicalize_depth_scale_m_per_unit(reported)
+
+        self.assertIs(canonical, CANONICAL_DEPTH_SCALE_M_PER_UNIT)
+        self.assertEqual(canonical, 0.001)
+
+    def test_canonical_scale_does_not_change_encoded_bytes(self):
+        generator = np.random.default_rng(7)
+        depth = generator.integers(0, 5001, size=(31, 47), dtype=np.uint16)
+        reported = 0.0010000000474974513
+
+        reported_bytes = encode_depth_gray_rgb(depth, scale_m_per_unit=reported)
+        canonical_bytes = encode_depth_gray_rgb(
+            depth,
+            scale_m_per_unit=canonicalize_depth_scale_m_per_unit(reported),
+        )
+
+        np.testing.assert_array_equal(canonical_bytes, reported_bytes)
+
+    def test_canonical_scale_rejects_a_different_sensor_unit(self):
+        with self.assertRaisesRegex(ValueError, "canonical 0.001"):
+            canonicalize_depth_scale_m_per_unit(0.0005)
+
     def test_fixed_metric_mapping_and_invalid_value(self):
         depth = np.array([[0, 1, 250, 625, 1000, 2000]], dtype=np.uint16)
 

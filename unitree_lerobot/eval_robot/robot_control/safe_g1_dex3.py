@@ -24,6 +24,10 @@ import cv2
 import numpy as np
 import zmq
 
+from unitree_lerobot.utils.camera_calibration import (
+    calibration_identity,
+    validate_realsense_rgbd_calibration,
+)
 from unitree_lerobot.eval_robot.g1_end_effectors import (
     DEX3_PROFILE,
     EndEffectorProfile,
@@ -64,7 +68,11 @@ from unitree_lerobot.eval_robot.run_logging import (
     diagnostic_json_path,
     write_json,
 )
-from unitree_lerobot.utils.depth_encoding import encode_depth_gray_rgb
+from unitree_lerobot.utils.depth_encoding import (
+    DEFAULT_DEPTH_SCALE_M_PER_UNIT,
+    canonicalize_depth_scale_m_per_unit,
+    encode_depth_gray_rgb,
+)
 from unitree_lerobot.utils.surface_normal_encoding import encode_surface_normals_rgb
 
 
@@ -1825,6 +1833,7 @@ def _validate_live_head_config(
     config: dict[str, Any],
     *,
     requires_depth: bool,
+    surface_normal_encoding: SurfaceNormalEncodingContract | None = None,
 ) -> tuple[int, int | None, float | None]:
     head = config.get("head_camera")
     if not isinstance(head, dict):
@@ -1869,11 +1878,70 @@ def _validate_live_head_config(
         if not 1 <= depth_port <= 65535:
             raise DeploymentError(f"TeleImager reported invalid depth_zmq_port {depth_port!r}")
         try:
-            depth_scale = float(head["depth_scale_m_per_unit"])
-        except (KeyError, TypeError, ValueError) as exc:
+            advertised_depth_scale = head["depth_scale_m_per_unit"]
+        except KeyError as exc:
             raise DeploymentError("TeleImager has no valid live RealSense depth scale") from exc
-        if not np.isfinite(depth_scale) or depth_scale <= 0.0:
-            raise DeploymentError(f"TeleImager reported invalid depth scale {depth_scale!r}")
+        try:
+            depth_scale = canonicalize_depth_scale_m_per_unit(
+                advertised_depth_scale,
+                name="TeleImager depth_scale_m_per_unit",
+            )
+            reported_depth_scale = head.get("depth_scale_reported_m_per_unit")
+            if reported_depth_scale is not None:
+                canonicalize_depth_scale_m_per_unit(
+                    reported_depth_scale,
+                    name="TeleImager depth_scale_reported_m_per_unit",
+                )
+        except ValueError as exc:
+            raise DeploymentError(f"TeleImager reported invalid depth scale: {exc}") from exc
+
+        expected_calibration = (
+            None
+            if surface_normal_encoding is None
+            else surface_normal_encoding.camera_calibration
+        )
+        if expected_calibration is not None:
+            try:
+                live_calibration = validate_realsense_rgbd_calibration(head.get("calibration"))
+                live_identity = calibration_identity(
+                    live_calibration,
+                    source=expected_calibration.source,
+                )
+            except (TypeError, ValueError) as exc:
+                raise DeploymentError(
+                    "Calibration-tagged surface-normal checkpoint requires a valid advertised "
+                    f"TeleImager head_camera.calibration: {exc}"
+                ) from exc
+            if live_identity != expected_calibration:
+                raise DeploymentError(
+                    "Live TeleImager camera calibration does not match the surface-normal "
+                    f"checkpoint: got {live_identity.to_metadata()!r}, expected "
+                    f"{expected_calibration.to_metadata()!r}"
+                )
+            expected_intrinsics = surface_normal_encoding.intrinsics
+            live_color = live_calibration["color"]
+            live_intrinsics = (
+                live_color["width"],
+                live_color["height"],
+                live_color["fx"],
+                live_color["fy"],
+                live_color["cx"],
+                live_color["cy"],
+            )
+            checkpoint_intrinsics = (
+                expected_intrinsics.width,
+                expected_intrinsics.height,
+                expected_intrinsics.fx,
+                expected_intrinsics.fy,
+                expected_intrinsics.cx,
+                expected_intrinsics.cy,
+            )
+            if live_intrinsics != checkpoint_intrinsics:
+                raise DeploymentError(
+                    "Advertised live color intrinsics do not match the surface-normal checkpoint: "
+                    f"got {live_intrinsics!r}, expected {checkpoint_intrinsics!r}"
+                )
+        assert depth_scale == DEFAULT_DEPTH_SCALE_M_PER_UNIT
     return port, depth_port, depth_scale
 
 
@@ -1933,6 +2001,7 @@ class TeleimagerCamera:
         stream_port, depth_port, depth_scale = _validate_live_head_config(
             live_config,
             requires_depth=self._requires_depth,
+            surface_normal_encoding=surface_normal_encoding,
         )
         atomic_port: int | None = None
         atomic_unavailable_reason = ""

@@ -12,6 +12,10 @@ import dataclasses
 
 import numpy as np
 
+from unitree_lerobot.utils.camera_calibration import (
+    CameraCalibrationIdentity,
+    validate_calibration_identity,
+)
 from unitree_lerobot.utils.depth_encoding import (
     DEFAULT_DEPTH_SCALE_M_PER_UNIT,
     DEPTH_COLOR_SOURCE_KEY,
@@ -55,6 +59,18 @@ DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480 = PinholeIntrinsics(
     cy=242.249740600586,
 )
 
+# Intel RealSense D435I 254322071415 color intrinsics at 640x480. Keep this a
+# named opt-in/recorded calibration; the historical serial above intentionally
+# remains the untagged legacy default.
+REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480 = PinholeIntrinsics(
+    width=640,
+    height=480,
+    fx=609.3858642578125,
+    fy=609.4705200195312,
+    cx=325.95001220703125,
+    cy=247.26507568359375,
+)
+
 
 def _finite_float(value: float, *, name: str) -> float:
     try:
@@ -94,6 +110,26 @@ def _validated_intrinsics(intrinsics: PinholeIntrinsics) -> PinholeIntrinsics:
         fy=fy,
         cx=cx,
         cy=cy,
+    )
+
+
+def pinhole_intrinsics_from_metadata(value: object) -> PinholeIntrinsics:
+    """Parse and validate the serialized pinhole intrinsics contract."""
+
+    expected_fields = {"model", "width", "height", "fx", "fy", "cx", "cy"}
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise ValueError(f"intrinsics must contain exactly {sorted(expected_fields)!r}")
+    if value["model"] != "pinhole":
+        raise ValueError(f"intrinsics model must be 'pinhole', got {value['model']!r}")
+    return _validated_intrinsics(
+        PinholeIntrinsics(
+            width=value["width"],
+            height=value["height"],
+            fx=value["fx"],
+            fy=value["fy"],
+            cx=value["cx"],
+            cy=value["cy"],
+        )
     )
 
 
@@ -200,6 +236,7 @@ def surface_normals_encoding_metadata(
     *,
     intrinsics: PinholeIntrinsics = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
     max_neighbor_depth_delta_m: float = DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M,
+    camera_calibration: CameraCalibrationIdentity | dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Return the versioned, JSON-serializable contract for this encoding."""
 
@@ -211,7 +248,7 @@ def surface_normals_encoding_metadata(
     if discontinuity <= 0:
         raise ValueError(f"max_neighbor_depth_delta_m must be positive, got {discontinuity}")
 
-    return {
+    metadata: dict[str, object] = {
         "source_key": SURFACE_NORMAL_SOURCE_KEY,
         "aligned_to": SURFACE_NORMAL_COLOR_SOURCE_KEY,
         "feature_key": f"observation.images.{SURFACE_NORMAL_OUTPUT_KEY}",
@@ -237,3 +274,11 @@ def surface_normals_encoding_metadata(
         "invalid_value": [0, 0, 0],
         "valid_component_range": [1, 255],
     }
+    if camera_calibration is not None:
+        identity = (
+            camera_calibration
+            if isinstance(camera_calibration, CameraCalibrationIdentity)
+            else validate_calibration_identity(camera_calibration)
+        )
+        metadata["camera_calibration"] = identity.to_metadata()
+    return metadata

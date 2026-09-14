@@ -10,6 +10,10 @@ from typing import Any
 
 import numpy as np
 
+from unitree_lerobot.utils.camera_calibration import (
+    CameraCalibrationIdentity,
+    validate_calibration_identity,
+)
 from unitree_lerobot.eval_robot.g1_end_effectors import (
     DEX3_PROFILE,
     EndEffectorProfile,
@@ -24,10 +28,9 @@ from unitree_lerobot.utils.depth_encoding import (
     DEPTH_SOURCE_KEY,
 )
 from unitree_lerobot.utils.surface_normal_encoding import (
-    DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
-    DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M,
     PinholeIntrinsics,
     SURFACE_NORMAL_OUTPUT_KEY,
+    pinhole_intrinsics_from_metadata,
     surface_normals_encoding_metadata,
 )
 
@@ -240,6 +243,7 @@ class DepthEncodingContract:
 class SurfaceNormalEncodingContract:
     intrinsics: PinholeIntrinsics
     max_neighbor_depth_delta_m: float
+    camera_calibration: CameraCalibrationIdentity | None = None
 
 
 def _task_contract_sha256(instructions: list[str]) -> str:
@@ -422,14 +426,36 @@ def _validate_surface_normal_metadata(contract: dict[str, Any]) -> SurfaceNormal
         )
     expected = surface_normals_encoding_metadata()
     for field, value in expected.items():
+        if field == "intrinsics":
+            continue
         if encoding.get(field) != value:
             raise DeploymentError(
                 f"Unsupported surface-normal encoding for {field}: "
                 f"got {encoding.get(field)!r}, expected {value!r}"
             )
+    try:
+        intrinsics = pinhole_intrinsics_from_metadata(encoding.get("intrinsics"))
+    except (TypeError, ValueError) as exc:
+        raise DeploymentError(f"Invalid surface-normal intrinsics: {exc}") from exc
+    if [intrinsics.height, intrinsics.width, 3] != EXPECTED_SURFACE_NORMAL_VIEW_SHAPE:
+        raise DeploymentError(
+            "Surface-normal intrinsics resolution does not match the model view: "
+            f"got {intrinsics.width}x{intrinsics.height}, expected "
+            f"{EXPECTED_SURFACE_NORMAL_VIEW_SHAPE[1]}x{EXPECTED_SURFACE_NORMAL_VIEW_SHAPE[0]}"
+        )
+    calibration_metadata = encoding.get("camera_calibration")
+    try:
+        camera_calibration = (
+            None
+            if calibration_metadata is None
+            else validate_calibration_identity(calibration_metadata)
+        )
+    except (TypeError, ValueError) as exc:
+        raise DeploymentError(f"Invalid surface-normal camera_calibration: {exc}") from exc
     return SurfaceNormalEncodingContract(
-        intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
-        max_neighbor_depth_delta_m=DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M,
+        intrinsics=intrinsics,
+        max_neighbor_depth_delta_m=float(encoding["max_neighbor_depth_delta_m"]),
+        camera_calibration=camera_calibration,
     )
 
 

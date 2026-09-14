@@ -4,10 +4,16 @@ import unittest
 
 import numpy as np
 
+from unitree_lerobot.utils.camera_calibration import (
+    D435I_254322071415_CALIBRATION,
+    calibration_identity,
+)
 from unitree_lerobot.utils.surface_normal_encoding import (
     DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
     PinholeIntrinsics,
+    REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
     encode_surface_normals_rgb,
+    pinhole_intrinsics_from_metadata,
     surface_normals_encoding_metadata,
 )
 
@@ -84,6 +90,23 @@ class SurfaceNormalEncodingTest(unittest.TestCase):
 
         np.testing.assert_array_equal(first, second)
 
+    def test_canonical_scale_spelling_does_not_change_normal_bytes(self):
+        depth = np.full((5, 7), 1000, dtype=np.uint16)
+        depth[2, :] = np.arange(980, 1050, 10, dtype=np.uint16)
+
+        canonical = encode_surface_normals_rgb(
+            depth,
+            scale_m_per_unit=0.001,
+            intrinsics=self.intrinsics,
+        )
+        sdk_reported = encode_surface_normals_rgb(
+            depth,
+            scale_m_per_unit=0.0010000000474974513,
+            intrinsics=self.intrinsics,
+        )
+
+        np.testing.assert_array_equal(canonical, sdk_reported)
+
     def test_missing_depth_and_discontinuities_are_invalid(self):
         depth = np.full((5, 7), 1000, dtype=np.uint16)
         depth[2, 1] = 0
@@ -159,6 +182,39 @@ class SurfaceNormalEncodingTest(unittest.TestCase):
                 "cx": DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480.cx,
                 "cy": DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480.cy,
             },
+        )
+
+    def test_new_d435i_intrinsics_are_named_without_replacing_legacy_default(self):
+        self.assertNotEqual(
+            REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
+            DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+        )
+        self.assertEqual(
+            REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
+            PinholeIntrinsics(
+                width=640,
+                height=480,
+                fx=609.3858642578125,
+                fy=609.4705200195312,
+                cx=325.95001220703125,
+                cy=247.26507568359375,
+            ),
+        )
+
+    def test_calibration_tagged_metadata_round_trips_intrinsics_and_identity(self):
+        identity = calibration_identity(
+            D435I_254322071415_CALIBRATION,
+            source="converter.profile.d435i-254322071415",
+        )
+        metadata = surface_normals_encoding_metadata(
+            intrinsics=REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
+            camera_calibration=identity,
+        )
+
+        self.assertEqual(metadata["camera_calibration"], identity.to_metadata())
+        self.assertEqual(
+            pinhole_intrinsics_from_metadata(metadata["intrinsics"]),
+            REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
         )
 
 

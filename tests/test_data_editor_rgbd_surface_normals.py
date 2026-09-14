@@ -12,6 +12,12 @@ from unittest import mock
 
 import numpy as np
 
+from unitree_lerobot.utils.camera_calibration import D435I_254322071415_CALIBRATION
+from unitree_lerobot.utils.depth_encoding import encode_depth_gray_rgb
+from unitree_lerobot.utils.surface_normal_encoding import (
+    REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
+    encode_surface_normals_rgb,
+)
 
 EDITOR_PATH = Path(__file__).parents[1] / "data_editor" / "data_editor_EN_rgbd.py"
 
@@ -162,6 +168,97 @@ class DataEditorRgbdSurfaceNormalsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.editor.resolve_display_depth_scale(payload, color_only=False)
 
+    def test_editor_canonicalizes_realsense_reported_scale_without_byte_change(self):
+        payload = {
+            "info": {
+                "depth": {
+                    "scale_m_per_unit": 0.001,
+                    "scale_reported_m_per_unit": 0.0010000000474974513,
+                }
+            }
+        }
+        depth = np.array([[0, 250, 625, 1000]], dtype=np.uint16)
+
+        scale = self.editor.resolve_depth_scale_m_per_unit(payload)
+
+        self.assertEqual(scale, 0.001)
+        np.testing.assert_array_equal(
+            self.editor.depth_to_gray_rgb(depth, scale),
+            self.editor.depth_to_gray_rgb(depth, 0.0010000000474974513),
+        )
+
+    def test_randomized_depth_preview_is_byte_exact_with_production_encoder(self):
+        generator = np.random.default_rng(4012)
+        depth = generator.integers(0, 5001, size=(73, 101), dtype=np.uint16)
+        depth[::7, ::11] = 0
+
+        preview = self.editor.depth_to_gray_rgb(
+            depth,
+            0.0010000000474974513,
+        )
+        production = encode_depth_gray_rgb(
+            depth,
+            scale_m_per_unit=0.001,
+            near_m=0.25,
+            far_m=1.0,
+        )
+
+        np.testing.assert_array_equal(preview, production)
+        self.assertGreater(np.unique(preview[..., 0]).size, 100)
+
+    def test_randomized_recorded_k_normals_preview_is_byte_exact_with_production(self):
+        generator = np.random.default_rng(254322071415)
+        y, x = np.indices((480, 640), dtype=np.uint16)
+        depth = (500 + x // 8 + y // 12).astype(np.uint16)
+        depth += generator.integers(0, 3, size=depth.shape, dtype=np.uint16)
+        depth[::53, ::47] = 0
+        intrinsics = self.editor.resolve_surface_normal_intrinsics(
+            {"info": {"depth": {"calibration": D435I_254322071415_CALIBRATION}}}
+        )
+
+        preview = self.editor.aligned_depth_to_surface_normals_rgb(
+            depth,
+            0.0010000000474974513,
+            intrinsics,
+        )
+        production = encode_surface_normals_rgb(
+            depth,
+            scale_m_per_unit=0.001,
+            intrinsics=REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
+        )
+
+        np.testing.assert_array_equal(preview, production)
+        self.assertGreater(np.count_nonzero(preview), 100_000)
+
+    def test_editor_uses_recorded_color_intrinsics_for_normals(self):
+        payload = {
+            "info": {
+                "depth": {"calibration": D435I_254322071415_CALIBRATION}
+            }
+        }
+
+        self.assertEqual(
+            self.editor.resolve_surface_normal_intrinsics(payload),
+            REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
+        )
+        self.assertEqual(
+            self.editor.resolve_surface_normal_intrinsics({}),
+            self.editor.DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+        )
+
+    def test_legacy_inspire_uses_replacement_camera_k_while_dex3_stays_old(self):
+        inspire = {"info": {"end_effector": {"type": "inspire"}, "depth": {}}}
+        dex3 = {"info": {"end_effector": {"type": "dex3"}, "depth": {}}}
+
+        self.assertEqual(
+            self.editor.resolve_surface_normal_intrinsics(inspire),
+            REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
+        )
+        self.assertEqual(
+            self.editor.resolve_surface_normal_intrinsics(dex3),
+            self.editor.DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+        )
+
     def test_derived_view_uses_the_aligned_depth_path_not_raw_depth(self):
         paths = self.editor.resolve_frame_display_paths(
             {
@@ -210,6 +307,9 @@ class DataEditorRgbdSurfaceNormalsTest(unittest.TestCase):
         player.is_playing = False
         player.color_only = False
         player.depth_scale_m_per_unit = 0.001
+        player.surface_normal_intrinsics = (
+            self.editor.DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480
+        )
         player.info_label = mock.Mock()
         player.active_display_streams = player.DISPLAY_STREAMS
         player.image_labels = {key: _Label() for key in player.active_display_streams}
@@ -230,6 +330,7 @@ class DataEditorRgbdSurfaceNormalsTest(unittest.TestCase):
         load_normals.assert_called_once_with(
             "/episode/depths/000007_depth_0.png",
             0.001,
+            self.editor.DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
         )
         self.assertEqual(
             load_depth.call_args_list,
