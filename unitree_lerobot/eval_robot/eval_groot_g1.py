@@ -75,6 +75,7 @@ from unitree_lerobot.eval_robot.voice_command_server import (
     VoiceCommandServer,
     load_voice_session_token,
 )
+from unitree_lerobot.eval_robot.vision_recorder import NonBlockingVisionRecorder
 from unitree_lerobot.utils.depth_encoding import DEPTH_OUTPUT_KEY
 from unitree_lerobot.utils.surface_normal_encoding import SURFACE_NORMAL_OUTPUT_KEY
 
@@ -1750,6 +1751,7 @@ def capture_policy_observation(
     camera_timeout_s: float = 0.5,
     show_camera: bool = False,
     allow_custom_instruction: bool = False,
+    vision_recorder: NonBlockingVisionRecorder | None = None,
 ) -> tuple[dict[str, object], object]:
     if actuator is not None:
         _raise_if_immediate_control(actuator)
@@ -1789,6 +1791,14 @@ def capture_policy_observation(
         allow_custom_instruction=allow_custom_instruction,
         end_effector=getattr(model_contract, "end_effector", "dex3"),
     )
+    if vision_recorder is not None:
+        try:
+            vision_recorder.submit_observation(observation)
+        except Exception:
+            # Recording is observability-only.  Never perform file-backed
+            # logging (or raise) on this timing-critical path: a recorder or
+            # disk failure must not turn a valid observation into backpressure.
+            pass
     return observation, state
 
 
@@ -1805,6 +1815,7 @@ def infer_chunk(
     command_conditioning: str = "none",
     show_camera: bool = False,
     allow_custom_instruction: bool = False,
+    vision_recorder: NonBlockingVisionRecorder | None = None,
 ) -> tuple[ActionChunk, float]:
     while True:
         pause_generation = _hand_pause_generation(actuator)
@@ -1817,6 +1828,7 @@ def infer_chunk(
             camera_timeout_s,
             show_camera,
             allow_custom_instruction,
+            vision_recorder,
         )
         if actuator is not None and _hand_pause_generation(actuator) != pause_generation:
             LOGGER.warning("Discarded observation captured across a hand-feedback pause; recapturing")
@@ -1872,6 +1884,7 @@ def infer_plan(
     command_conditioning: str = "none",
     show_camera: bool = False,
     allow_custom_instruction: bool = False,
+    vision_recorder: NonBlockingVisionRecorder | None = None,
 ) -> tuple[ActionChunk, float]:
     while True:
         pause_generation = _hand_pause_generation(actuator)
@@ -1884,6 +1897,7 @@ def infer_plan(
             camera_timeout_s,
             show_camera,
             allow_custom_instruction,
+            vision_recorder,
         )
         if actuator is not None and _hand_pause_generation(actuator) != pause_generation:
             LOGGER.warning("Discarded observation captured across a hand-feedback pause; recapturing")
@@ -1978,6 +1992,7 @@ def _prepare_policy_goal(
                 command_conditioning=getattr(args, "command_conditioning", "xr"),
                 show_camera=getattr(args, "show_camera", False),
                 allow_custom_instruction=allow_custom_instruction,
+                vision_recorder=getattr(args, "_vision_recorder", None),
             ),
         )
         delta_summary = _run_with_immediate_operator_keys(
@@ -2214,6 +2229,7 @@ def _run_active_goal_controlled(
             command_conditioning=getattr(args, "command_conditioning", "xr"),
             show_camera=getattr(args, "show_camera", False),
             allow_custom_instruction=allow_custom_instruction,
+            vision_recorder=getattr(args, "_vision_recorder", None),
         )
 
         # A command typed during synchronous inference is honored before the
@@ -2473,6 +2489,7 @@ def _run_active_goal_rtc_controlled(
         command_conditioning=getattr(args, "command_conditioning", "xr"),
         show_camera=getattr(args, "show_camera", False),
         allow_custom_instruction=allow_custom_instruction,
+        vision_recorder=getattr(args, "_vision_recorder", None),
     )
     initial_command = _active_command_action(_poll_active_command(terminal))
     if initial_command == "hold":
@@ -2650,6 +2667,7 @@ def _run_active_goal_rtc_controlled(
                         actuator,
                         show_camera=getattr(args, "show_camera", False),
                         allow_custom_instruction=allow_custom_instruction,
+                        vision_recorder=getattr(args, "_vision_recorder", None),
                     )
                     try:
                         post_capture_snapshot = actuator.rtc_snapshot()
@@ -2816,6 +2834,7 @@ def _run_shadow_rtc(
                     contract,
                     show_camera=getattr(args, "show_camera", False),
                     allow_custom_instruction=allow_custom_instruction,
+                    vision_recorder=getattr(args, "_vision_recorder", None),
                 )
                 # Account for virtual actions that elapsed while camera capture
                 # blocked. As in live RTC, the request remains conditioned on
@@ -2925,6 +2944,8 @@ def run(args: argparse.Namespace) -> None:
     state_reader: G1Dex3StateReader | None = None
     actuator: SafeG1Dex3Actuator | None = None
     voice_server: VoiceCommandServer | None = None
+    vision_recorder: NonBlockingVisionRecorder | None = None
+    args._vision_recorder = None
     cleanup_error: Exception | None = None
     try:
         policy = Gr00tClient(args.policy_host, args.policy_port)
@@ -3052,6 +3073,30 @@ def run(args: argparse.Namespace) -> None:
             head.get("binocular"),
             head.get("fps"),
         )
+        if bool(getattr(args, "record_vision", False)):
+            run_log_dir = getattr(args, "_run_log_dir", None)
+            if run_log_dir is None:
+                raise DeploymentError("--record-vision requires the CLI per-run log directory")
+            vision_recording_dir = Path(run_log_dir) / "vision_recording"
+            try:
+                vision_recorder = NonBlockingVisionRecorder(
+                    vision_recording_dir,
+                    contract.video_keys,
+                    metadata={
+                        "end_effector": end_effector,
+                        "execution_horizon": args.execution_horizon,
+                        "image_host": image_host,
+                        "inference_mode": inference_mode,
+                    },
+                )
+            except Exception as exc:
+                raise DeploymentError(f"Could not start policy-vision recording: {exc}") from exc
+            args._vision_recorder = vision_recorder
+            LOGGER.info(
+                "Policy-vision recording enabled at %s (lossless PNG, capacity-one "
+                "drop-new worker; policy-request cadence, no extra camera subscription)",
+                vision_recording_dir,
+            )
 
         # Complete one observation -> server -> validated action pass while no
         # command publisher exists.  This output is deliberately discarded.
@@ -3073,6 +3118,7 @@ def run(args: argparse.Namespace) -> None:
                 allow_custom_instruction=allow_custom_instruction,
                 validate_initial_step=preflight_validation,
                 command_conditioning=getattr(args, "command_conditioning", "xr"),
+                vision_recorder=vision_recorder,
             )
         else:
             preflight, inference_s = infer_chunk(
@@ -3091,6 +3137,7 @@ def run(args: argparse.Namespace) -> None:
                 # executable step checks occur later on final child commands.
                 validate_initial_step=preflight_validation,
                 command_conditioning=getattr(args, "command_conditioning", "xr"),
+                vision_recorder=vision_recorder,
             )
         preflight_label = (
             "Publisher-free raw-contract preflight"
@@ -3141,6 +3188,7 @@ def run(args: argparse.Namespace) -> None:
                     # hard, but there is no actuator child to exercise conditioning.
                     validate_initial_step=False,
                     command_conditioning=getattr(args, "command_conditioning", "xr"),
+                    vision_recorder=vision_recorder,
                 )
                 LOGGER.info(
                     "Shadow chunk %d/%d: inference %.3fs, %s",
@@ -3371,6 +3419,17 @@ def run(args: argparse.Namespace) -> None:
                 camera.close()
             except Exception:
                 LOGGER.exception("Camera cleanup failed")
+        if vision_recorder is not None:
+            try:
+                vision_recorder.close()
+                LOGGER.info(
+                    "Policy-vision recording summary: %s",
+                    getattr(vision_recorder, "stats", "unavailable"),
+                )
+            except Exception:
+                # Robot authority has already been released.  Recording cleanup
+                # remains secondary and must not mask the active/actuator result.
+                LOGGER.exception("Policy-vision recorder cleanup failed after robot release")
         if state_reader is not None:
             state_reader.close()
         if policy is not None:
@@ -3443,6 +3502,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-camera",
         action="store_true",
         help="Show each decoded RGB/depth frame actually placed in the GR00T observation",
+    )
+    parser.add_argument(
+        "--record-vision",
+        action="store_true",
+        help=(
+            "Losslessly record each policy-sampled vision observation in an isolated, "
+            "drop-on-overload worker below the per-run log directory"
+        ),
     )
     parser.add_argument(
         "--network-interface",

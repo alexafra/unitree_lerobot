@@ -180,6 +180,33 @@ Add `--show-camera` to any shadow, simulation, or real command to display each d
 `ego_view` frame actually placed in the GR00T observation. RGBD checkpoints also display
 `depth_gray_view`. Pressing `q` in a preview window stops the runner through normal cleanup.
 
+Add `--record-vision` to save the exact vision arrays constructed for policy-request
+attempts, including publisher-free preflight, Warmup2, and any capture later discarded by
+a safety recapture. The files are written below the per-run log directory in
+`vision_recording/`: each selected video key has lossless PNG frames, `frames.jsonl`
+records the written samples and timestamps, `manifest.json` describes the contract, and
+`summary.json` reports submitted, written, and dropped counts plus writer status. The PNGs
+contain the client's uint8 RGB preprocessor inputs with the leading batch/time axes removed.
+They are not the server's post-crop, resized, or normalized model tensor.
+
+This is policy-request-cadence evidence, **not** a continuous 30 fps camera recording. The
+recorder reuses the observation already built for inference, opens no extra TeleImager
+subscription or network stream, and never recomputes depth or surface normals. Encoding and
+disk I/O run in a low-priority spawned process behind a capacity-one, drop-new queue, so a
+slow disk drops recording samples instead of backpressuring robot processing. This design
+minimizes interference but cannot promise literally zero shared CPU, memory-bandwidth, or
+storage impact; point `--log-dir` at a dedicated disk when that contention matters.
+`--show-camera` is a separate synchronous GUI path, not part of this isolation guarantee;
+avoid it during latency-sensitive actuation. For an uninterrupted live 30 fps stream, use a
+separately qualified external or camera-server-side recorder rather than the robot-control
+client.
+
+This opt-in path is unit-tested but has not yet completed the hardware timing qualification
+required elsewhere in this document. Before using it during real actuation, compare warmed
+recording-off versus recording-on shadow soaks and retain the inference, capture, scheduler,
+drop-count, CPU, memory, and disk results. Process isolation minimizes coupling; it is not a
+claim of zero interference on shared hardware.
+
 Use `--custom-goal "your instruction"` instead of `--task` to send arbitrary language text
 to GR00T. The two flags are mutually exclusive. Custom text may be outside the fine-tuning
 distribution, so a non-matching instruction requires typing exact uppercase `YES` before
@@ -418,6 +445,7 @@ is stated explicitly.
 | `--policy-port PORT` | `5555` | Connect to the GR00T policy server at this TCP port. |
 | `--image-host HOST` | automatic | Connect to TeleImager here; when omitted, use `192.168.123.164` for the robot or `127.0.0.1` with `--sim`. |
 | `--show-camera` | off | Display every decoded RGB and derived depth/normal frame actually sent to GR00T. |
+| `--record-vision` | off | Losslessly record exact policy-request-cadence preprocessor vision arrays below the run's `vision_recording/` directory in an isolated drop-on-overload writer; this is not 30 fps video. |
 | `--network-interface INTERFACE` | unset | Select the CycloneDDS NIC; mandatory for real actuation and forbidden for stock IsaacLab actuation. |
 | `--execution-horizon N` | `8` | Execute or account for `N` 30 Hz actions per chunk/replan interval; `N` must be at least one and no larger than the model horizon. |
 | `--max-chunks N` | `1` | Bound the run to `N` chunks, giving an RTC action budget of `execution_horizon × N`; `N` must be at least one. |
@@ -437,7 +465,7 @@ is stated explicitly.
 | `--actuate` | off | Create command publishers after preflight and confirmation; when omitted, run publisher-free shadow evaluation. |
 | `--allow-unqualified-real` | off | Acknowledge the explicitly unqualified real-hardware path; required for real `--actuate` and ineffective with `--sim`. |
 | `--confirm-sim-network-isolated` | off | Assert that the IsaacLab host cannot reach any physical robot network; required for simulated actuation. |
-| `--log-dir DIR` | `./logs` | Place the new per-run log directory and timing diagnostics under this directory. |
+| `--log-dir DIR` | `./logs` | Place the new per-run log directory, timing diagnostics, and optional `vision_recording/` under this directory. |
 
 The accepted `--task` values are `pick-toothpaste`, `down-toothpaste`,
 `pick-red-cup`, `down-red-cup`, `pick-wooden-block`, `down-wooden-block`,
