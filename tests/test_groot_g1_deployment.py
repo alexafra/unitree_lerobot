@@ -32,6 +32,7 @@ from unitree_lerobot.eval_robot.eval_groot_g1 import (
     _readline_while_armed,
     _run_blocking_motion_with_immediate_release,
     _run_return_to_start_from_hold,
+    _run_return_to_start_sequence_from_hold,
     _select_next_goal_while_holding,
     GOAL_MODE_TOGGLE,
     RETURN_TO_START,
@@ -68,6 +69,7 @@ from unitree_lerobot.eval_robot.groot_contract import (
     load_initialization_spec,
     make_observation,
     parse_action_chunk,
+    validate_initialization_spec,
     validate_model_contract,
     validate_policy_metadata,
     validate_measured_state,
@@ -120,8 +122,13 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     request_live_camera_config,
 )
 from unitree_lerobot.eval_robot.training_start_pose import (
+    DEX3_TRAINING_START_JOINTS_RAD,
+    DEX3_TRAINING_START_SOURCE,
+    INSPIRE_TRAINING_START_JOINTS,
+    INSPIRE_TRAINING_START_SOURCE,
     TRAINING_START_JOINTS_RAD,
     TRAINING_START_SOURCE,
+    training_start_source,
     training_start_spec,
 )
 from unitree_lerobot.utils.depth_encoding import encode_depth_gray_rgb
@@ -351,6 +358,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertFalse(xr_home_without_warmup1.warmup1)
 
     def test_warmup1_pose_is_exact_frozen_episode_zero_frame_zero_state(self):
+        self.assertIs(TRAINING_START_JOINTS_RAD, DEX3_TRAINING_START_JOINTS_RAD)
+        self.assertIs(TRAINING_START_SOURCE, DEX3_TRAINING_START_SOURCE)
+        self.assertEqual(training_start_source(), DEX3_TRAINING_START_SOURCE)
         self.assertEqual(TRAINING_START_JOINTS_RAD.shape, (28,))
         self.assertEqual(TRAINING_START_JOINTS_RAD.dtype, np.float64)
         self.assertFalse(TRAINING_START_JOINTS_RAD.flags.writeable)
@@ -365,7 +375,10 @@ class GrootG1DeploymentTests(unittest.TestCase):
         )
 
         spec = training_start_spec()
+        # Preserve the existing Dex3 pose-file mode for zero_state_test and
+        # other callers that deliberately route this target through initialize.
         self.assertEqual(spec.mode, "pose-file")
+        self.assertEqual(spec.end_effector, "dex3")
         self.assertIn("episode 0 frame 0", spec.label)
         np.testing.assert_array_equal(spec.arm, TRAINING_START_JOINTS_RAD[:14])
         np.testing.assert_array_equal(spec.left_hand, TRAINING_START_JOINTS_RAD[14:21])
@@ -375,6 +388,112 @@ class GrootG1DeploymentTests(unittest.TestCase):
         assert spec.arm is not None
         spec.arm[0] = 0.0
         self.assertEqual(training_start_spec().arm[0], TRAINING_START_JOINTS_RAD[0])
+
+    def test_inspire_warmup1_pose_is_exact_frozen_training_start_medoid(self):
+        expected = np.array(
+            [
+                -0.5636061429977417,
+                0.28611138463020325,
+                0.2579364776611328,
+                1.2384618520736694,
+                -0.052682653069496155,
+                -0.8750162124633789,
+                -0.1916637122631073,
+                -0.5884613990783691,
+                -0.10392720252275467,
+                -0.32727721333503723,
+                1.2397561073303223,
+                0.1675993949174881,
+                -1.0738584995269775,
+                0.4185490608215332,
+                0.7570000290870667,
+                0.8569999933242798,
+                0.925000011920929,
+                0.9210000038146973,
+                0.9990000128746033,
+                0.7699999809265137,
+                0.5989999771118164,
+                0.6769999861717224,
+                0.7549999952316284,
+                0.796999990940094,
+                0.875,
+                0.40799999237060547,
+            ],
+            dtype=np.float64,
+        )
+        np.testing.assert_array_equal(INSPIRE_TRAINING_START_JOINTS, expected)
+        self.assertEqual(INSPIRE_TRAINING_START_JOINTS.shape, (26,))
+        self.assertEqual(INSPIRE_TRAINING_START_JOINTS.dtype, np.float64)
+        self.assertFalse(INSPIRE_TRAINING_START_JOINTS.flags.writeable)
+        self.assertTrue(
+            INSPIRE_TRAINING_START_SOURCE["dataset_path"].endswith(
+                "inspire_pick_place_red_cup_08_13/train"
+            )
+        )
+        self.assertEqual(INSPIRE_TRAINING_START_SOURCE["episode_index"], 56)
+        self.assertEqual(INSPIRE_TRAINING_START_SOURCE["split_episode"], "episode_0057")
+        self.assertEqual(INSPIRE_TRAINING_START_SOURCE["source_episode"], "episode_0079")
+        self.assertEqual(
+            INSPIRE_TRAINING_START_SOURCE["data_json_sha256"],
+            "9a8776c3c3767689392cfe063df40174c603038403a67878b8f034e26fdc7eb5",
+        )
+        self.assertEqual(INSPIRE_TRAINING_START_SOURCE["frame_index"], 0)
+        self.assertEqual(INSPIRE_TRAINING_START_SOURCE["timestamp_s"], 0.0)
+        self.assertEqual(INSPIRE_TRAINING_START_SOURCE["task"], "pick up the red cup.")
+        self.assertEqual(
+            training_start_source("inspire-ftp"),
+            INSPIRE_TRAINING_START_SOURCE,
+        )
+        self.assertEqual(
+            training_start_source("inspire-dfx"),
+            INSPIRE_TRAINING_START_SOURCE,
+        )
+
+        for profile in ("inspire-ftp", "inspire-dfx"):
+            with self.subTest(profile=profile):
+                spec = training_start_spec(profile)
+                self.assertEqual(spec.mode, "training-start")
+                self.assertEqual(spec.end_effector, profile)
+                self.assertIn("episode 56 frame 0", spec.label)
+                np.testing.assert_array_equal(spec.arm, expected[:14])
+                np.testing.assert_array_equal(spec.left_hand, expected[14:20])
+                np.testing.assert_array_equal(spec.right_hand, expected[20:])
+
+        # The two runtime profiles share semantics but receive independent
+        # arrays so one run cannot mutate another run's reviewed target.
+        ftp = training_start_spec("inspire-ftp")
+        assert ftp.left_hand is not None
+        ftp.left_hand[0] = 0.0
+        self.assertEqual(
+            training_start_spec("inspire-dfx").left_hand[0],
+            INSPIRE_TRAINING_START_JOINTS[14],
+        )
+
+    def test_inspire_training_start_is_accepted_only_by_the_internal_warmup_path(self):
+        spec = training_start_spec("inspire-ftp")
+        with self.assertRaisesRegex(DeploymentError, "Unsupported initialization mode"):
+            validate_initialization_spec(spec)
+        validate_initialization_spec(spec, allow_training_start=True)
+
+        measured = RobotState(
+            captured_at=1.0,
+            mode_machine=5,
+            arm=np.zeros(14),
+            arm_dq=np.zeros(14),
+            left_hand=np.ones(6),
+            right_hand=np.ones(6),
+        )
+        with self.assertRaisesRegex(DeploymentError, "Unsupported initialization mode"):
+            build_initialization_chunk(measured, spec)
+        chunk = build_initialization_chunk(
+            measured,
+            spec,
+            allow_training_start=True,
+        )
+        self.assertEqual(chunk.end_effector, "inspire-ftp")
+        np.testing.assert_array_equal(chunk.arm[-1], spec.arm)
+        np.testing.assert_array_equal(chunk.left_hand[-1], spec.left_hand)
+        np.testing.assert_array_equal(chunk.right_hand[-1], spec.right_hand)
 
     def test_custom_goal_is_validated_and_mutually_exclusive_with_trained_task(self):
         parser = build_parser()
@@ -1191,7 +1310,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
         self.assertEqual(mode_calls, [(True, True, False)])
 
-    def test_warmup2_routing_is_independent_and_startup_stages_run_once(self):
+    def test_warmup2_routing_is_independent_and_return_replays_selected_startup_stages(self):
         events = []
         warmup_specs = []
 
@@ -1305,18 +1424,22 @@ class GrootG1DeploymentTests(unittest.TestCase):
                     # --future-goal-warmup2, which is disabled in this test.
                     [True, returned_to_start],
                 )
-                self.assertEqual(confirm_return_to_start.call_count, int(returned_to_start))
+                self.assertEqual(
+                    confirm_return_to_start.call_count,
+                    int(returned_to_start) * (1 + int(warmup1_enabled)),
+                )
                 self.assertEqual(events.count("actuator.initialize"), 1)
                 self.assertEqual(events.count("actuator.hold"), 2)
-                self.assertEqual(
-                    len(warmup_specs),
-                    int(warmup1_enabled) + int(returned_to_start),
-                )
-                if warmup_specs:
-                    expected = (
-                        TRAINING_START_JOINTS_RAD[:14] if warmup1_enabled else np.zeros(14)
-                    )
-                    np.testing.assert_array_equal(warmup_specs[-1].arm, expected)
+                expected_arms = []
+                if warmup1_enabled:
+                    expected_arms.append(TRAINING_START_JOINTS_RAD[:14])
+                if returned_to_start:
+                    expected_arms.append(np.zeros(14))
+                    if warmup1_enabled:
+                        expected_arms.append(TRAINING_START_JOINTS_RAD[:14])
+                self.assertEqual(len(warmup_specs), len(expected_arms))
+                for actual, expected in zip(warmup_specs, expected_arms, strict=True):
+                    np.testing.assert_array_equal(actual.arm, expected)
 
     def test_shadow_skips_initial_step_validation_for_every_chunk_but_measured_live_keeps_it(self):
         class StopAfterPreflight(Exception):
@@ -2394,6 +2517,65 @@ class GrootG1DeploymentTests(unittest.TestCase):
             _run_return_to_start_from_hold(actuator, spec)
 
         actuator.request_immediate_release.assert_not_called()
+
+    def test_return_to_start_sequence_orders_start_then_warmup1_with_one_final_visual_gate(self):
+        start = load_initialization_spec("xr-home", task_name="pick-red-cup")
+        warmup1 = training_start_spec()
+        actuator = object()
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+
+        with mock.patch(
+            f"{module}._run_return_to_start_from_hold",
+            side_effect=("continue", "continue"),
+        ) as run_stage:
+            self.assertEqual(
+                _run_return_to_start_sequence_from_hold(
+                    actuator,
+                    (start, warmup1),
+                ),
+                "continue",
+            )
+
+        self.assertEqual(
+            run_stage.call_args_list,
+            [
+                mock.call(
+                    actuator,
+                    start,
+                    require_final_visual_check=False,
+                ),
+                mock.call(
+                    actuator,
+                    warmup1,
+                    require_final_visual_check=True,
+                ),
+            ],
+        )
+
+    def test_return_to_start_sequence_stops_before_later_stages_on_hold_or_release(self):
+        start = load_initialization_spec("xr-home", task_name="pick-red-cup")
+        warmup1 = training_start_spec()
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+
+        for outcome in ("hold", "release"):
+            with (
+                self.subTest(outcome=outcome),
+                mock.patch(
+                    f"{module}._run_return_to_start_from_hold",
+                    return_value=outcome,
+                ) as run_stage,
+            ):
+                self.assertEqual(
+                    _run_return_to_start_sequence_from_hold(
+                        object(),
+                        (start, warmup1),
+                    ),
+                    outcome,
+                )
+                run_stage.assert_called_once()
+
+        with self.assertRaisesRegex(DeploymentError, "no fixed startup pose"):
+            _run_return_to_start_sequence_from_hold(object(), ())
 
     def test_held_goal_selector_services_heartbeat_and_rejects_unconfirmed_custom_text(self):
         actuator = SimpleNamespace(

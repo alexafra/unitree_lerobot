@@ -243,6 +243,14 @@ def test_ftp_profile_contract_and_explicit_live_gate():
         validate_policy_metadata(_metadata(protocol="dfx"), end_effector="inspire-ftp")
 
     parser = build_parser()
+    # Both Inspire profiles now have the same reviewed 26D training-start
+    # Warmup1 target, so the default-on Warmup1 is valid in shadow mode.
+    for profile in ("inspire-ftp", "inspire-dfx"):
+        validate_args(
+            parser.parse_args(
+                ["--task", "pick-red-cup", "--end-effector", profile]
+            )
+        )
     shadow = parser.parse_args(
         ["--task", "pick-red-cup", "--end-effector", "inspire-ftp", "--no-warmup1"]
     )
@@ -379,6 +387,11 @@ def test_ftp_xr_home_and_return_to_start_are_profile_aware():
     with pytest.raises(DeploymentError, match="requires.*xr-home"):
         validate_args(parser.parse_args(common))
     validate_args(parser.parse_args([*common, "--initialization", "xr-home"]))
+    # The requested production chain uses the now-reviewed, default-on
+    # Inspire Warmup1 between XR-home and Warmup2.
+    default_warmup_chain = [*common, "--initialization", "xr-home"]
+    default_warmup_chain.remove("--no-warmup1")
+    validate_args(parser.parse_args(default_warmup_chain))
 
 
 def test_missing_ftp_sdk_fails_before_parent_dds_initialization():

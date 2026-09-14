@@ -662,7 +662,8 @@ robot. At RUN press Ctrl-C instead of `r`, so no policy action is executed.
 - [ ] Ctrl-C releases cleanly.
 
 Do not use XR-home for a put-down task while holding an object; it explicitly targets both
-hands to zero and can release or disturb the object.
+hands to their profile home (Dex3 zero; Inspire normalized one/fully open) and can release
+or disturb the object.
 
 ---
 
@@ -674,9 +675,12 @@ frame-zero poses are task-dependent and materially different from joint zero. Do
 
 Before the first policy action, establish a task-valid start by one of these routes:
 
-1. Preferred: export and review one real training episode's frame-zero pose, then use
+1. Use the checked-in, profile-specific `--warmup1` target when its documented source and
+   empty-hand staging condition match the run. Inspire uses one reviewed complete 26D
+   training-start frame; arbitrary Inspire pose files remain prohibited.
+2. For Dex3, export and review one real training episode's frame-zero pose, then use
    `--initialization pose-file --initial-pose-file "$INITIAL_POSE_FILE"`.
-2. Manually establish and independently verify an approved task-start pose, then use
+3. Manually establish and independently verify an approved task-start pose, then use
    `--initialization measured` so the client acquires authority without changing it.
 
 For a pose file:

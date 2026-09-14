@@ -67,7 +67,7 @@ from unitree_lerobot.eval_robot.robot_control.g1_inspire_ftp import (
     require_inspire_ftp_sdk,
 )
 from unitree_lerobot.eval_robot.training_start_pose import (
-    TRAINING_START_SOURCE,
+    training_start_source,
     training_start_spec,
 )
 from unitree_lerobot.eval_robot.voice_command_server import (
@@ -819,10 +819,6 @@ def validate_args(args: argparse.Namespace) -> None:
             raise DeploymentError(
                 f"{end_effector} supports --initialization measured or the explicit fully-open xr-home"
             )
-        if bool(getattr(args, "warmup1", False)):
-            raise DeploymentError(
-                f"{end_effector} has no reviewed training-frame Warmup1 pose; pass --no-warmup1"
-            )
         if args.actuate and getattr(args, "command_conditioning", "xr") != "xr":
             raise DeploymentError(
                 f"{end_effector} actuation requires --command-conditioning xr so the authorized "
@@ -1442,16 +1438,21 @@ def confirm_return_to_start(
     warning = (
         f"\nRETURN TO START WILL MOVE THE ROBOT toward {spec.label!r}. "
         "This is a slow bounded joint-space path, not collision-aware planning. "
-        "It reuses the startup target without rerunning authority acquisition or the "
-        "one-time initialization/Warmup1 protocol stages. Keep the workspace clear and "
-        "remain on the emergency stop."
+        "It replays one selected startup-pose stage while keeping the existing command "
+        "authority; it does not reacquire authority or run policy inference. Keep the "
+        "workspace clear and remain on the emergency stop."
     )
     if spec.moves_hands:
-        if spec.end_effector != "dex3":
+        if spec.end_effector != "dex3" and spec.mode == "xr-home":
             warning += (
                 " This target opens both Inspire hands and can drop held objects; both hands must be empty. "
-                "After the move, a second r gate requires visual confirmation because Inspire hand "
-                "convergence is not software-verified."
+                "Visually check them at the next displayed gate because Inspire hand convergence "
+                "is not software-verified."
+            )
+        elif spec.end_effector != "dex3":
+            warning += (
+                " This reviewed Inspire training-start target explicitly moves all six channels of "
+                "both hands. Both hands must be empty. Hand convergence is not software-verified."
             )
         else:
             warning += " This target explicitly moves both Dex3 hands; verify their contents."
@@ -1485,6 +1486,8 @@ def confirm_return_to_start_complete(
 def _run_return_to_start_from_hold(
     actuator: SafeG1Dex3Actuator,
     spec: InitializationSpec,
+    *,
+    require_final_visual_check: bool = True,
 ) -> str:
     """Run a confirmed return transition while preserving feedback-triggered HOLD."""
 
@@ -1512,9 +1515,9 @@ def _run_return_to_start_from_hold(
         lambda: actuator.warmup_pose(spec),
         stage="RETURN-TO-START",
     )
-    if _hand_convergence_is_software_verified(spec.end_effector):
+    if _hand_convergence_is_software_verified(spec.end_effector) or not require_final_visual_check:
         LOGGER.warning(
-            "Returned to startup target %r; remaining in powered HOLD",
+            "Completed Return-to-Start stage %r; remaining in powered HOLD",
             spec.label,
         )
         return "continue"
@@ -1525,6 +1528,25 @@ def _run_return_to_start_from_hold(
         spec.label,
     )
     return confirm_return_to_start_complete(actuator, spec)
+
+
+def _run_return_to_start_sequence_from_hold(
+    actuator: SafeG1Dex3Actuator,
+    specs: tuple[InitializationSpec, ...],
+) -> str:
+    """Replay each selected fixed startup pose, preserving one final visual gate."""
+
+    if not specs:
+        raise DeploymentError("Return-to-Start has no fixed startup pose to replay")
+    for index, spec in enumerate(specs):
+        decision = _run_return_to_start_from_hold(
+            actuator,
+            spec,
+            require_final_visual_check=index == len(specs) - 1,
+        )
+        if decision != "continue":
+            return decision
+    return "continue"
 
 
 def confirm_initialization(
@@ -1554,10 +1576,14 @@ def confirm_initialization(
                 "both hands must be empty."
             )
     elif stage == "WARMUP1":
+        profile = get_end_effector_profile(spec.end_effector)
+        task_description = (
+            "cereal-box-pick" if spec.end_effector == "dex3" else "red-cup-pick"
+        )
         warning += (
-            " Warmup1 commands all 14 arms and both 7-joint hands from one recorded "
-            "cereal-box-pick frame. Both hands must be empty. It does not reproduce the "
-            "recorded legs, waist, pelvis height, or world pose."
+            f" Warmup1 commands all 14 arms and both {profile.hand_dof}-channel hands from "
+            f"one recorded {task_description} frame. Both hands must be empty. It does not "
+            "reproduce the recorded legs, waist, pelvis height, world pose, or object layout."
         )
     elif spec.moves_hands:
         warning += " This pose explicitly moves one or both hands; verify their contents."
@@ -2884,9 +2910,14 @@ def run(args: argparse.Namespace) -> None:
         end_effector=runtime_end_effector,
     )
     warmup1_enabled = bool(getattr(args, "warmup1", False))
-    warmup1 = training_start_spec() if warmup1_enabled else None
+    warmup1 = training_start_spec(runtime_end_effector) if warmup1_enabled else None
+    warmup1_source = training_start_source(runtime_end_effector) if warmup1_enabled else None
     return_to_start_enabled = bool(getattr(args, "return_to_start", False))
-    return_to_start_spec = warmup1 if warmup1 is not None else configured_initialization
+    return_to_start_specs = tuple(
+        spec
+        for spec in (configured_initialization, warmup1)
+        if spec is not None and spec.moves
+    )
     image_host = args.image_host or ("127.0.0.1" if args.sim else "192.168.123.164")
 
     policy: Gr00tClient | None = None
@@ -3182,6 +3213,7 @@ def run(args: argparse.Namespace) -> None:
             )
         if warmup1_enabled:
             assert warmup1 is not None
+            assert warmup1_source is not None
             confirm_initialization(actuator, warmup1, stage="WARMUP1")
             _run_blocking_motion_with_immediate_release(
                 actuator,
@@ -3189,10 +3221,11 @@ def run(args: argparse.Namespace) -> None:
                 stage="WARMUP1",
             )
             LOGGER.warning(
-                "Warmup1 completed: %s (source episode=%d frame=%d)",
+                "Warmup1 completed: %s (converted episode=%s source episode=%s frame=%s)",
                 warmup1.label,
-                TRAINING_START_SOURCE["episode_index"],
-                TRAINING_START_SOURCE["frame_index"],
+                warmup1_source["episode_index"],
+                warmup1_source.get("source_episode", warmup1_source["episode_index"]),
+                warmup1_source["frame_index"],
             )
         confirm_policy_start(
             actuator,
@@ -3208,8 +3241,9 @@ def run(args: argparse.Namespace) -> None:
         # discarded. Every initial or replacement goal resets and re-observes.
         # Warmup2 is governed by --warmup2 for the first goal and for the next
         # goal after an explicit Return-to-Start reset. Direct replacement goals
-        # use the independent --future-goal-warmup2 setting. None repeats
-        # initialization or Warmup1.
+        # use the independent --future-goal-warmup2 setting. Return-to-Start
+        # replays the selected fixed initialization and Warmup1 poses while the
+        # actuator remains armed; direct replacement goals replay neither.
         if sys.stdin.isatty():
             print(
                 "\nACTIVE GOAL CONTROLS (NO ENTER): press s to STOP in a powered position hold; "
@@ -3304,7 +3338,10 @@ def run(args: argparse.Namespace) -> None:
                         acknowledge()
                 if next_goal != RETURN_TO_START:
                     break
-                decision = _run_return_to_start_from_hold(actuator, return_to_start_spec)
+                decision = _run_return_to_start_sequence_from_hold(
+                    actuator,
+                    return_to_start_specs,
+                )
                 if decision == "release":
                     next_goal = None
                     break
@@ -3471,8 +3508,8 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "After initialization, slowly move once to the frozen measured pose from training "
-            "episode 0 frame 0 before policy inference (default: enabled)"
+            "After initialization, slowly move to one frozen measured training-start pose for "
+            "the selected hand profile before policy inference (default: enabled)"
         ),
     )
     parser.add_argument(
@@ -3496,7 +3533,7 @@ def build_parser() -> argparse.ArgumentParser:
             "For each direct replacement goal that does not follow Return-to-Start, perform "
             "the guarded Warmup2 first-target transition before live execution (default: "
             "enabled). Explicit Return-to-Start resets follow --warmup2 instead; initialization "
-            "and Warmup1 are never repeated"
+            "and Warmup1 are repeated only by explicit Return-to-Start"
         ),
     )
     parser.add_argument(
@@ -3504,9 +3541,9 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Offer Shift+Tab in powered HOLD to repeat Warmup1 when enabled, otherwise the "
-            "explicit xr-home/pose-file initialization target (default: disabled); it is "
-            "invalid with --no-warmup1 --initialization measured. Inspire requires xr-home"
+            "Offer Shift+Tab in powered HOLD to replay the fixed initialization target and then "
+            "Warmup1 when enabled (default: disabled); the next selected goal follows Warmup2. "
+            "It is invalid with --no-warmup1 --initialization measured. Inspire requires xr-home"
         ),
     )
     parser.add_argument(

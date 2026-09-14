@@ -111,6 +111,10 @@ ARM_DOF = 14
 HAND_DOF = DEX3_PROFILE.hand_dof
 CONTROL_HZ = 30.0
 INITIALIZATION_MODES = ("measured", "xr-home", "pose-file")
+# Internal-only mode used for a checked-in, reviewed demonstrated pose. It is
+# deliberately absent from INITIALIZATION_MODES so argparse and public
+# pose-file initialization cannot select it.
+TRAINING_START_MODE = "training-start"
 INITIAL_POSE_SCHEMA_VERSION = 1
 
 # Inspire hands hang slightly lower than Dex3 at the historical all-zero XR
@@ -792,9 +796,13 @@ def validate_initialization_spec(
     spec: InitializationSpec,
     *,
     allow_policy_warm_start: bool = False,
+    allow_training_start: bool = False,
 ) -> None:
     profile = _end_effector_profile(spec.end_effector)
-    if spec.mode not in INITIALIZATION_MODES:
+    allowed_modes = INITIALIZATION_MODES
+    if allow_training_start:
+        allowed_modes = (*allowed_modes, TRAINING_START_MODE)
+    if spec.mode not in allowed_modes:
         raise DeploymentError(f"Unsupported initialization mode {spec.mode!r}")
     if not isinstance(spec.label, str) or not spec.label.strip() or len(spec.label) > 120:
         raise DeploymentError("Initialization label must be a non-empty string of at most 120 characters")
@@ -829,14 +837,17 @@ def validate_initialization_spec(
                         f"{profile.name} XR-home {name} target must be exactly {semantics}"
                     )
             return
-        if not allow_policy_warm_start or spec.mode != "pose-file":
+        policy_warm_start = allow_policy_warm_start and spec.mode == "pose-file"
+        training_start = allow_training_start and spec.mode == TRAINING_START_MODE
+        if not policy_warm_start and not training_start:
             raise DeploymentError(
                 f"{profile.name} accepts measured initialization, its explicit XR-home, and the "
-                "internal validated policy Warmup2 transition"
+                "internal validated policy Warmup2 or reviewed training-start transition"
             )
         if spec.arm is None or spec.left_hand is None or spec.right_hand is None:
+            transition = "training-start" if training_start else "policy Warmup2"
             raise DeploymentError(
-                f"{profile.name} policy Warmup2 requires explicit arm and both-hand targets"
+                f"{profile.name} {transition} requires explicit arm and both-hand targets"
             )
         inspire_targets = (
             ("arm", spec.arm, ARM_DOF, ARM_LOWER, ARM_UPPER, ARM_JOINT_NAMES, JOINT_LIMIT_MARGIN_RAD, "rad"),
@@ -890,11 +901,18 @@ def validate_initialization_spec(
         ):
             if target is None or not np.array_equal(np.asarray(target), np.zeros(size)):
                 raise DeploymentError(f"XR-home {name} target must be exactly joint zero")
-    if spec.mode == "pose-file":
+    if spec.mode == TRAINING_START_MODE:
+        if any(target is None for target in (spec.arm, spec.left_hand, spec.right_hand)):
+            raise DeploymentError(
+                "Training-start initialization requires explicit arm and both-hand targets"
+            )
+    elif spec.mode == "pose-file":
         if spec.arm is None:
             raise DeploymentError("Pose-file initialization requires an explicit arm target")
         if (spec.left_hand is None) != (spec.right_hand is None):
-            raise DeploymentError("Pose-file initialization must preserve both hands or explicitly target both")
+            raise DeploymentError(
+                "Pose-file initialization must preserve both hands or explicitly target both"
+            )
     targets = (
         (
             "arm",

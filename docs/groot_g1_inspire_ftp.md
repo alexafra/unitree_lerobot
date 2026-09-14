@@ -89,7 +89,7 @@ cd /home/alex/Development/unitree_lerobot
   --image-host 192.168.123.164 \
   --network-interface enp132s0 \
   --initialization xr-home \
-  --no-warmup1 \
+  --warmup1 \
   --warmup2 \
   --future-goal-warmup2 \
   --return-to-start \
@@ -120,12 +120,40 @@ middleware call returned `True`; it is not an acknowledgement from the bridge
 or physical hand.
 
 `xr-home` uses an Inspire-specific staging pose: shoulders and wrists remain at
-joint zero, both elbows target `-0.10 rad` to raise the lower Inspire hands
+joint zero, both elbows target `-0.15 rad` to raise the lower Inspire hands
 slightly, and both hands are all one (fully open). The move follows a bounded
 interpolation, but it can drop an object. Both hands must be empty.
-Return-to-Start is allowed for Inspire only when this fixed `xr-home` target was
-selected. Warmup1 remains disabled because the Dex3 training-frame pose is not
-an FTP pose.
+
+Warmup1 is profile-aware. For either Inspire transport it uses one complete,
+real 26D `observation.state` row rather than reusing the 28D Dex3 target or
+assembling a per-joint mean/median. The frozen source is converted training
+episode 56, frame 0, from
+`/home/alex/Development/Datasets/lerobot2/inspire_pick_place_red_cup_08_13/train`
+(converted timestamp `0.0`; original processed-raw `episode_0079`, frame 0,
+task `pick up the red cup.`).
+That row was the whole-frame medoid of the 109 training-episode starts and its
+recorded image shows both hands empty. It is still a joint-space target, not a
+collision-aware plan, and it does not reproduce the recorded legs, waist,
+pelvis height, object placement, or world pose. In particular, it is an
+empty-hand pick start and does not recreate the put demonstrations' cup-held
+right-hand condition.
+
+With the options shown above, startup is an explicit pose chain: guarded
+`xr-home`, guarded Inspire Warmup1, RUN, then (when enabled) a fresh inferred
+Warmup2 target followed by CONTINUE and a fresh strict inference. Each moving
+stage retains its displayed operator gate. Inspire endpoint completion verifies
+the arm target and DDS submission, not physical hand convergence, so the
+displayed visual hand checks remain required.
+
+`--return-to-start` replays that same enabled fixed pose chain instead of
+shortcutting directly to its last target. With `--initialization xr-home
+--warmup1`, Shift+Tab therefore moves to XR-home first and then to the Inspire
+Warmup1 target, with a separate pre-motion confirmation for each stage and one
+post-chain Inspire hand visual check. The next selected goal then follows
+`--warmup2` when enabled. Inspire Return-to-Start deliberately requires the
+fixed `xr-home` initialization even when Warmup1 is enabled; measured
+initialization is not accepted for this workflow. Return-to-Start never
+reacquires command authority and never reuses an old policy result.
 
 ## Stop and feedback limitations
 
@@ -153,18 +181,19 @@ bridge or device acceptance. The physical emergency stop remains the
 authoritative stop mechanism.
 
 There is no qualified Inspire hand tracking-error threshold. Initialization,
-Warmup2, and Return-to-Start completion therefore means the arm endpoint and
-stability dwell passed while valid hand DDS callbacks continued and the hand
-target was submitted; it does **not** mean the hands were observed to reach the
-target. After initialization and Warmup2, the existing `r` gate explicitly
-requires visual confirmation of both hands. Return-to-Start has an additional
-post-motion `r` gate for the same check. Press `s` at a post-motion gate if
-either hand did not reach the displayed target; press `q` to release authority.
+Warmup1, Warmup2, and each Return-to-Start stage completion therefore mean the
+arm endpoint and stability dwell passed while valid hand DDS callbacks
+continued and the hand target was submitted; they do **not** mean the hands
+were observed to reach the target. After the startup pose chain and Warmup2,
+the existing `r` gates explicitly require visual confirmation of both hands. A
+Return-to-Start chain has one additional post-chain `r` gate for the same check.
+Press `s` at a post-motion gate if either hand did not reach the displayed
+target; press `q` to release authority.
 
 At each displayed gate, `r` advances, `s` stays in or enters powered HOLD, and
 `q` starts orderly release. During the subsequent blocking startup,
-initialization, Warmup2, or Return-to-Start motion, `s` and `q` both cancel by
-starting orderly release: the client cannot service the powered-HOLD barrier
-until that blocking transition returns. During active policy motion, `s`
+initialization, Warmup1, Warmup2, or Return-to-Start motion, `s` and `q` both
+cancel by starting orderly release: the client cannot service the powered-HOLD
+barrier until that blocking transition returns. During active policy motion, `s`
 instead discards timed work and enters powered HOLD. These software keys do not
 replace the physical emergency stop.

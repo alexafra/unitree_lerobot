@@ -1413,13 +1413,18 @@ def build_initialization_chunk(
     spec: InitializationSpec,
     *,
     allow_policy_warm_start: bool = False,
+    allow_training_start: bool = False,
     speed_scale: float = 1.0,
 ) -> ActionChunk:
     """Resolve measured targets and create a bounded smooth joint-space path."""
 
     if not np.isfinite(speed_scale) or not 0.0 < speed_scale <= 1.0:
         raise ValueError("speed_scale must be finite and in (0, 1]")
-    validate_initialization_spec(spec, allow_policy_warm_start=allow_policy_warm_start)
+    validate_initialization_spec(
+        spec,
+        allow_policy_warm_start=allow_policy_warm_start,
+        allow_training_start=allow_training_start,
+    )
     profile = get_end_effector_profile(spec.end_effector)
     validate_measured_state(
         state.arm,
@@ -1446,8 +1451,8 @@ def build_initialization_chunk(
 
     if profile.name != "dex3":
         # This path is used by the explicit profile XR-home and by the internal
-        # Warmup2 transition after a same-profile policy chunk passed hard
-        # range validation. Both share the final Inspire writer's step ceiling.
+        # reviewed training-start/Warmup2 transitions. All share the final
+        # Inspire writer's step ceiling.
         assert spec.arm is not None and spec.left_hand is not None and spec.right_hand is not None
         assert profile.conditioned_step is not None
         targets = (
@@ -1492,7 +1497,7 @@ def build_initialization_chunk(
         duration_s = steps / PUBLISH_HZ
         if duration_s > INITIALIZATION_MAX_DURATION_S:
             raise DeploymentError(
-                f"{profile.name} initialization/Warmup2 path needs {duration_s:.1f}s; "
+                f"{profile.name} guarded pose path needs {duration_s:.1f}s; "
                 f"INITIALIZATION_MAX_DURATION_S={INITIALIZATION_MAX_DURATION_S:.1f}s"
             )
         chunk = ActionChunk(
@@ -4897,7 +4902,11 @@ def _actuator_main(
                         left_hand=backend._left_target.copy(),
                         right_hand=backend._right_target.copy(),
                     )
-                    warmup_pose_chunk = build_initialization_chunk(command_start, warmup_pose)
+                    warmup_pose_chunk = build_initialization_chunk(
+                        command_start,
+                        warmup_pose,
+                        allow_training_start=True,
+                    )
                     _status(
                         status_queue,
                         "warmup_pose_started",
@@ -6278,7 +6287,7 @@ class SafeG1Dex3Actuator:
             raise DeploymentError(
                 "Guarded warmup pose requires initialized HOLD with no chunk in flight"
             )
-        validate_initialization_spec(spec)
+        validate_initialization_spec(spec, allow_training_start=True)
         self._wait_for_hand_feedback()
         self.heartbeat()
         try:

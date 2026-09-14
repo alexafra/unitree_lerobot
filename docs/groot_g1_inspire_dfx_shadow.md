@@ -64,7 +64,7 @@ cd /home/alex/Development/unitree_lerobot
   --image-host 192.168.123.164 \
   --network-interface enp132s0 \
   --initialization xr-home \
-  --no-warmup1 \
+  --warmup1 \
   --warmup2 \
   --future-goal-warmup2 \
   --return-to-start \
@@ -94,18 +94,26 @@ laboratory choices, not manufacturer-qualified limits or safety certification.
    refreshed throughout ramp and settle so DFX's roughly one-second lease does
    not expire.
 6. The command above explicitly selects the Inspire XR-home staging pose:
-   shoulders and wrists remain at joint zero, both elbows target `-0.10 rad` to
+   shoulders and wrists remain at joint zero, both elbows target `-0.15 rad` to
    raise the hands slightly, and all six normalized channels of each hand are
    one (fully open). The guarded client interpolates to it instead of issuing a
    discontinuous startup command. It can drop an object, so both hands must be
    empty. `--initialization measured` remains the default no-home-motion
    alternative.
-7. Warmup1 is disabled because there is no reviewed 26D training-frame home. At
-   INITIALIZE, RUN, and WARMUP2, `r` advances after inspection. Because no
-   qualified Inspire hand tracking-error threshold exists, endpoint completion
-   verifies arm convergence only: the hand target was submitted, but hand
-   convergence is not software-verified. Visually confirm both hands at RUN and
-   CONTINUE. Return-to-Start adds a post-motion `r` visual-confirmation gate.
+7. Warmup1 is profile-aware and uses a reviewed complete 26D Inspire training
+   observation, not the 28D Dex3 target or a synthetic per-joint average. Its
+   exact source is converted training episode 56, frame 0, from
+   `/home/alex/Development/Datasets/lerobot2/inspire_pick_place_red_cup_08_13/train`
+   (converted timestamp `0.0`; original processed-raw `episode_0079`, frame 0, task
+   `pick up the red cup.`). It was selected as the whole-frame medoid of all 109
+   training-episode starts, and its recorded image shows both hands empty. It
+   does not recreate legs, waist, pelvis height, object placement, or world
+   pose, and it does not reproduce a put demonstration's cup-held start.
+8. At INITIALIZE, WARMUP1, RUN, and WARMUP2, `r` advances after inspection.
+   Because no qualified Inspire hand tracking-error threshold exists, endpoint
+   completion verifies arm convergence only: the hand target was submitted, but
+   hand convergence is not software-verified. Visually confirm both hands at RUN
+   and CONTINUE. Return-to-Start adds one post-chain `r` visual-confirmation gate.
    Warmup2 moves only toward target zero of a fresh policy chunk, discards it,
    then resets and re-observes for ordinary execution.
 
@@ -153,19 +161,23 @@ and DDS write success. Arm tracking remains hard-gated by the existing client.
 - During policy motion, `s` discards timed work and enters a powered 100 Hz
   position HOLD at the last commanded arm/hand targets. It is not a passive
   brake and can continue exerting force. A newly selected goal is freshly
-  inferred; initialization and Warmup1 are not repeated.
-- During blocking startup, initialization, Warmup2, or Return-to-Start motion,
+  inferred; initialization and Warmup1 are not repeated unless the operator
+  first requests the explicit Return-to-Start pose-chain replay.
+- During blocking startup, initialization, Warmup1, Warmup2, or
+  Return-to-Start motion,
   `s` and `q` both cancel via orderly release. A powered-HOLD barrier cannot be
   serviced until the blocking transition returns.
 - During active motion or HOLD, `q` starts orderly release and exit. `Ctrl-C`
   uses the same cleanup path.
 
-For Inspire DFX, Return-to-Start is offered only when the run explicitly selects
-`--initialization xr-home --return-to-start`. Shift+Tab from powered HOLD asks
-for a fresh `r` confirmation, then follows the same bounded path back to zero
-arms and fully open hands. It does not repeat authority acquisition or Warmup1;
-the next goal follows the ordinary Warmup2 gate. Return-to-Start remains rejected
-with measured initialization because that mode deliberately has no fixed target.
+Return-to-Start replays the enabled fixed startup pose chain. With the command
+above, Shift+Tab from powered HOLD separately confirms and replays XR-home and
+then the reviewed Inspire Warmup1 target. One post-chain visual hand gate
+follows the final stage. The replay does not reacquire authority or reuse policy
+output. The next goal follows the ordinary Warmup2 gate when that stage is
+enabled. Inspire Return-to-Start deliberately requires the fixed `xr-home`
+initialization even when Warmup1 is enabled; measured initialization is not
+accepted for this workflow.
 
 ### Lease-only hand release
 
