@@ -434,7 +434,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertFalse(INSPIRE_TRAINING_START_JOINTS.flags.writeable)
         self.assertTrue(
             INSPIRE_TRAINING_START_SOURCE["dataset_path"].endswith(
-                "inspire_pick_place_red_cup_08_13/train"
+                "inspire/pick_place_red_cup_08_13/train"
             )
         )
         self.assertEqual(INSPIRE_TRAINING_START_SOURCE["episode_index"], 56)
