@@ -296,9 +296,11 @@ def _readline_before_authority(
     prompt: str,
     *,
     confirmation_mode: bool = False,
+    goal_mode_toggle: bool = False,
+    allow_literal_q: bool = False,
     external_pending: Callable[[], bool] | None = None,
 ) -> str:
-    """Read unarmed text or an r/s/q single-key confirmation."""
+    """Read unarmed text, a task-mode Tab, or an r/s/q confirmation."""
 
     if not sys.stdin.isatty():
         print(prompt, end="", flush=True)
@@ -316,6 +318,8 @@ def _readline_before_authority(
         response = sys.stdin.readline()
         if response == "":
             raise DeploymentError("stdin closed while waiting for operator input")
+        if goal_mode_toggle and response.rstrip("\r\n") == GOAL_MODE_TOGGLE:
+            return GOAL_MODE_TOGGLE
         response = response.strip()
         if not confirmation_mode:
             return response
@@ -361,9 +365,12 @@ def _readline_before_authority(
             value = os.read(fd, 1)
             if value == b"":
                 raise DeploymentError("stdin closed while waiting for operator input")
-            if value in {b"q", b"Q", b"\x11"}:
+            if value == b"\x11" or (not allow_literal_q and value in {b"q", b"Q"}):
                 print()
                 raise OperatorRelease
+            if goal_mode_toggle and value == b"\t":
+                print()
+                return GOAL_MODE_TOGGLE
             if confirmation_mode:
                 if value in {b"r", b"R"}:
                     print()
@@ -601,10 +608,21 @@ def select_instruction(
         return "custom-goal", goal
     if task_name is not None:
         return task_name, TASKS[task_name]
-    print("Select a trained task:")
     task_names = list(TASKS)
-    for index, name in enumerate(task_names, start=1):
-        print(f"  {index}. {name:16s}  {TASKS[name]}")
+    custom_goal_mode = False
+
+    def show_mode() -> None:
+        if custom_goal_mode:
+            print(
+                "\nCUSTOM GOAL MODE (outside the exact trained-task allowlist).\n"
+                "Enter custom goal text to send it. Press Tab to return to trained tasks."
+            )
+            return
+        print("Select a trained task (press Tab for a custom goal):")
+        for index, name in enumerate(task_names, start=1):
+            print(f"  {index}. {name:16s}  {TASKS[name]}")
+
+    show_mode()
     while True:
         if voice_server is not None:
             voice_goal = _take_initial_voice_command(voice_server, confirm_voice_text=confirm_voice_text)
@@ -613,27 +631,31 @@ def select_instruction(
             if isinstance(voice_goal, tuple):
                 return voice_goal
         response = _readline_before_authority(
-            "Task number: ",
+            "Custom goal> " if custom_goal_mode else "Task number: ",
+            goal_mode_toggle=True,
+            allow_literal_q=custom_goal_mode,
             external_pending=(None if voice_server is None else lambda: voice_server.command_pending),
         )
         if response == VOICE_INPUT_AVAILABLE:
             continue
+        if response == GOAL_MODE_TOGGLE:
+            custom_goal_mode = not custom_goal_mode
+            show_mode()
+            continue
+        if custom_goal_mode:
+            if response.lower() == "q":
+                raise OperatorRelease
+            try:
+                return select_instruction(None, response)
+            except DeploymentError as exc:
+                LOGGER.warning("Invalid custom goal: %s", exc)
+                continue
         try:
             selected = int(response)
             name = task_names[selected - 1]
         except (EOFError, ValueError, IndexError) as exc:
             raise DeploymentError("A valid trained task must be selected") from exc
         return name, TASKS[name]
-
-
-def confirm_custom_goal(instruction: str) -> None:
-    print(
-        f"\nCUSTOM GOAL IS NOT AN EXACT TRAINING INSTRUCTION:\n  {instruction}\n"
-        "Behavior may be outside the fine-tuning distribution. All normal motion checks remain active."
-    )
-    response = _readline_before_authority("Type YES to send this custom goal to GR00T: ")
-    if response != "YES":
-        raise DeploymentError("Custom goal was not confirmed")
 
 
 def resolve_runtime_goal(response: str) -> tuple[str, str] | None:
@@ -1335,7 +1357,7 @@ def _select_next_goal_while_holding(
         if custom_goal_mode:
             print(
                 "\nCUSTOM GOAL MODE (outside the exact trained-task allowlist).\n"
-                "Enter custom goal text, then explicitly confirm it. "
+                "Enter custom goal text to send it. "
                 "Press Tab to return to trained-task options."
             )
             return
@@ -1405,45 +1427,10 @@ def _select_next_goal_while_holding(
             continue
 
         LOGGER.warning(
-            "Proposed next goal is not an exact trained instruction: %r",
+            "Sending next goal that is not an exact trained instruction: %r",
             instruction,
         )
-        print(
-            f"\nCUSTOM GOAL IS NOT AN EXACT TRAINING INSTRUCTION:\n  {instruction}\n"
-            "Behavior may be outside the fine-tuning distribution. All normal motion checks remain active."
-        )
-        try:
-            confirmation = _readline_while_armed(
-                actuator,
-                "Type YES to send this custom goal, or press Tab for trained tasks: ",
-                timeout_s=OPERATOR_CONFIRMATION_TIMEOUT_S,
-                goal_mode_toggle=True,
-                return_to_start=return_to_start,
-            )
-        except DeploymentError as exc:
-            if str(exc).startswith("Timed out waiting for armed operator input"):
-                raise DeploymentError(
-                    "Timed out waiting for custom-goal confirmation; releasing command authority; "
-                    f"OPERATOR_CONFIRMATION_TIMEOUT_S={OPERATOR_CONFIRMATION_TIMEOUT_S}"
-                ) from exc
-            raise
-        if confirmation == "YES":
-            return task_name, instruction
-        if confirmation == GOAL_MODE_TOGGLE:
-            custom_goal_mode = False
-            if mode_state is not None:
-                mode_state["custom_goal_mode"] = False
-            show_mode()
-            continue
-        if confirmation == RETURN_TO_START:
-            return RETURN_TO_START
-        if confirmation.lower() in EXIT_COMMANDS:
-            return None
-        if confirmation.lower() in STOP_COMMANDS:
-            _finish_operator_stop(actuator)
-            LOGGER.info("Custom goal was not sent; remaining STOPPED")
-            continue
-        LOGGER.warning("Custom goal rejected; remaining in powered hold")
+        return task_name, instruction
 
 
 def confirm_return_to_start(
@@ -2888,7 +2875,6 @@ def run(args: argparse.Namespace) -> None:
             "Using custom goal text that was not selected from the exact trained-task allowlist: %r",
             instruction,
         )
-        confirm_custom_goal(instruction)
     end_effector = getattr(args, "end_effector", "dex3")
     runtime_end_effector = resolve_runtime_end_effector(end_effector, args.sim)
     configured_initialization = load_initialization_spec(

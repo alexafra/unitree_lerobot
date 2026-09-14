@@ -37,7 +37,6 @@ from unitree_lerobot.eval_robot.eval_groot_g1 import (
     RETURN_TO_START,
     OperatorRelease,
     build_parser,
-    confirm_custom_goal,
     confirm_actuation,
     run as run_groot,
     select_instruction,
@@ -384,20 +383,18 @@ class GrootG1DeploymentTests(unittest.TestCase):
             select_instruction(args.task, args.custom_goal),
             ("custom-goal", "move the cup beside the cylinder."),
         )
+        with (
+            mock.patch.object(sys, "stdin", io.StringIO(f"{GOAL_MODE_TOGGLE}\nstack the cups\n")),
+            mock.patch("builtins.print"),
+        ):
+            self.assertEqual(
+                select_instruction(None),
+                ("custom-goal", "stack the cups"),
+            )
         with self.assertRaisesRegex(DeploymentError, "printable"):
             select_instruction(None, "bad\ngoal")
         with mock.patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["--task", "pick-red-cup", "--custom-goal", "another goal"])
-
-        with mock.patch.object(sys, "stdin", io.StringIO("YES\n")):
-            confirm_custom_goal("move the cup beside the cylinder")
-        for response in ("yes", "NO", ""):
-            with (
-                self.subTest(response=response),
-                mock.patch.object(sys, "stdin", io.StringIO(response + "\n")),
-                self.assertRaisesRegex(DeploymentError, "not confirmed"),
-            ):
-                confirm_custom_goal("move the cup beside the cylinder")
 
         measured = load_initialization_spec("measured", task_name="custom-goal")
         self.assertEqual(measured.mode, "measured")
@@ -1171,7 +1168,6 @@ class GrootG1DeploymentTests(unittest.TestCase):
             return None
 
         with (
-            mock.patch(f"{module}.confirm_custom_goal"),
             mock.patch(f"{module}.Gr00tClient", return_value=policy),
             mock.patch(f"{module}.validate_model_contract", return_value=contract),
             mock.patch(f"{module}.validate_policy_metadata", return_value=None),
@@ -2456,7 +2452,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             heartbeat=mock.Mock(),
             assert_healthy=mock.Mock(),
         )
-        stdin = io.StringIO(f"{GOAL_MODE_TOGGLE}\nmove it somewhere novel\nYES\n")
+        stdin = io.StringIO(f"{GOAL_MODE_TOGGLE}\nmove it somewhere novel\n")
         with (
             mock.patch.object(sys, "stdin", stdin),
             mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
@@ -2465,8 +2461,8 @@ class GrootG1DeploymentTests(unittest.TestCase):
             selected = _select_next_goal_while_holding(custom_actuator)
 
         self.assertEqual(selected, ("custom-goal", "move it somewhere novel"))
-        self.assertEqual(custom_actuator.heartbeat.call_count, 3)
-        self.assertEqual(custom_actuator.assert_healthy.call_count, 3)
+        self.assertEqual(custom_actuator.heartbeat.call_count, 2)
+        self.assertEqual(custom_actuator.assert_healthy.call_count, 2)
 
         trained_actuator = SimpleNamespace(
             heartbeat=mock.Mock(),
@@ -2497,7 +2493,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             heartbeat=mock.Mock(),
             assert_healthy=mock.Mock(),
         )
-        stdin = io.StringIO(f"{GOAL_MODE_TOGGLE}\nmove it somewhere novel\nYES\n")
+        stdin = io.StringIO(f"{GOAL_MODE_TOGGLE}\nmove it somewhere novel\n")
         with (
             mock.patch.object(sys, "stdin", stdin),
             mock.patch(f"{module}.select.select", return_value=([stdin], [], [])),
