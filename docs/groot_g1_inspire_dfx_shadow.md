@@ -103,7 +103,7 @@ laboratory choices, not manufacturer-qualified limits or safety certification.
 7. Warmup1 is profile-aware and uses a reviewed complete 26D Inspire training
    observation, not the 28D Dex3 target or a synthetic per-joint average. Its
    exact source is converted training episode 56, frame 0, from
-   `/home/alex/Development/Datasets/lerobot2/inspire_pick_place_red_cup_08_13/train`
+   `/home/alex/Development/Datasets/lerobot2/inspire/pick_place_red_cup_08_13/train`
    (converted timestamp `0.0`; original processed-raw `episode_0079`, frame 0, task
    `pick up the red cup.`). It was selected as the whole-frame medoid of all 109
    training-episode starts, and its recorded image shows both hands empty. It

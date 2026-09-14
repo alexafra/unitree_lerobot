@@ -128,7 +128,7 @@ Warmup1 is profile-aware. For either Inspire transport it uses one complete,
 real 26D `observation.state` row rather than reusing the 28D Dex3 target or
 assembling a per-joint mean/median. The frozen source is converted training
 episode 56, frame 0, from
-`/home/alex/Development/Datasets/lerobot2/inspire_pick_place_red_cup_08_13/train`
+`/home/alex/Development/Datasets/lerobot2/inspire/pick_place_red_cup_08_13/train`
 (converted timestamp `0.0`; original processed-raw `episode_0079`, frame 0,
 task `pick up the red cup.`).
 That row was the whole-frame medoid of the 109 training-episode starts and its

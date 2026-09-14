@@ -386,7 +386,7 @@ class DataEditorRgbdSurfaceNormalsTest(unittest.TestCase):
         player.health_warning_label = mock.Mock()
         player.health_details_btn = mock.Mock()
         player._health_report_text = ""
-        scan = types.SimpleNamespace(findings=(object(),))
+        scan = types.SimpleNamespace(findings=(object(),), warnings=(object(),), serious=())
 
         with (
             mock.patch.object(
@@ -405,6 +405,24 @@ class DataEditorRgbdSurfaceNormalsTest(unittest.TestCase):
         )
         player.health_warning_label.show.assert_called_once_with()
         player.health_details_btn.show.assert_called_once_with()
+
+    def test_serious_health_findings_show_red_header(self):
+        player = object.__new__(self.editor.DatasetPlayer)
+        player.health_warning_label = mock.Mock()
+        player.health_details_btn = mock.Mock()
+        player._health_report_text = ""
+        scan = types.SimpleNamespace(findings=(object(),), warnings=(), serious=(object(),))
+
+        with (
+            mock.patch.object(self.editor, "health_header_text", return_value="red issue"),
+            mock.patch.object(self.editor, "render_report", return_value="full reasons"),
+        ):
+            player._apply_episode_health_scan(scan)
+
+        player.health_warning_label.setText.assert_called_once_with("red issue")
+        player.health_warning_label.setStyleSheet.assert_called_once_with(
+            self.editor.EPISODE_HEALTH_SERIOUS_STYLE
+        )
 
     def test_clean_health_scan_shows_explicit_green_status(self):
         player = object.__new__(self.editor.DatasetPlayer)
@@ -536,12 +554,27 @@ class DataEditorRgbdSurfaceNormalsTest(unittest.TestCase):
                 frames.append(
                     {
                         "idx": index,
+                        "timestamp_s": index * 0.0165,
                         "colors": {"color_0": f"colors/{filename}"},
                         "depths": {},
                     }
                 )
             (episode / "data.json").write_text(
-                json.dumps({"info": {}, "data": frames}),
+                json.dumps(
+                    {
+                        "info": {},
+                        "timing": {
+                            "frame_count": 3,
+                            "sample_duration_s": 0.033,
+                            "measured_fps": 2 / 0.033,
+                            "max_frame_gap_s": 0.0165,
+                            "recording_duration_s": 1.25,
+                            "capture_start_utc": "2026-09-15T00:00:00+00:00",
+                            "capture_stop_utc": "2026-09-15T00:00:01.250000+00:00",
+                        },
+                        "data": frames,
+                    }
+                ),
                 encoding="utf-8",
             )
 
@@ -559,6 +592,16 @@ class DataEditorRgbdSurfaceNormalsTest(unittest.TestCase):
             self.assertEqual((colors / "000000_color_0.jpg").read_bytes(), b"zero")
             self.assertEqual((colors / "000001_color_0.jpg").read_bytes(), b"two")
             self.assertFalse((colors / "000002_color_0.jpg").exists())
+            self.assertEqual(payload["timing"]["frame_count"], 2)
+            self.assertAlmostEqual(payload["timing"]["sample_duration_s"], 0.033)
+            self.assertAlmostEqual(payload["timing"]["measured_fps"], 1 / 0.033)
+            self.assertAlmostEqual(payload["timing"]["max_frame_gap_s"], 0.033)
+            self.assertEqual(payload["timing"]["recording_duration_s"], 1.25)
+            self.assertEqual(payload["timing"]["capture_start_utc"], "2026-09-15T00:00:00+00:00")
+            self.assertEqual(
+                payload["timing"]["capture_stop_utc"],
+                "2026-09-15T00:00:01.250000+00:00",
+            )
 
 
 if __name__ == "__main__":

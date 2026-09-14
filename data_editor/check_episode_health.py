@@ -25,6 +25,8 @@ from typing import Any, Callable, Sequence
 
 DEFAULT_MAX_FRAME_GAP_S = 0.075
 DEFAULT_MIN_MEASURED_FPS = 29.0
+DEFAULT_SERIOUS_GAP_S = 0.250
+DEFAULT_SERIOUS_MIN_FPS = 27.0
 CAMERA_EVIDENCE_NOTE = (
     "These are recorded frame-loop and valid DDS state-callback timing checks. "
     "They do not prove a camera-sensor drop, late exposure, or repeated image; "
@@ -40,6 +42,11 @@ ATOMIC_RGBD_STORAGE_NOTE = (
     "at info.rgbd_pairing and per-row capture_sequence, server/client monotonic "
     "timestamps, and sample_held evidence at data[*].rgbd_pairing. Legacy "
     "recordings omit that per-frame camera provenance."
+)
+SEVERITY_NOTE = (
+    "Orange means a fully evidenced, recovered timing delay below 250 ms (or recorder-loop "
+    "rate from 27 to 29 FPS). Red means structural/incomplete evidence, an unrecovered/DFX "
+    "anomaly, a gap of at least 250 ms, or recorder-loop rate below 27 FPS."
 )
 
 _EPISODE_NAME = re.compile(r"^episode_(\d+)$")
@@ -58,6 +65,7 @@ class EpisodeHealthFinding:
     classification: str
     reasons: tuple[str, ...]
     evidence_incomplete: bool = False
+    severity: str = "warning"
 
 
 @dataclass(frozen=True)
@@ -79,6 +87,14 @@ class EpisodeHealthScan:
             for finding in self.findings
             if finding.classification == "unverified" or finding.evidence_incomplete
         )
+
+    @property
+    def warnings(self) -> tuple[EpisodeHealthFinding, ...]:
+        return tuple(finding for finding in self.findings if finding.severity == "warning")
+
+    @property
+    def serious(self) -> tuple[EpisodeHealthFinding, ...]:
+        return tuple(finding for finding in self.findings if finding.severity == "serious")
 
 
 def _module_file_from_root(root: Path) -> Path:
@@ -276,8 +292,110 @@ def _format_result_reasons(result: Any) -> tuple[str, ...]:
 
 
 def _has_incomplete_evidence(raw_reasons: Sequence[Any]) -> bool:
-    markers = ("missing", "invalid", "unavailable", "unknown", "unsupported")
+    markers = (
+        "missing",
+        "invalid",
+        "unavailable",
+        "unknown",
+        "unsupported",
+        "unreadable",
+        "malformed",
+        "not_object",
+    )
     return any(marker in str(reason).lower() for reason in raw_reasons for marker in markers)
+
+
+def _dds_gap_is_serious(
+    document: dict[str, Any] | None,
+    *,
+    serious_gap_s: float,
+) -> bool:
+    """Return whether a recorded DDS gap is unrecovered, unverifiable, or large."""
+
+    if document is None or not isinstance(document.get("diagnostics"), dict):
+        return True
+    found_positive_gap = False
+    for source in document["diagnostics"].values():
+        if not isinstance(source, dict) or source.get("metric") != "valid_state_receive_gap":
+            continue
+        for stream in source.values():
+            if not isinstance(stream, dict):
+                continue
+            gap_count = stream.get("gap_count")
+            if isinstance(gap_count, bool) or not isinstance(gap_count, int) or gap_count <= 0:
+                continue
+            found_positive_gap = True
+            max_gap_s = _finite_number(stream.get("max_gap_duration_s"))
+            if max_gap_s is None or max_gap_s >= serious_gap_s:
+                return True
+            recovered_count = stream.get("recovered_gap_count")
+            if (
+                isinstance(recovered_count, bool)
+                or not isinstance(recovered_count, int)
+                or recovered_count < gap_count
+            ):
+                return True
+            if stream.get("open_gap_at_end") is not False:
+                return True
+            events = stream.get("gaps")
+            if not isinstance(events, list) or len(events) != gap_count:
+                return True
+            if any(not isinstance(event, dict) or event.get("recovered") is not True for event in events):
+                return True
+    return not found_positive_gap
+
+
+def _finding_severity(
+    result: Any,
+    document: dict[str, Any] | None,
+    *,
+    serious_gap_s: float,
+    serious_min_fps: float,
+) -> str:
+    """Map shared evidence to a display severity without changing its verdict."""
+
+    status = str(getattr(result, "status", "unknown"))
+    raw_reasons = tuple(str(reason) for reason in getattr(result, "reasons", ()))
+    if status != "reject" or _has_incomplete_evidence(raw_reasons):
+        return "serious"
+
+    exact_frame_gap_s = _finite_number(getattr(result, "max_frame_gap_s", None))
+    exact_measured_fps = _finite_number(getattr(result, "measured_fps", None))
+    saw_dds_gap = False
+    for reason in raw_reasons:
+        frame_gap = _FRAME_GAP_REASON.fullmatch(reason)
+        if frame_gap:
+            observed_frame_gap_s = (
+                exact_frame_gap_s
+                if exact_frame_gap_s is not None
+                else float(frame_gap.group("observed"))
+            )
+            if observed_frame_gap_s >= serious_gap_s:
+                return "serious"
+            continue
+        fps = _FPS_REASON.fullmatch(reason)
+        if fps:
+            observed_measured_fps = (
+                exact_measured_fps
+                if exact_measured_fps is not None
+                else float(fps.group("observed"))
+            )
+            if observed_measured_fps < serious_min_fps:
+                return "serious"
+            continue
+        if reason.startswith("dds_gap:"):
+            saw_dds_gap = True
+            continue
+        # Only the three explicitly understood timing findings above can be
+        # orange. Fail closed when the shared checker adds a new reject reason,
+        # or when it reports any structural/DFX inconsistency.
+        return "serious"
+
+    if not raw_reasons or (
+        saw_dds_gap and _dds_gap_is_serious(document, serious_gap_s=serious_gap_s)
+    ):
+        return "serious"
+    return "warning"
 
 
 def _episode_sort_key(episode_id: str) -> tuple[int, int | str]:
@@ -306,6 +424,8 @@ def scan_episode_health(
     *,
     max_frame_gap_s: float = DEFAULT_MAX_FRAME_GAP_S,
     min_measured_fps: float = DEFAULT_MIN_MEASURED_FPS,
+    serious_gap_s: float = DEFAULT_SERIOUS_GAP_S,
+    serious_min_fps: float = DEFAULT_SERIOUS_MIN_FPS,
     xr_teleoperate_root: Path | None = None,
     scanner: Callable[..., Sequence[Any]] | None = None,
 ) -> EpisodeHealthScan:
@@ -318,6 +438,10 @@ def scan_episode_health(
         raise ValueError("max_frame_gap_s must be finite and non-negative")
     if not math.isfinite(min_measured_fps) or min_measured_fps < 0:
         raise ValueError("min_measured_fps must be finite and non-negative")
+    if not math.isfinite(serious_gap_s) or serious_gap_s < max_frame_gap_s:
+        raise ValueError("serious_gap_s must be finite and at least max_frame_gap_s")
+    if not math.isfinite(serious_min_fps) or not 0 <= serious_min_fps <= min_measured_fps:
+        raise ValueError("serious_min_fps must be finite and between zero and min_measured_fps")
 
     if scanner is None:
         quality_module = load_shared_episode_quality(xr_teleoperate_root)
@@ -360,6 +484,12 @@ def scan_episode_health(
                 classification,
                 reasons,
                 evidence_incomplete=(status != "clean" and _has_incomplete_evidence(getattr(result, "reasons", ()))),
+                severity=_finding_severity(
+                    result,
+                    _read_document(getattr(result, "data_json", None)),
+                    serious_gap_s=serious_gap_s,
+                    serious_min_fps=serious_min_fps,
+                ),
             )
         )
 
@@ -370,6 +500,7 @@ def scan_episode_health(
                 "unverified",
                 (f"quality evidence: data.json is missing from {episode_dir}",),
                 evidence_incomplete=True,
+                severity="serious",
             )
         )
 
@@ -394,19 +525,22 @@ def health_header_text(scan: EpisodeHealthScan) -> str:
     """Return explicit status text for the editor's top health banner."""
 
     parts = []
-    if scan.possibly_problematic:
+    if scan.serious:
         parts.append(
-            f"{len(scan.possibly_problematic)} measured warning(s): " + _compact_episode_ids(scan.possibly_problematic)
+            f"{len(scan.serious)} serious/structural issue(s): " + _compact_episode_ids(scan.serious)
         )
-    if scan.unverified:
-        parts.append(f"{len(scan.unverified)} not fully verifiable: " + _compact_episode_ids(scan.unverified))
+    if scan.warnings:
+        parts.append(
+            f"{len(scan.warnings)} recovered timing warning(s): " + _compact_episode_ids(scan.warnings)
+        )
     if not parts:
         return (
             f"✓ Episode health — {scan.total_episode_count} checked; no recorder-loop/DDS "
             "warnings or missing required evidence. Camera-sensor delivery is not verified by these checks."
         )
+    symbol = "⛔" if scan.serious else "⚠"
     return (
-        "⚠ Episode health — " + "; ".join(parts) + ". Open View Health Details for objective reasons. "
+        f"{symbol} Episode health — " + "; ".join(parts) + ". Open View Health Details for objective reasons. "
         "Recorder-loop/DDS timing is not proof of a camera-sensor drop."
     )
 
@@ -416,22 +550,21 @@ def render_report(scan: EpisodeHealthScan) -> str:
         f"READ-ONLY EPISODE HEALTH: {scan.selected_path}",
         (
             f"Scanned {scan.total_episode_count}: {scan.clean_count} clean, "
-            f"{len(scan.possibly_problematic)} possibly problematic, "
+            f"{len(scan.warnings)} orange timing warnings, "
+            f"{len(scan.serious)} red serious/structural issues, "
             f"{len(scan.unverified)} with incomplete evidence"
         ),
         STORAGE_NOTE,
         ATOMIC_RGBD_STORAGE_NOTE,
+        SEVERITY_NOTE,
         f"Shared classifier: {scan.checker_source}",
     ]
     if not scan.findings:
         lines.append("No measured problems or missing required evidence were found.")
     for finding in scan.findings:
-        if finding.classification == "possibly_problematic":
-            label = "POSSIBLY PROBLEMATIC"
-            if finding.evidence_incomplete:
-                label += "; EVIDENCE INCOMPLETE"
-        else:
-            label = "UNVERIFIED"
+        label = "RED SERIOUS" if finding.severity == "serious" else "ORANGE WARNING"
+        if finding.classification == "unverified" or finding.evidence_incomplete:
+            label += "; EVIDENCE INCOMPLETE"
         lines.append(f"{finding.episode_id} [{label}]")
         lines.extend(f"  - {reason}" for reason in finding.reasons)
     lines.append(CAMERA_EVIDENCE_NOTE)
@@ -474,6 +607,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=f"Warn below this recorder-loop frame rate (default: {DEFAULT_MIN_MEASURED_FPS}).",
     )
     parser.add_argument(
+        "--serious-gap-s",
+        type=_nonnegative_float,
+        default=DEFAULT_SERIOUS_GAP_S,
+        help=f"Mark frame/DDS gaps at or above this value red (default: {DEFAULT_SERIOUS_GAP_S}).",
+    )
+    parser.add_argument(
+        "--serious-min-fps",
+        type=_nonnegative_float,
+        default=DEFAULT_SERIOUS_MIN_FPS,
+        help=f"Mark recorder-loop rates below this value red (default: {DEFAULT_SERIOUS_MIN_FPS}).",
+    )
+    parser.add_argument(
         "--xr-teleoperate-root",
         type=Path,
         help="xr_teleoperate checkout root if it is not installed or next to this repository.",
@@ -492,6 +637,8 @@ def main(
             args.episode_folder,
             max_frame_gap_s=args.max_frame_gap_s,
             min_measured_fps=args.min_measured_fps,
+            serious_gap_s=args.serious_gap_s,
+            serious_min_fps=args.serious_min_fps,
             xr_teleoperate_root=args.xr_teleoperate_root,
             scanner=scanner,
         )

@@ -63,10 +63,22 @@ EPISODE_HEALTH_WARNING_STYLE = """
     QLabel {
         font-size: 14px;
         font-weight: bold;
-        color: #664d03;
+        color: #7a3e00;
         padding: 9px 12px;
-        border: 1px solid #ffca2c;
-        background-color: #fff3cd;
+        border: 1px solid #fd7e14;
+        background-color: #ffe5cc;
+        border-radius: 6px;
+    }
+"""
+
+EPISODE_HEALTH_SERIOUS_STYLE = """
+    QLabel {
+        font-size: 14px;
+        font-weight: bold;
+        color: #842029;
+        padding: 9px 12px;
+        border: 1px solid #f5c2c7;
+        background-color: #f8d7da;
         border-radius: 6px;
     }
 """
@@ -164,6 +176,50 @@ def calculate_measured_fps(data_items):
         return None
 
     return (len(timestamps) - 1) / elapsed
+
+
+def refresh_derived_timing_after_trim(json_obj):
+    """Refresh only timing values that are mathematically derived from retained rows."""
+
+    timing = json_obj.get("timing")
+    data_items = json_obj.get("data")
+    if not isinstance(timing, dict) or not isinstance(data_items, list):
+        return
+
+    timing["frame_count"] = len(data_items)
+    derived_keys = ("sample_duration_s", "measured_fps", "max_frame_gap_s")
+    timestamps = []
+    for item in data_items:
+        timestamp = item.get("timestamp_s") if isinstance(item, dict) else None
+        if (
+            isinstance(timestamp, bool)
+            or not isinstance(timestamp, (int, float))
+            or not np.isfinite(timestamp)
+            or timestamp < 0
+        ):
+            for key in derived_keys:
+                timing.pop(key, None)
+            return
+        timestamps.append(float(timestamp))
+
+    if any(current <= previous for previous, current in zip(timestamps, timestamps[1:])):
+        for key in derived_keys:
+            timing.pop(key, None)
+        return
+
+    if len(timestamps) < 2:
+        sample_duration_s = 0.0
+        measured_fps = 0.0
+        max_frame_gap_s = 0.0
+    else:
+        gaps = [current - previous for previous, current in zip(timestamps, timestamps[1:])]
+        sample_duration_s = timestamps[-1] - timestamps[0]
+        measured_fps = (len(timestamps) - 1) / sample_duration_s
+        max_frame_gap_s = max(gaps)
+
+    timing["sample_duration_s"] = sample_duration_s
+    timing["measured_fps"] = measured_fps
+    timing["max_frame_gap_s"] = max_frame_gap_s
 
 
 def resolve_depth_scale_m_per_unit(json_obj):
@@ -957,12 +1013,17 @@ class DatasetPlayer(QWidget):
         self._show_episode_health_banner(
             "⚠ Episode health check unavailable — the editor did not infer that "
             "unchanged-looking frames are healthy. View details for the checker error.",
-            EPISODE_HEALTH_WARNING_STYLE,
+            EPISODE_HEALTH_SERIOUS_STYLE,
             details,
         )
 
     def _apply_episode_health_scan(self, scan):
-        style = EPISODE_HEALTH_WARNING_STYLE if scan.findings else EPISODE_HEALTH_CLEAN_STYLE
+        if getattr(scan, "serious", ()):
+            style = EPISODE_HEALTH_SERIOUS_STYLE
+        elif getattr(scan, "warnings", ()) or scan.findings:
+            style = EPISODE_HEALTH_WARNING_STYLE
+        else:
+            style = EPISODE_HEALTH_CLEAN_STYLE
         self._show_episode_health_banner(
             health_header_text(scan),
             style,
@@ -2007,6 +2068,7 @@ class DatasetPlayer(QWidget):
             new_data_list.append(new_item)
 
         json_obj["data"] = new_data_list
+        refresh_derived_timing_after_trim(json_obj)
 
         with open(
             json_path,

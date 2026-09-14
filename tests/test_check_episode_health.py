@@ -72,6 +72,7 @@ class CheckEpisodeHealthTest(unittest.TestCase):
                                 "recovered_gap_count": 1,
                                 "open_gap_at_end": False,
                                 "max_gap_duration_s": 0.075734794,
+                                "gaps": [{"recovered": True}],
                             },
                             "total_side_gap_count": 1,
                         }
@@ -120,6 +121,8 @@ class CheckEpisodeHealthTest(unittest.TestCase):
                 [finding.episode_id for finding in scan.possibly_problematic],
                 ["episode_0063"],
             )
+            self.assertEqual([finding.episode_id for finding in scan.warnings], ["episode_0063"])
+            self.assertEqual([finding.episode_id for finding in scan.serious], ["episode_0073"])
             problem_reasons = "\n".join(scan.possibly_problematic[0].reasons)
             self.assertIn("recorded frame-loop gap: 120.000 ms", problem_reasons)
             self.assertIn("between frame IDs 1 and 2", problem_reasons)
@@ -172,7 +175,7 @@ class CheckEpisodeHealthTest(unittest.TestCase):
 
             rendered = output.getvalue()
             self.assertEqual(exit_code, 1)
-            self.assertIn("episode_0012 [POSSIBLY PROBLEMATIC]", rendered)
+            self.assertIn("episode_0012 [ORANGE WARNING]", rendered)
             self.assertIn("recorded frame-loop average: 28.500 FPS", rendered)
             self.assertIn("data[*].timestamp_s", rendered)
             self.assertIn("info.rgbd_pairing", rendered)
@@ -198,7 +201,19 @@ class CheckEpisodeHealthTest(unittest.TestCase):
         self.assertIn("View Health Details", warning)
         self.assertIn("not proof of a camera-sensor drop", warning)
 
-    def test_reject_with_missing_evidence_is_both_warning_and_unverified(self):
+        serious_finding = self.checker.EpisodeHealthFinding(
+            "episode_0099",
+            "possibly_problematic",
+            ("structural mismatch",),
+            severity="serious",
+        )
+        serious = self.checker.health_header_text(
+            self.checker.EpisodeHealthScan("/data", 2, 1, (serious_finding,), "shared.py")
+        )
+        self.assertIn("serious/structural", serious)
+        self.assertIn("episode_0099", serious)
+
+    def test_reject_with_missing_evidence_is_serious_and_unverified(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             data_json = _write_episode(root, "episode_0005", {})
@@ -218,10 +233,134 @@ class CheckEpisodeHealthTest(unittest.TestCase):
             )
 
             self.assertEqual(scan.possibly_problematic, scan.unverified)
+            self.assertEqual(scan.serious, scan.unverified)
             self.assertIn(
                 "EVIDENCE INCOMPLETE",
                 self.checker.render_report(scan),
             )
+
+    def test_severity_thresholds_and_unrecovered_dds_are_red(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_json = _write_episode(
+                root,
+                "episode_0001",
+                {
+                    "diagnostics": {
+                        "inspire_ftp_state_subscribers": {
+                            "metric": "valid_state_receive_gap",
+                            "left": {
+                                "gap_count": 1,
+                                "recovered_gap_count": 0,
+                                "open_gap_at_end": True,
+                                "max_gap_duration_s": 0.100,
+                                "gaps": [{"recovered": False}],
+                            },
+                        }
+                    }
+                },
+            )
+            results = [
+                SimpleNamespace(
+                    episode="episode_0001",
+                    data_json=str(data_json),
+                    status="reject",
+                    reasons=["dds_gap:inspire_ftp_state_subscribers.left.gap_count=1"],
+                ),
+                SimpleNamespace(
+                    episode="episode_0002",
+                    data_json=str(data_json),
+                    status="reject",
+                    reasons=["max_frame_gap_s=0.250000>0.075000"],
+                ),
+                SimpleNamespace(
+                    episode="episode_0003",
+                    data_json=str(data_json),
+                    status="reject",
+                    reasons=["measured_fps=26.999<29.000"],
+                ),
+                SimpleNamespace(
+                    episode="episode_0004",
+                    data_json=str(data_json),
+                    status="reject",
+                    reasons=["frame_count_mismatch:timing=10,data=9"],
+                ),
+            ]
+
+            scan = self.checker.scan_episode_health(
+                root,
+                scanner=lambda *args, **kwargs: results,
+            )
+
+            self.assertEqual([finding.episode_id for finding in scan.serious], [
+                "episode_0001",
+                "episode_0002",
+                "episode_0003",
+                "episode_0004",
+            ])
+            self.assertFalse(scan.warnings)
+
+    def test_severity_uses_exact_metrics_instead_of_rounded_reason_text(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_json = _write_episode(root, "episode_0001", {})
+            results = [
+                SimpleNamespace(
+                    episode="episode_0001",
+                    data_json=str(data_json),
+                    status="reject",
+                    reasons=["max_frame_gap_s=0.250000>0.075000"],
+                    max_frame_gap_s=0.2499996,
+                ),
+                SimpleNamespace(
+                    episode="episode_0002",
+                    data_json=str(data_json),
+                    status="reject",
+                    reasons=["measured_fps=27.000<29.000"],
+                    measured_fps=26.9996,
+                ),
+            ]
+
+            scan = self.checker.scan_episode_health(
+                root,
+                scanner=lambda *args, **kwargs: results,
+            )
+
+            self.assertEqual([finding.episode_id for finding in scan.warnings], ["episode_0001"])
+            self.assertEqual([finding.episode_id for finding in scan.serious], ["episode_0002"])
+
+    def test_unrecognized_reject_reasons_fail_closed_as_serious(self):
+        structural_reasons = [
+            "dds_streams_unexpected:source:extra",
+            "dds_stream_not_observed:source.left",
+            "dds_sample_count_zero:source.left",
+            "dfx_sides_unexpected:extra",
+            "dfx_sample_count_zero:left",
+            "dfx_accepted_count_zero:right",
+            "future_structural_failure",
+        ]
+        for structural_reason in structural_reasons:
+            with self.subTest(reason=structural_reason), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                data_json = _write_episode(root, "episode_0001", {})
+                result = SimpleNamespace(
+                    episode="episode_0001",
+                    data_json=str(data_json),
+                    status="reject",
+                    reasons=[
+                        "max_frame_gap_s=0.100000>0.075000",
+                        structural_reason,
+                    ],
+                    max_frame_gap_s=0.100,
+                )
+
+                scan = self.checker.scan_episode_health(
+                    root,
+                    scanner=lambda *args, **kwargs: [result],
+                )
+
+                self.assertEqual(scan.serious, scan.findings)
+                self.assertFalse(scan.warnings)
 
     def test_explicit_xr_checkout_loads_shared_scanner(self):
         with tempfile.TemporaryDirectory() as temp_dir:

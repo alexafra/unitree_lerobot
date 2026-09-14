@@ -69,8 +69,8 @@ TRAINING_START_JOINTS_RAD = DEX3_TRAINING_START_JOINTS_RAD
 
 INSPIRE_TRAINING_START_SOURCE = {
     "dataset_path": (
-        "/home/alex/Development/Datasets/lerobot2/"
-        "inspire_pick_place_red_cup_08_13/train"
+        "/home/alex/Development/Datasets/lerobot2/inspire/"
+        "pick_place_red_cup_08_13/train"
     ),
     # LeRobot episode indices are zero-based. The split manifest maps this
     # converted episode to source episode_0079.
