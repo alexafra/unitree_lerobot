@@ -8,12 +8,19 @@ from unitree_lerobot.eval_robot.eval_groot_g1 import build_parser, run
 from unitree_lerobot.eval_robot.groot_client import DeploymentError
 from unitree_lerobot.eval_robot.groot_contract import (
     ModelContract,
+    TASKS,
     _task_contract_sha256,
     validate_policy_instruction,
 )
 
 
 RED_CUP_TASKS = ["pick up the red cup.", "put down the red cup."]
+
+
+def test_left_to_right_cup_pyramid_task_is_exactly_registered():
+    assert TASKS["build-cup-pyramid-left-to-right"] == (
+        "build a cup pyramid left-to-right."
+    )
 
 
 def _metadata(instructions=RED_CUP_TASKS):

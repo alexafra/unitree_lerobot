@@ -53,8 +53,8 @@ TASKS = {
     "down-wooden-block": "put down the wooden block.",
     "pick-cerealbox": "pick up the cereal box.",
     "down-cerealbox": "put down the cereal box.",
-    "stack-three-cups": "stack the three red cups."
-
+    "stack-three-cups": "stack the three red cups.",
+    "build-cup-pyramid-left-to-right": "build a cup pyramid left-to-right.",
 }
 
 COLOUR_VIDEO_KEYS = ("ego_view",)
