@@ -23,6 +23,18 @@ def test_left_to_right_cup_pyramid_task_is_exactly_registered():
     )
 
 
+@pytest.mark.parametrize(
+    ("task", "instruction"),
+    [
+        ("pick-green-cup", "pick up the green cup."),
+        ("down-green-cup", "put down the green cup."),
+    ],
+)
+def test_green_cup_tasks_are_exactly_registered_and_accepted_by_cli(task, instruction):
+    assert TASKS[task] == instruction
+    assert build_parser().parse_args(["--task", task]).task == task
+
+
 def _metadata(instructions=RED_CUP_TASKS):
     instructions = list(instructions)
     return {

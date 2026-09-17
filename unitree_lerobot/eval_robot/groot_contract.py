@@ -49,6 +49,8 @@ TASKS = {
     "down-toothpaste": "put down the cylinder toothpaste.",
     "pick-red-cup": "pick up the red cup.",
     "down-red-cup": "put down the red cup.",
+    "pick-green-cup": "pick up the green cup.",
+    "down-green-cup": "put down the green cup.",
     "pick-wooden-block": "pick up the wooden block.",
     "down-wooden-block": "put down the wooden block.",
     "pick-cerealbox": "pick up the cereal box.",
