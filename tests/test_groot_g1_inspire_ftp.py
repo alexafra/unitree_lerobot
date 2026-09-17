@@ -4,6 +4,8 @@ import contextlib
 from types import ModuleType, SimpleNamespace
 from unittest import mock
 import sys
+import threading
+import time
 
 import numpy as np
 import pytest
@@ -53,7 +55,9 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     QUALIFIED_REAL_MODE_MACHINE,
     RobotState,
     _G1Dex3CommandBackend,
+    _execute_initialization,
     _ramp_real_arm_authority,
+    _wait_for_initialization_start,
 )
 
 
@@ -727,6 +731,76 @@ def _mode5_state(
     )
 
 
+class _Mode5TransitionBackend:
+    simulation = False
+    profile = INSPIRE_FTP_PROFILE
+
+    def __init__(
+        self,
+        *,
+        waist_target: np.ndarray,
+        measured_waist: np.ndarray,
+        waist_dq: np.ndarray | None = None,
+    ) -> None:
+        self._arm_target = np.zeros(14)
+        self._left_target = np.zeros(6)
+        self._right_target = np.zeros(6)
+        self._waist_target = np.asarray(waist_target, dtype=np.float64).copy()
+        self.measured_waist = np.asarray(measured_waist, dtype=np.float64).copy()
+        self.waist_dq = (
+            np.zeros(3, dtype=np.float64)
+            if waist_dq is None
+            else np.asarray(waist_dq, dtype=np.float64).copy()
+        )
+        self.rebases = 0
+        self.publishes = 0
+        self.arm_state_offset = np.zeros(14, dtype=np.float64)
+        self.endpoint_waist_offset = np.zeros(3, dtype=np.float64)
+
+    @staticmethod
+    def _uses_mode5_waist_hold() -> bool:
+        return True
+
+    def _require_mode5_waist_state(self, state: RobotState):
+        return _G1Dex3CommandBackend._require_mode5_waist_state(self, state)
+
+    def _set_measured_waist_hold(self, state: RobotState) -> None:
+        waist, _waist_dq = self._require_mode5_waist_state(state)
+        self._waist_target = waist.copy()
+        self.rebases += 1
+
+    def state(self) -> RobotState:
+        captured_at = time.monotonic()
+        return RobotState(
+            captured_at=captured_at,
+            mode_machine=INSPIRE_FTP_REAL_MODE_MACHINE,
+            arm=self._arm_target + self.arm_state_offset,
+            arm_dq=np.zeros(14),
+            left_hand=self._left_target.copy(),
+            right_hand=self._right_target.copy(),
+            waist=self.measured_waist + self.endpoint_waist_offset,
+            waist_dq=self.waist_dq.copy(),
+            arm_received_at=captured_at,
+        )
+
+    def set_target(self, arm, left, right) -> None:
+        self._arm_target = np.asarray(arm, dtype=np.float64).copy()
+        self._left_target = np.asarray(left, dtype=np.float64).copy()
+        self._right_target = np.asarray(right, dtype=np.float64).copy()
+
+    def publish(self) -> None:
+        self.publishes += 1
+
+
+class _FreshHeartbeat:
+    def __init__(self) -> None:
+        self.value = time.monotonic()
+
+    @staticmethod
+    def get_lock():
+        return contextlib.nullcontext()
+
+
 def _low_command() -> SimpleNamespace:
     return SimpleNamespace(
         mode_pr=-1,
@@ -926,6 +1000,233 @@ def test_ftp_mode5_runtime_allows_teleop_compatible_waist_motion():
         pytest.raises(DeploymentError, match="Waist is not stationary.*waist_pitch"),
     ):
         backend._validate_prearm_takeover_state(_mode5_state(waist_dq=moving))
+
+
+def test_mode5_guarded_transitions_never_ratchet_canonical_waist_target():
+    assert MAX_WAIST_HOLD_ERROR_RAD == 0.075
+    old_target = np.array([0.0, 0.0, -0.11])
+    measured = np.array([0.0, 0.0, -0.02])
+    backend = _Mode5TransitionBackend(
+        waist_target=old_target,
+        measured_waist=measured,
+    )
+    module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+    with (
+        mock.patch(f"{module}.MODE5_WAIST_REBASE_DWELL_S", 0.01),
+        mock.patch(f"{module}.INITIALIZATION_START_TIMEOUT_S", 0.20),
+        mock.patch(f"{module}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 2),
+    ):
+        first = _wait_for_initialization_start(
+            backend,
+            threading.Event(),
+            _FreshHeartbeat(),
+        )
+        second = _wait_for_initialization_start(
+            backend,
+            threading.Event(),
+            _FreshHeartbeat(),
+        )
+
+    assert first is not None
+    assert second is not None
+    assert backend.rebases == 0
+    np.testing.assert_array_equal(backend._waist_target, old_target)
+    assert np.max(np.abs(measured - old_target)) > MAX_WAIST_HOLD_ERROR_RAD
+
+
+def test_mode5_guarded_transition_does_not_rebase_moving_waist():
+    old_target = np.array([0.0, 0.0, -0.11])
+    backend = _Mode5TransitionBackend(
+        waist_target=old_target,
+        measured_waist=np.array([0.0, 0.0, -0.04]),
+        waist_dq=np.array([0.0, 0.0, 0.11]),
+    )
+    module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+    with (
+        mock.patch(f"{module}.MODE5_WAIST_REBASE_DWELL_S", 0.005),
+        mock.patch(f"{module}.INITIALIZATION_START_TIMEOUT_S", 0.03),
+        mock.patch(f"{module}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 1),
+        pytest.raises(DeploymentError, match="did not become stationary"),
+    ):
+        _wait_for_initialization_start(
+            backend,
+            threading.Event(),
+            _FreshHeartbeat(),
+        )
+
+    assert backend.rebases == 0
+    np.testing.assert_array_equal(backend._waist_target, old_target)
+
+
+def test_mode5_guarded_transition_does_not_rebase_drifting_waist():
+    class DriftingBackend(_Mode5TransitionBackend):
+        calls = 0
+
+        def state(self) -> RobotState:
+            self.calls += 1
+            self.endpoint_waist_offset[2] = 0.03 if self.calls % 2 == 0 else 0.0
+            return super().state()
+
+    old_target = np.array([0.0, 0.0, -0.11])
+    backend = DriftingBackend(
+        waist_target=old_target,
+        measured_waist=np.array([0.0, 0.0, -0.04]),
+    )
+    module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+    with (
+        mock.patch(f"{module}.MODE5_WAIST_REBASE_DWELL_S", 0.02),
+        mock.patch(f"{module}.INITIALIZATION_START_TIMEOUT_S", 0.04),
+        mock.patch(f"{module}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 1),
+        pytest.raises(DeploymentError, match="did not become stationary"),
+    ):
+        _wait_for_initialization_start(
+            backend,
+            threading.Event(),
+            _FreshHeartbeat(),
+        )
+
+    assert backend.rebases == 0
+    np.testing.assert_array_equal(backend._waist_target, old_target)
+
+
+def test_mode5_guarded_transition_does_not_rebase_with_arm_tracking_error():
+    old_target = np.array([0.0, 0.0, -0.11])
+    backend = _Mode5TransitionBackend(
+        waist_target=old_target,
+        measured_waist=np.array([0.0, 0.0, -0.04]),
+    )
+    backend.arm_state_offset[0] = 0.21
+    module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+    with (
+        mock.patch(f"{module}.MODE5_WAIST_REBASE_DWELL_S", 0.005),
+        mock.patch(f"{module}.INITIALIZATION_START_TIMEOUT_S", 0.03),
+        mock.patch(f"{module}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 1),
+        pytest.raises(DeploymentError, match="did not become stationary"),
+    ):
+        _wait_for_initialization_start(
+            backend,
+            threading.Event(),
+            _FreshHeartbeat(),
+        )
+
+    assert backend.rebases == 0
+    np.testing.assert_array_equal(backend._waist_target, old_target)
+
+
+def test_mode5_guarded_transition_rejects_invalid_waist_without_rebase():
+    old_target = np.array([0.0, 0.0, -0.11])
+    backend = _Mode5TransitionBackend(
+        waist_target=old_target,
+        measured_waist=np.array([0.0, 0.51, -0.04]),
+    )
+    with pytest.raises(DeploymentError, match="waist_roll.*outside the guarded"):
+        _wait_for_initialization_start(
+            backend,
+            threading.Event(),
+            _FreshHeartbeat(),
+        )
+
+    assert backend.rebases == 0
+    np.testing.assert_array_equal(backend._waist_target, old_target)
+
+
+def test_mode5_endpoint_enforces_hold_error_against_canonical_target():
+    measured = np.zeros(3)
+    canonical = np.array([0.0, 0.0, -0.09])
+    backend = _Mode5TransitionBackend(
+        waist_target=canonical,
+        measured_waist=measured,
+    )
+    module = "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3"
+    with (
+        mock.patch(f"{module}.MODE5_WAIST_REBASE_DWELL_S", 0.005),
+        mock.patch(f"{module}.INITIALIZATION_START_TIMEOUT_S", 0.20),
+        mock.patch(f"{module}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 1),
+    ):
+        state = _wait_for_initialization_start(
+            backend,
+            threading.Event(),
+            _FreshHeartbeat(),
+        )
+    assert state is not None
+    assert np.max(np.abs(measured - canonical)) > MAX_WAIST_HOLD_ERROR_RAD
+    np.testing.assert_array_equal(backend._waist_target, canonical)
+
+    chunk = ActionChunk(
+        arm=np.zeros((1, 14)),
+        left_hand=np.zeros((1, 6)),
+        right_hand=np.zeros((1, 6)),
+        end_effector="inspire-ftp",
+    )
+    backend.measured_waist = canonical.copy()
+    backend.endpoint_waist_offset[2] = MAX_WAIST_HOLD_ERROR_RAD
+    with (
+        mock.patch(f"{module}.INITIALIZATION_CONVERGENCE_TIMEOUT_S", 0.05),
+        mock.patch(f"{module}.INITIALIZATION_CONVERGENCE_DWELL_S", 0.005),
+        mock.patch(f"{module}.INITIALIZATION_MIN_DISTINCT_SAMPLES", 1),
+    ):
+        assert _execute_initialization(
+            backend,
+            chunk,
+            threading.Event(),
+            _FreshHeartbeat(),
+            float("inf"),
+        )
+
+    backend.endpoint_waist_offset[2] = MAX_WAIST_HOLD_ERROR_RAD + 0.01
+    with (
+        mock.patch(f"{module}.INITIALIZATION_CONVERGENCE_TIMEOUT_S", 0.02),
+        pytest.raises(DeploymentError, match=r"waist hold error=0\.085 rad"),
+    ):
+        _execute_initialization(
+            backend,
+            chunk,
+            threading.Event(),
+            _FreshHeartbeat(),
+            float("inf"),
+        )
+    assert backend.rebases == 0
+    np.testing.assert_array_equal(backend._waist_target, canonical)
+
+
+def test_non_mode5_guarded_transition_does_not_rebase_waist():
+    class Backend:
+        simulation = False
+        profile = DEX3_PROFILE
+        _arm_target = np.zeros(14)
+        _left_target = np.zeros(7)
+        _right_target = np.zeros(7)
+
+        @staticmethod
+        def _uses_mode5_waist_hold() -> bool:
+            return False
+
+        @staticmethod
+        def _set_measured_waist_hold(_state) -> None:
+            raise AssertionError("non-mode5 transition must not rebase a waist target")
+
+        def state(self) -> RobotState:
+            captured_at = time.monotonic()
+            return RobotState(
+                captured_at=captured_at,
+                mode_machine=QUALIFIED_REAL_MODE_MACHINE,
+                arm=self._arm_target.copy(),
+                arm_dq=np.zeros(14),
+                left_hand=self._left_target.copy(),
+                right_hand=self._right_target.copy(),
+                arm_received_at=captured_at,
+            )
+
+        @staticmethod
+        def publish() -> None:
+            pass
+
+    state = _wait_for_initialization_start(
+        Backend(),
+        threading.Event(),
+        _FreshHeartbeat(),
+    )
+    assert state is not None
 
 
 def test_ftp_release_reaches_zero_arm_weight_without_hand_refresh():

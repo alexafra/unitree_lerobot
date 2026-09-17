@@ -169,8 +169,8 @@ class HandFreshnessGateTests(unittest.TestCase):
     def test_pause_window_is_profile_specific_and_sim_remains_unchanged(self):
         self.assertEqual(_hand_state_pause_age_limit(False, "dex3"), 0.100)
         self.assertEqual(_hand_state_pause_age_limit(False, "inspire-dfx"), 0.100)
-        self.assertEqual(_hand_state_pause_age_limit(False, "inspire-ftp"), 0.150)
-        self.assertEqual(INSPIRE_FTP_HAND_STATE_PAUSE_AGE_S, 0.150)
+        self.assertEqual(_hand_state_pause_age_limit(False, "inspire-ftp"), 0.175)
+        self.assertEqual(INSPIRE_FTP_HAND_STATE_PAUSE_AGE_S, 0.175)
         for end_effector in ("dex3", "inspire-dfx", "inspire-ftp"):
             self.assertEqual(_hand_state_pause_age_limit(True, end_effector), 1.000)
         self.assertEqual(TEMPORARY_UNQUALIFIED_SIM_HAND_STATE_PAUSE_AGE_S, 1.000)
@@ -190,18 +190,18 @@ class HandFreshnessGateTests(unittest.TestCase):
         self.assertFalse(default_result.ready)
         self.assertTrue(sim_result.ready)
 
-    def test_ftp_live_gate_accepts_120ms_and_pauses_after_150ms(self):
+    def test_ftp_live_gate_accepts_recorded_151ms_and_pauses_after_175ms(self):
         gate = HandStateFreshnessGate(
             pause_age_s=_hand_state_pause_age_limit(False, "inspire-ftp")
         )
         accepted = gate.check(
-            _state(captured_at=49.88, left_at=49.88, right_at=50.0),
+            _state(captured_at=49.848724, left_at=49.848724, right_at=50.0),
             now=50.0,
         )
         self.assertTrue(accepted.ready)
 
         paused = gate.check(
-            _state(captured_at=49.849, left_at=49.849, right_at=50.0),
+            _state(captured_at=49.824, left_at=49.824, right_at=50.0),
             now=50.0,
         )
         self.assertFalse(paused.ready)

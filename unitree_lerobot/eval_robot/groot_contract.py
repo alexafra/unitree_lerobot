@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -23,16 +24,24 @@ from unitree_lerobot.eval_robot.g1_end_effectors import (
 )
 from unitree_lerobot.eval_robot.groot_client import DeploymentError
 from unitree_lerobot.utils.depth_encoding import (
+    DEFAULT_DEPTH_FAR_M,
+    DEFAULT_DEPTH_NEAR_M,
     DEPTH_ENCODING,
     DEPTH_OUTPUT_KEY,
     DEPTH_SOURCE_KEY,
 )
 from unitree_lerobot.utils.surface_normal_encoding import (
+    LEGACY_SURFACE_NORMAL_ENCODING_VERSION,
     PinholeIntrinsics,
+    SURFACE_NORMAL_DEPTH_RANGE_REQUIRED_SAMPLES,
+    SURFACE_NORMAL_ENCODING_VERSION,
     SURFACE_NORMAL_OUTPUT_KEY,
     pinhole_intrinsics_from_metadata,
     surface_normals_encoding_metadata,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 TASKS = {
@@ -62,6 +71,17 @@ SUPPORTED_VIDEO_KEYS = (
 )
 # Backwards-compatible public name used by existing callers/tests.
 VIDEO_KEYS = COLOUR_VIDEO_KEYS
+
+# The live client reconstructs the complete late-fusion architecture contract
+# from the server's modality configuration, then compares it byte-for-byte
+# (as Python values) with the checkpoint-bound policy metadata.  Keep these
+# values explicit here rather than trusting descriptive model-directory names.
+POST_VISION_LATE_FUSION_MODE = "post_vision_late_fusion"
+POST_VISION_LATE_FUSION_STAGES = {
+    "pre_vision_language_adapter": (2048, 1024),
+    "post_vision_language_adapter": (4096, 2048),
+}
+POST_VISION_LATE_FUSION_DEEPSTACK_LAYERS = [5, 11, 17]
 STATE_KEYS = ("left_arm", "right_arm", "left_hand", "right_hand")
 ACTION_KEYS = STATE_KEYS
 LANGUAGE_KEYS = ("annotation.human.task_description",)
@@ -244,6 +264,39 @@ class SurfaceNormalEncodingContract:
     intrinsics: PinholeIntrinsics
     max_neighbor_depth_delta_m: float
     camera_calibration: CameraCalibrationIdentity | None = None
+    encoding_version: int = LEGACY_SURFACE_NORMAL_ENCODING_VERSION
+    depth_near_m: float | None = None
+    depth_far_m: float | None = None
+
+    def to_metadata(self) -> dict[str, object]:
+        """Serialize the exact selected offline/live surface-normal transform."""
+
+        if self.encoding_version == LEGACY_SURFACE_NORMAL_ENCODING_VERSION:
+            if self.depth_near_m is not None or self.depth_far_m is not None:
+                raise ValueError("Surface-normal v1 must not carry depth range bounds")
+        elif self.encoding_version == SURFACE_NORMAL_ENCODING_VERSION:
+            if self.depth_near_m is None or self.depth_far_m is None:
+                raise ValueError("Surface-normal v2 requires depth range bounds")
+        else:
+            raise ValueError(
+                f"Unsupported surface-normal encoding version {self.encoding_version!r}"
+            )
+        return surface_normals_encoding_metadata(
+            intrinsics=self.intrinsics,
+            max_neighbor_depth_delta_m=self.max_neighbor_depth_delta_m,
+            camera_calibration=self.camera_calibration,
+            encoding_version=self.encoding_version,
+            depth_near_m=(
+                self.depth_near_m
+                if self.depth_near_m is not None
+                else DEFAULT_DEPTH_NEAR_M
+            ),
+            depth_far_m=(
+                self.depth_far_m
+                if self.depth_far_m is not None
+                else DEFAULT_DEPTH_FAR_M
+            ),
+        )
 
 
 def _task_contract_sha256(instructions: list[str]) -> str:
@@ -310,7 +363,28 @@ def validate_policy_instruction(metadata: dict[str, Any], instruction: str) -> t
     return tuple(instructions)
 
 
-def _vision_input_contract(video_keys: tuple[str, ...], fusion: Any = None) -> dict[str, Any]:  # earlyfusion
+def _vision_input_contract(
+    video_keys: tuple[str, ...],
+    fusion: Any = None,
+    *,
+    post_vision_fusion: Any = False,
+    post_vision_fusion_stage: Any = None,
+) -> dict[str, Any]:  # earlyfusion
+    if not isinstance(post_vision_fusion, bool):
+        raise DeploymentError(
+            "Server post_vision_fusion is malformed: expected a boolean, "
+            f"got {post_vision_fusion!r}"
+        )
+    if post_vision_fusion and fusion is not None:
+        raise DeploymentError(
+            "Server cannot request channel_fusion and post_vision_fusion together"
+        )
+    if not post_vision_fusion and post_vision_fusion_stage is not None:
+        raise DeploymentError(
+            "Server post_vision_fusion_stage must be absent when "
+            "post_vision_fusion is disabled"
+        )
+
     layout = ["ego_view:0", "ego_view:1", "ego_view:2"]  # earlyfusion
     if fusion is not None:  # earlyfusion
         if not isinstance(fusion, list) or any(not isinstance(source, dict) for source in fusion):  # earlyfusion
@@ -323,6 +397,54 @@ def _vision_input_contract(video_keys: tuple[str, ...], fusion: Any = None) -> d
         if sources != expected:  # earlyfusion
             raise DeploymentError(f"Unsupported channel_fusion for {video_keys}: {sources!r}")  # earlyfusion
         layout = [f"{key}:{channel}" for key, channels in sources for channel in channels]  # earlyfusion
+
+    if post_vision_fusion:
+        if video_keys not in {RGBD_VIDEO_KEYS, SURFACE_NORMAL_VIDEO_KEYS}:
+            raise DeploymentError(
+                "Post-vision late fusion requires exactly ordered RGB+depth or "
+                f"RGB+surface-normal views, got {video_keys!r}"
+            )
+        if post_vision_fusion_stage not in POST_VISION_LATE_FUSION_STAGES:
+            raise DeploymentError(
+                "Unsupported post_vision_fusion_stage: "
+                f"got {post_vision_fusion_stage!r}, expected exactly one of "
+                f"{sorted(POST_VISION_LATE_FUSION_STAGES)!r}"
+            )
+        adapter_input_dim, adapter_output_dim = POST_VISION_LATE_FUSION_STAGES[
+            post_vision_fusion_stage
+        ]
+        parameters_per_adapter = (
+            adapter_input_dim * adapter_output_dim + adapter_output_dim
+        )
+        return {
+            "version": 2,
+            "mode": POST_VISION_LATE_FUSION_MODE,
+            "input_channels": 3,
+            "channel_layout": layout,
+            "patch_embed_init": "original_rgb",
+            "patch_embed_trainable": False,
+            "wire_video_keys": list(video_keys),
+            "post_vision_fusion": {
+                "version": 1,
+                "adapter_type": "concat_linear",
+                "adapter_bias": True,
+                "adapter_bias_init": "zeros",
+                "adapter_count": 4,
+                "deepstack_layers": list(
+                    POST_VISION_LATE_FUSION_DEEPSTACK_LAYERS
+                ),
+                "adapter_init": "rgb50_geo50",
+                "rgb_init_scale": 0.5,
+                "geometry_init_scale": 0.5,
+                "stage": post_vision_fusion_stage,
+                "adapter_input_dim": adapter_input_dim,
+                "adapter_output_dim": adapter_output_dim,
+                "parameters_per_adapter": parameters_per_adapter,
+                "total_adapter_parameters": 4 * parameters_per_adapter,
+                "source_keys": list(video_keys),
+            },
+        }
+
     channels = len(layout)  # earlyfusion
     return {"version": 1, "mode": "early_channel_fusion" if fusion is not None else "separate_views", "input_channels": channels, "channel_layout": layout, "patch_embed_init": {3: "original_rgb", 4: "rgb_mean", 6: "zeros"}[channels], "wire_video_keys": list(video_keys)}  # earlyfusion
 
@@ -424,15 +546,107 @@ def _validate_surface_normal_metadata(contract: dict[str, Any]) -> SurfaceNormal
         raise DeploymentError(
             "Deployment dataset contract has no surface_normals_encoding for the surface-normal model"
         )
-    expected = surface_normals_encoding_metadata()
+    encoding_version = encoding.get("encoding_version")
+    if (
+        isinstance(encoding_version, bool)
+        or not isinstance(encoding_version, int)
+        or encoding_version
+        not in {
+            LEGACY_SURFACE_NORMAL_ENCODING_VERSION,
+            SURFACE_NORMAL_ENCODING_VERSION,
+        }
+    ):
+        raise DeploymentError(
+            "Unsupported surface-normal encoding_version: "
+            f"got {encoding_version!r}, expected one of "
+            f"{[LEGACY_SURFACE_NORMAL_ENCODING_VERSION, SURFACE_NORMAL_ENCODING_VERSION]!r}"
+        )
+    expected = surface_normals_encoding_metadata(encoding_version=encoding_version)
     for field, value in expected.items():
-        if field == "intrinsics":
+        if field in {"intrinsics", "depth_valid_range_m"}:
             continue
         if encoding.get(field) != value:
             raise DeploymentError(
                 f"Unsupported surface-normal encoding for {field}: "
                 f"got {encoding.get(field)!r}, expected {value!r}"
             )
+    depth_near_m: float | None = None
+    depth_far_m: float | None = None
+    depth_valid_range = encoding.get("depth_valid_range_m")
+    if encoding_version == LEGACY_SURFACE_NORMAL_ENCODING_VERSION:
+        if "depth_valid_range_m" in encoding:
+            raise DeploymentError(
+                "Legacy surface-normal encoding_version 1 must not declare "
+                "depth_valid_range_m"
+            )
+    else:
+        if not isinstance(depth_valid_range, dict) or set(depth_valid_range) != {
+            "near_m",
+            "far_m",
+            "inclusive",
+            "required_samples",
+        }:
+            raise DeploymentError(
+                "Surface-normal encoding_version 2 depth_valid_range_m must contain "
+                "exactly near_m, far_m, inclusive, and required_samples"
+            )
+        if depth_valid_range["inclusive"] is not True:
+            raise DeploymentError(
+                "Surface-normal encoding_version 2 depth_valid_range_m.inclusive must be true"
+            )
+        if depth_valid_range["required_samples"] != list(
+            SURFACE_NORMAL_DEPTH_RANGE_REQUIRED_SAMPLES
+        ):
+            raise DeploymentError(
+                "Surface-normal encoding_version 2 "
+                "depth_valid_range_m.required_samples must be exactly "
+                f"{list(SURFACE_NORMAL_DEPTH_RANGE_REQUIRED_SAMPLES)!r}"
+            )
+        raw_near_m = depth_valid_range["near_m"]
+        raw_far_m = depth_valid_range["far_m"]
+        if (
+            isinstance(raw_near_m, bool)
+            or isinstance(raw_far_m, bool)
+            or not isinstance(raw_near_m, (int, float))
+            or not isinstance(raw_far_m, (int, float))
+        ):
+            raise DeploymentError(
+                "Surface-normal depth_valid_range_m near_m/far_m are non-numeric"
+            )
+        depth_near_m = float(raw_near_m)
+        depth_far_m = float(raw_far_m)
+        if (
+            not np.isfinite(depth_near_m)
+            or not np.isfinite(depth_far_m)
+            or depth_near_m < 0.0
+            or depth_far_m <= depth_near_m
+        ):
+            raise DeploymentError(
+                "Invalid surface-normal depth_valid_range_m: "
+                f"near_m={depth_near_m!r}, far_m={depth_far_m!r}"
+            )
+        declared_depth_encoding = contract.get("depth_encoding")
+        if declared_depth_encoding is None:
+            expected_near_m = DEFAULT_DEPTH_NEAR_M
+            expected_far_m = DEFAULT_DEPTH_FAR_M
+            expected_source = "canonical depth encoding"
+        else:
+            depth_contract = _validate_depth_metadata(contract)
+            expected_near_m = depth_contract.near_m
+            expected_far_m = depth_contract.far_m
+            expected_source = "dataset depth_encoding"
+        if depth_near_m != expected_near_m or depth_far_m != expected_far_m:
+            raise DeploymentError(
+                "Surface-normal v2 depth_valid_range_m must exactly match the "
+                f"{expected_source} near/far bounds "
+                f"[{expected_near_m}, {expected_far_m}]"
+            )
+    unknown_fields = set(encoding) - set(expected) - {"camera_calibration"}
+    if unknown_fields:
+        raise DeploymentError(
+            "Surface-normal encoding declares unsupported fields: "
+            f"{sorted(unknown_fields)!r}"
+        )
     try:
         intrinsics = pinhole_intrinsics_from_metadata(encoding.get("intrinsics"))
     except (TypeError, ValueError) as exc:
@@ -456,6 +670,9 @@ def _validate_surface_normal_metadata(contract: dict[str, Any]) -> SurfaceNormal
         intrinsics=intrinsics,
         max_neighbor_depth_delta_m=float(encoding["max_neighbor_depth_delta_m"]),
         camera_calibration=camera_calibration,
+        encoding_version=encoding_version,
+        depth_near_m=depth_near_m,
+        depth_far_m=depth_far_m,
     )
 
 
@@ -581,6 +798,14 @@ def _config_field(config: dict[str, Any], modality: str, field: str) -> Any:
     return value
 
 
+def _optional_config_value(config: Any, field: str, default: Any = None) -> Any:
+    """Read optional serialized ModalityConfig fields without importing GR00T."""
+
+    if isinstance(config, dict):
+        return config.get(field, default)
+    return getattr(config, field, default)
+
+
 def validate_model_contract(config: dict[str, Any], *, end_effector: str = "dex3") -> ModelContract:
     """Accept only the supported G1 colour/geometry and selected hand contract."""
 
@@ -598,8 +823,17 @@ def validate_model_contract(config: dict[str, Any], *, end_effector: str = "dex3
             f"one of {SUPPORTED_VIDEO_KEYS}."
         )
     video_config = config["video"]  # earlyfusion
-    fusion = video_config.get("channel_fusion") if isinstance(video_config, dict) else getattr(video_config, "channel_fusion", None)  # earlyfusion
-    vision_input_contract = _vision_input_contract(video_keys, fusion)  # earlyfusion
+    fusion = _optional_config_value(video_config, "channel_fusion")  # earlyfusion
+    vision_input_contract = _vision_input_contract(  # earlyfusion
+        video_keys,
+        fusion,
+        post_vision_fusion=_optional_config_value(
+            video_config, "post_vision_fusion", False
+        ),
+        post_vision_fusion_stage=_optional_config_value(
+            video_config, "post_vision_fusion_stage"
+        ),
+    )
     for modality, keys in expected.items():
         actual = tuple(_config_field(config, modality, "modality_keys"))
         if actual != keys:
@@ -1377,7 +1611,7 @@ def validate_action_chunk(
 def _parse_full_action(
     action: dict[str, Any], model_horizon: int, *, end_effector: str = "dex3"
 ) -> ActionChunk:
-    """Parse a complete model prediction and enforce its absolute joint ranges."""
+    """Parse a complete model prediction and project finite arms into safe ranges."""
 
     profile = _end_effector_profile(end_effector)
     chunks = {
@@ -1385,6 +1619,30 @@ def _parse_full_action(
         for key in ACTION_KEYS
     }
     full_arm = np.concatenate((chunks["left_arm"], chunks["right_arm"]), axis=1)
+    safe_lower = ARM_LOWER + JOINT_LIMIT_MARGIN_RAD
+    safe_upper = ARM_UPPER - JOINT_LIMIT_MARGIN_RAD
+    clamped_arm = np.clip(full_arm, safe_lower, safe_upper)
+    changed = np.argwhere(clamped_arm != full_arm)
+    if changed.size:
+        excess = np.abs(full_arm - clamped_arm)
+        worst_flat = int(np.argmax(excess))
+        worst_step, worst_joint = np.unravel_index(worst_flat, excess.shape)
+        affected_joints = sorted({ARM_JOINT_NAMES[int(joint)] for _step, joint in changed})
+        LOGGER.warning(
+            "POLICY ARM LIMIT CLAMP: clamped %d finite target(s) across joints=%s; "
+            "worst step=%d joint=%d (%s) original=%+.4f rad clamped=%+.4f rad "
+            "excess=%.4f rad. Continuing execution; operator may stop with s or q.",
+            len(changed),
+            ",".join(affected_joints),
+            int(worst_step),
+            int(worst_joint),
+            ARM_JOINT_NAMES[int(worst_joint)],
+            float(full_arm[worst_step, worst_joint]),
+            float(clamped_arm[worst_step, worst_joint]),
+            float(excess[worst_step, worst_joint]),
+            extra={"terminal_yellow": True},
+        )
+        full_arm = clamped_arm
     _check_limits(
         "arm",
         full_arm,

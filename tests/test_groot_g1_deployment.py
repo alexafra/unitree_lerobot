@@ -48,6 +48,7 @@ from unitree_lerobot.eval_robot.eval_groot_g1 import (
 from unitree_lerobot.eval_robot.groot_client import DeploymentError, MsgSerializer
 from unitree_lerobot.eval_robot.groot_contract import (
     ACTION_KEYS,
+    ARM_UPPER,
     ActionChunk,
     COLOUR_VIDEO_KEYS,
     DepthEncodingContract,
@@ -70,6 +71,7 @@ from unitree_lerobot.eval_robot.groot_contract import (
     load_initialization_spec,
     make_observation,
     parse_action_chunk,
+    parse_action_plan,
     validate_initialization_spec,
     validate_model_contract,
     validate_policy_metadata,
@@ -140,6 +142,7 @@ from unitree_lerobot.utils.camera_calibration import (
 from unitree_lerobot.utils.depth_encoding import encode_depth_gray_rgb
 from unitree_lerobot.utils.surface_normal_encoding import (
     DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+    LEGACY_SURFACE_NORMAL_ENCODING_VERSION,
     REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
     encode_surface_normals_rgb,
     surface_normals_encoding_metadata,
@@ -151,6 +154,7 @@ def modality_config(
     *,
     rgbd: bool = False,
     surface_normals: bool = False,
+    late_fusion_stage: str | None = None,
 ):
     if rgbd and surface_normals:
         raise ValueError("test config cannot request both geometry views")
@@ -159,7 +163,7 @@ def modality_config(
         if surface_normals
         else RGBD_VIDEO_KEYS if rgbd else COLOUR_VIDEO_KEYS
     )
-    return {
+    config = {
         "video": {
             "delta_indices": [0],
             "modality_keys": list(video_keys),
@@ -183,6 +187,12 @@ def modality_config(
             "modality_keys": ["annotation.human.task_description"],
         },
     }
+    if late_fusion_stage is not None:
+        config["video"].update(
+            post_vision_fusion=True,
+            post_vision_fusion_stage=late_fusion_stage,
+        )
+    return config
 
 
 def valid_action(horizon: int = 16):
@@ -1770,6 +1780,52 @@ class GrootG1DeploymentTests(unittest.TestCase):
         ]
         self.assertEqual(len(prompt_calls), 2)
 
+    def test_armed_confirmation_prompt_refreshes_at_sixty_seconds_not_before(self):
+        import unitree_lerobot.eval_robot.eval_groot_g1 as eval_module
+
+        prompt = "[WAITING FOR RUN] Press r (no Enter); s STOP; q release: "
+        self.assertEqual(eval_module.OPERATOR_CONFIRMATION_TIMEOUT_S, 600.0)
+        self.assertEqual(eval_module.CONFIRMATION_PROMPT_REFRESH_S, 60.0)
+
+        for elapsed_s, expected_prompt_count in ((5.0, 1), (59.999, 1), (60.0, 2)):
+            with self.subTest(elapsed_s=elapsed_s):
+                actuator = SimpleNamespace(
+                    heartbeat=mock.Mock(),
+                    assert_healthy=mock.Mock(return_value=False),
+                )
+                stdin = io.StringIO("r\n")
+                with (
+                    mock.patch.object(sys, "stdin", stdin),
+                    mock.patch(
+                        "unitree_lerobot.eval_robot.eval_groot_g1.time.monotonic",
+                        side_effect=[0.0, 0.0, 0.0, elapsed_s, elapsed_s],
+                    ),
+                    mock.patch(
+                        "unitree_lerobot.eval_robot.eval_groot_g1.select.select",
+                        side_effect=[([], [], []), ([stdin], [], [])],
+                    ),
+                    mock.patch("builtins.print") as printed,
+                ):
+                    response = _readline_while_armed(
+                        actuator,
+                        prompt,
+                        timeout_s=eval_module.OPERATOR_CONFIRMATION_TIMEOUT_S,
+                        confirmation_mode=True,
+                    )
+
+                self.assertEqual(response, "continue")
+                prompt_calls = [
+                    call
+                    for call in printed.call_args_list
+                    if call.args
+                    and isinstance(call.args[0], str)
+                    and call.args[0].endswith(prompt)
+                ]
+                self.assertEqual(len(prompt_calls), expected_prompt_count)
+                self.assertEqual(prompt_calls[0].args[0], prompt)
+                if expected_prompt_count == 2:
+                    self.assertEqual(prompt_calls[1].args[0], f"\n{prompt}")
+
     def test_pre_initialization_stop_stays_at_gate_until_r_without_calling_hold(self):
         master_fd, slave_fd = pty.openpty()
         stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
@@ -1837,6 +1893,30 @@ class GrootG1DeploymentTests(unittest.TestCase):
             mock.patch(f"{module}.select.select", select_mock),
             mock.patch("builtins.print"),
             self.assertRaisesRegex(DeploymentError, "Timed out waiting for RUN"),
+        ):
+            _confirm_while_armed(actuator, "ready", "RUN")
+
+        actuator.heartbeat.assert_called_once_with()
+        actuator.assert_healthy.assert_called_once_with()
+        select_mock.assert_not_called()
+
+    def test_armed_confirmation_default_ten_minute_timeout_remains_fail_safe(self):
+        actuator = SimpleNamespace(
+            heartbeat=mock.Mock(),
+            assert_healthy=mock.Mock(return_value=False),
+        )
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        stdin = io.StringIO("")
+        select_mock = mock.Mock()
+        with (
+            mock.patch.object(sys, "stdin", stdin),
+            mock.patch(f"{module}.time.monotonic", side_effect=[0.0, 0.0, 600.0]),
+            mock.patch(f"{module}.select.select", select_mock),
+            mock.patch("builtins.print"),
+            self.assertRaisesRegex(
+                DeploymentError,
+                r"Timed out waiting for RUN;.*OPERATOR_CONFIRMATION_TIMEOUT_S=600\.0",
+            ),
         ):
             _confirm_while_armed(actuator, "ready", "RUN")
 
@@ -2977,6 +3057,163 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertEqual(contract.vision_input_contract["wire_video_keys"], list(SURFACE_NORMAL_VIDEO_KEYS))  # earlyfusion
         self.assertEqual(contract.vision_input_contract["channel_layout"][-3:], ["surface_normals_view:0", "surface_normals_view:1", "surface_normals_view:2"])  # earlyfusion
 
+    def test_model_contract_derives_exact_late_fusion_architecture(self):
+        cases = (
+            (True, False, "pre_vision_language_adapter", 2048, 1024),
+            (True, False, "post_vision_language_adapter", 4096, 2048),
+            (False, True, "pre_vision_language_adapter", 2048, 1024),
+            (False, True, "post_vision_language_adapter", 4096, 2048),
+        )
+        for rgbd, surface_normals, stage, input_dim, output_dim in cases:
+            with self.subTest(geometry="rgbd" if rgbd else "normals", stage=stage):
+                model = validate_model_contract(
+                    modality_config(
+                        rgbd=rgbd,
+                        surface_normals=surface_normals,
+                        late_fusion_stage=stage,
+                    )
+                )
+                video_keys = RGBD_VIDEO_KEYS if rgbd else SURFACE_NORMAL_VIDEO_KEYS
+                parameters_per_adapter = input_dim * output_dim + output_dim
+                self.assertEqual(
+                    model.vision_input_contract,
+                    {
+                        "version": 2,
+                        "mode": "post_vision_late_fusion",
+                        "input_channels": 3,
+                        "channel_layout": [
+                            "ego_view:0",
+                            "ego_view:1",
+                            "ego_view:2",
+                        ],
+                        "patch_embed_init": "original_rgb",
+                        "patch_embed_trainable": False,
+                        "wire_video_keys": list(video_keys),
+                        "post_vision_fusion": {
+                            "version": 1,
+                            "adapter_type": "concat_linear",
+                            "adapter_bias": True,
+                            "adapter_bias_init": "zeros",
+                            "adapter_count": 4,
+                            "deepstack_layers": [5, 11, 17],
+                            "adapter_init": "rgb50_geo50",
+                            "rgb_init_scale": 0.5,
+                            "geometry_init_scale": 0.5,
+                            "stage": stage,
+                            "adapter_input_dim": input_dim,
+                            "adapter_output_dim": output_dim,
+                            "parameters_per_adapter": parameters_per_adapter,
+                            "total_adapter_parameters": 4
+                            * parameters_per_adapter,
+                            "source_keys": list(video_keys),
+                        },
+                    },
+                )
+
+    def test_model_contract_late_fusion_fails_closed_on_malformed_or_mixed_labels(self):
+        cases = (
+            (
+                lambda video: video.update(post_vision_fusion="true"),
+                "post_vision_fusion is malformed",
+            ),
+            (
+                lambda video: video.update(
+                    post_vision_fusion=False,
+                    post_vision_fusion_stage="pre_vision_language_adapter",
+                ),
+                "must be absent",
+            ),
+            (
+                lambda video: video.update(
+                    post_vision_fusion=True,
+                    post_vision_fusion_stage="pre_merger",
+                ),
+                "Unsupported post_vision_fusion_stage",
+            ),
+            (
+                lambda video: video.update(
+                    post_vision_fusion=True,
+                    post_vision_fusion_stage="post_merger",
+                ),
+                "Unsupported post_vision_fusion_stage",
+            ),
+            (
+                lambda video: video.update(
+                    post_vision_fusion=True,
+                    post_vision_fusion_stage="pre_vision_language_adapter",
+                    channel_fusion=[
+                        {"key": "ego_view", "channels": [0, 1, 2]},
+                        {"key": "depth_gray_view", "channels": [0]},
+                    ],
+                ),
+                "cannot request channel_fusion and post_vision_fusion together",
+            ),
+        )
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                config = modality_config(rgbd=True)
+                mutate(config["video"])
+                with self.assertRaisesRegex(DeploymentError, message):
+                    validate_model_contract(config)
+
+    def test_policy_metadata_requires_exact_late_fusion_contract(self):
+        model = validate_model_contract(
+            modality_config(
+                rgbd=True,
+                late_fusion_stage="post_vision_language_adapter",
+            )
+        )
+        expected_vision = model.vision_input_contract
+        metadata = {
+            "protocol_version": 1,
+            "embodiment_tag": "new_embodiment",
+            "action_output_contract": EXPECTED_ACTION_OUTPUT_CONTRACT,
+            "vision_input_contract": expected_vision,
+            "dataset_contract": {
+                "robot_type": EXPECTED_ROBOT_TYPE,
+                "fps": 30.0,
+                "observation_state_names": EXPECTED_JOINT_NAMES,
+                "action_names": EXPECTED_JOINT_NAMES,
+                "ego_view_shape": EXPECTED_EGO_VIEW_SHAPE,
+                "video_shapes": {
+                    "ego_view": EXPECTED_EGO_VIEW_SHAPE,
+                    "depth_gray_view": EXPECTED_DEPTH_VIEW_SHAPE,
+                },
+                "depth_encoding": {
+                    "source_key": "depth_0",
+                    "feature_key": "observation.images.depth_gray_view",
+                    "encoding": "linear_grayscale_replicated_rgb",
+                    "near_m": 0.25,
+                    "far_m": 1.0,
+                    "invalid_value": 0,
+                    "valid_value_range": [1, 255],
+                },
+            },
+        }
+
+        validate_policy_metadata(
+            metadata,
+            requires_depth=True,
+            vision_input_contract=expected_vision,
+        )
+        for field, value in (
+            ("adapter_count", 3),
+            ("adapter_bias", False),
+            ("rgb_init_scale", 0.9),
+            ("stage", "pre_vision_language_adapter"),
+        ):
+            with self.subTest(field=field):
+                malformed = copy.deepcopy(metadata)
+                malformed["vision_input_contract"]["post_vision_fusion"][field] = value
+                with self.assertRaisesRegex(
+                    DeploymentError, "vision input contract mismatch"
+                ):
+                    validate_policy_metadata(
+                        malformed,
+                        requires_depth=True,
+                        vision_input_contract=expected_vision,
+                    )
+
     def test_policy_metadata_validates_exact_surface_normal_contract(self):
         metadata = {
             "protocol_version": 1,
@@ -3002,6 +3239,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
             SurfaceNormalEncodingContract(
                 intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
                 max_neighbor_depth_delta_m=0.05,
+                encoding_version=2,
+                depth_near_m=0.25,
+                depth_far_m=1.0,
             ),
         )
         fusion_config = modality_config(surface_normals=True)  # earlyfusion
@@ -3058,11 +3298,16 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 intrinsics=REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
                 max_neighbor_depth_delta_m=0.05,
                 camera_calibration=identity,
+                encoding_version=2,
+                depth_near_m=0.25,
+                depth_far_m=1.0,
             ),
         )
 
     def test_policy_metadata_keeps_legacy_surface_normal_contract_untagged(self):
-        encoding = surface_normals_encoding_metadata()
+        encoding = surface_normals_encoding_metadata(
+            encoding_version=LEGACY_SURFACE_NORMAL_ENCODING_VERSION
+        )
         self.assertNotIn("camera_calibration", encoding)
         metadata = {
             "protocol_version": 1,
@@ -3086,6 +3331,113 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
         self.assertIsNone(contract.camera_calibration)
         self.assertEqual(contract.intrinsics, DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480)
+        self.assertEqual(contract.encoding_version, LEGACY_SURFACE_NORMAL_ENCODING_VERSION)
+        self.assertIsNone(contract.depth_near_m)
+        self.assertIsNone(contract.depth_far_m)
+
+        encoding["depth_valid_range_m"] = None
+        with self.assertRaisesRegex(DeploymentError, "must not declare depth_valid_range_m"):
+            validate_policy_metadata(metadata, requires_surface_normals=True)
+
+    def test_policy_metadata_rejects_malformed_surface_normal_v2_range(self):
+        cases = (
+            (
+                lambda value: value["depth_valid_range_m"].update(inclusive=False),
+                "inclusive must be true",
+            ),
+            (
+                lambda value: value["depth_valid_range_m"].update(
+                    required_samples=["center"]
+                ),
+                "required_samples must be exactly",
+            ),
+            (
+                lambda value: value.update(range_semantics="center_only"),
+                "unsupported fields",
+            ),
+        )
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                encoding = surface_normals_encoding_metadata()
+                mutate(encoding)
+                metadata = {
+                    "protocol_version": 1,
+                    "embodiment_tag": "new_embodiment",
+                    "action_output_contract": EXPECTED_ACTION_OUTPUT_CONTRACT,
+                    "dataset_contract": {
+                        "robot_type": EXPECTED_ROBOT_TYPE,
+                        "fps": 30.0,
+                        "observation_state_names": EXPECTED_JOINT_NAMES,
+                        "action_names": EXPECTED_JOINT_NAMES,
+                        "ego_view_shape": EXPECTED_EGO_VIEW_SHAPE,
+                        "video_shapes": {
+                            "ego_view": EXPECTED_EGO_VIEW_SHAPE,
+                            "surface_normals_view": EXPECTED_DEPTH_VIEW_SHAPE,
+                        },
+                        "surface_normals_encoding": encoding,
+                    },
+                }
+
+                with self.assertRaisesRegex(DeploymentError, message):
+                    validate_policy_metadata(metadata, requires_surface_normals=True)
+
+    def test_policy_metadata_rejects_surface_normal_v2_range_mismatch(self):
+        encoding = surface_normals_encoding_metadata()
+        encoding["depth_valid_range_m"]["far_m"] = 0.9
+        metadata = {
+            "protocol_version": 1,
+            "embodiment_tag": "new_embodiment",
+            "action_output_contract": EXPECTED_ACTION_OUTPUT_CONTRACT,
+            "dataset_contract": {
+                "robot_type": EXPECTED_ROBOT_TYPE,
+                "fps": 30.0,
+                "observation_state_names": EXPECTED_JOINT_NAMES,
+                "action_names": EXPECTED_JOINT_NAMES,
+                "ego_view_shape": EXPECTED_EGO_VIEW_SHAPE,
+                "video_shapes": {
+                    "ego_view": EXPECTED_EGO_VIEW_SHAPE,
+                    "surface_normals_view": EXPECTED_DEPTH_VIEW_SHAPE,
+                },
+                "surface_normals_encoding": encoding,
+            },
+        }
+
+        with self.assertRaisesRegex(DeploymentError, "must exactly match.*canonical"):
+            validate_policy_metadata(metadata, requires_surface_normals=True)
+
+    def test_policy_metadata_rejects_surface_normal_range_mismatching_depth_view(self):
+        encoding = surface_normals_encoding_metadata()
+        encoding["depth_valid_range_m"]["far_m"] = 0.9
+        metadata = {
+            "protocol_version": 1,
+            "embodiment_tag": "new_embodiment",
+            "action_output_contract": EXPECTED_ACTION_OUTPUT_CONTRACT,
+            "dataset_contract": {
+                "robot_type": EXPECTED_ROBOT_TYPE,
+                "fps": 30.0,
+                "observation_state_names": EXPECTED_JOINT_NAMES,
+                "action_names": EXPECTED_JOINT_NAMES,
+                "ego_view_shape": EXPECTED_EGO_VIEW_SHAPE,
+                "video_shapes": {
+                    "ego_view": EXPECTED_EGO_VIEW_SHAPE,
+                    "depth_gray_view": EXPECTED_DEPTH_VIEW_SHAPE,
+                    "surface_normals_view": EXPECTED_DEPTH_VIEW_SHAPE,
+                },
+                "depth_encoding": {
+                    "source_key": "depth_0",
+                    "feature_key": "observation.images.depth_gray_view",
+                    "encoding": "linear_grayscale_replicated_rgb",
+                    "near_m": 0.25,
+                    "far_m": 1.0,
+                    "invalid_value": 0,
+                    "valid_value_range": [1, 255],
+                },
+                "surface_normals_encoding": encoding,
+            },
+        }
+
+        with self.assertRaisesRegex(DeploymentError, "must exactly match.*dataset depth_encoding"):
+            validate_policy_metadata(metadata, requires_surface_normals=True)
 
     def test_policy_metadata_requires_the_explicit_g1_training_tag(self):
         metadata = {
@@ -3453,12 +3805,80 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 validate_initial_step=False,
             )
 
-    def test_action_parser_rejects_invalid_unexecuted_tail(self):
+    def test_action_parser_clamps_finite_arm_target_in_full_unexecuted_tail(self):
         action = valid_action()
         action["left_arm"][0, 15, 0] = 100.0
 
-        with self.assertRaisesRegex(DeploymentError, "outside"):
-            parse_action_chunk(action, 16, 8, np.zeros(14), np.zeros(7), np.zeros(7))
+        with self.assertLogs(
+            "unitree_lerobot.eval_robot.groot_contract", level="WARNING"
+        ) as captured:
+            plan = parse_action_plan(
+                action,
+                16,
+                np.zeros(14),
+                np.zeros(7),
+                np.zeros(7),
+                validate_target_steps=False,
+            )
+
+        self.assertEqual(plan.length, 16)
+        self.assertAlmostEqual(
+            plan.arm[15, 0],
+            ARM_UPPER[0] - JOINT_LIMIT_MARGIN_RAD,
+        )
+        self.assertEqual(len(captured.records), 1)
+        self.assertTrue(getattr(captured.records[0], "terminal_yellow", False))
+        self.assertIn("clamped 1 finite target(s)", captured.records[0].getMessage())
+
+    def test_action_parser_clamps_live_right_elbow_value_and_warns_yellow_once(self):
+        action = valid_action(horizon=32)
+        action["right_arm"][0, 29, 3] = 2.0910
+
+        with self.assertLogs(
+            "unitree_lerobot.eval_robot.groot_contract", level="WARNING"
+        ) as captured:
+            plan = parse_action_plan(
+                action,
+                32,
+                np.zeros(14),
+                np.zeros(7),
+                np.zeros(7),
+                validate_target_steps=False,
+            )
+
+        safe_upper = ARM_UPPER[10] - JOINT_LIMIT_MARGIN_RAD
+        self.assertAlmostEqual(plan.arm[29, 10], safe_upper)
+        self.assertEqual(len(captured.records), 1)
+        record = captured.records[0]
+        self.assertTrue(getattr(record, "terminal_yellow", False))
+        message = record.getMessage()
+        self.assertIn("clamped 1 finite target(s)", message)
+        self.assertIn("step=29", message)
+        self.assertIn("joint=10 (kRightElbow)", message)
+        self.assertIn("original=+2.0910 rad", message)
+        self.assertIn(f"clamped=+{safe_upper:.4f} rad", message)
+        self.assertIn("Continuing execution", message)
+
+    def test_action_parser_does_not_warn_or_mutate_in_range_arm_plan(self):
+        action = valid_action(horizon=32)
+        action["left_arm"][0, :, 0] = np.linspace(-0.2, 0.2, 32)
+        action["right_arm"][0, :, 3] = np.linspace(-0.3, 0.3, 32)
+        expected = np.concatenate((action["left_arm"][0], action["right_arm"][0]), axis=1)
+
+        with mock.patch(
+            "unitree_lerobot.eval_robot.groot_contract.LOGGER.warning"
+        ) as warning:
+            plan = parse_action_plan(
+                action,
+                32,
+                np.zeros(14),
+                np.zeros(7),
+                np.zeros(7),
+                validate_target_steps=False,
+            )
+
+        warning.assert_not_called()
+        np.testing.assert_array_equal(plan.arm, expected)
 
     def test_action_parser_accepts_calibrated_one_milliradian_hand_endpoint(self):
         action = valid_action()
@@ -3779,7 +4199,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
         missing = copy.deepcopy(live_config)
         del missing["head_camera"]["calibration"]
-        with self.assertRaisesRegex(DeploymentError, "requires a valid advertised"):
+        with self.assertRaisesRegex(DeploymentError, "partial updated depth metadata"):
             _validate_live_head_config(
                 missing,
                 requires_depth=True,
@@ -3794,6 +4214,89 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 requires_depth=True,
                 surface_normal_encoding=encoding,
             )
+
+    def test_tagged_surface_normal_contract_accepts_exact_pinned_legacy_profile(self):
+        identity = calibration_identity(
+            D435I_254322071415_CALIBRATION,
+            source="episode.info.depth.calibration",
+        )
+        encoding = SurfaceNormalEncodingContract(
+            intrinsics=REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
+            max_neighbor_depth_delta_m=0.05,
+            camera_calibration=identity,
+        )
+        legacy_config = {
+            "head_camera": {
+                "enable_zmq": True,
+                "fps": 30,
+                "image_shape": [480, 640],
+                "type": "realsense",
+                "enable_depth": True,
+                "binocular": False,
+                "serial_number": "254322071415",
+                "zmq_port": 5555,
+                "depth_zmq_port": 5558,
+                "depth_scale_m_per_unit": 0.0010000000474974513,
+            }
+        }
+
+        with self.assertLogs(
+            "unitree_lerobot.eval_robot.robot_control.safe_g1_dex3",
+            level="WARNING",
+        ) as captured:
+            _, _, scale = _validate_live_head_config(
+                legacy_config,
+                requires_depth=True,
+                surface_normal_encoding=encoding,
+            )
+
+        self.assertEqual(scale, 0.001)
+        self.assertIn(D435I_254322071415_CALIBRATION["fingerprint"], captured.output[0])
+
+    def test_tagged_surface_normal_pinned_legacy_profile_fails_closed_on_mismatch(self):
+        identity = calibration_identity(
+            D435I_254322071415_CALIBRATION,
+            source="episode.info.depth.calibration",
+        )
+        encoding = SurfaceNormalEncodingContract(
+            intrinsics=REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
+            max_neighbor_depth_delta_m=0.05,
+            camera_calibration=identity,
+        )
+        exact_legacy = {
+            "head_camera": {
+                "enable_zmq": True,
+                "fps": 30,
+                "image_shape": [480, 640],
+                "type": "realsense",
+                "enable_depth": True,
+                "binocular": False,
+                "serial_number": "254322071415",
+                "zmq_port": 5555,
+                "depth_zmq_port": 5558,
+                "depth_scale_m_per_unit": 0.001,
+            }
+        }
+        mismatches = {
+            "null calibration": {"calibration": None},
+            "partial calibration": {"calibration": {"schema": "realsense_rgbd_calibration.v1"}},
+            "wrong serial": {"serial_number": "other"},
+            "wrong shape": {"image_shape": [720, 1280]},
+            "wrong fps": {"fps": 15},
+            "wrong scale": {"depth_scale_m_per_unit": 0.0005},
+            "partial updated metadata": {"depth_scale_reported_m_per_unit": 0.001},
+        }
+
+        for label, changes in mismatches.items():
+            with self.subTest(label=label):
+                config = copy.deepcopy(exact_legacy)
+                config["head_camera"].update(changes)
+                with self.assertRaises(DeploymentError):
+                    _validate_live_head_config(
+                        config,
+                        requires_depth=True,
+                        surface_normal_encoding=encoding,
+                    )
 
     def test_legacy_surface_normal_contract_does_not_require_live_calibration(self):
         encoding = SurfaceNormalEncodingContract(
@@ -4083,6 +4586,32 @@ class GrootG1DeploymentTests(unittest.TestCase):
             max_neighbor_depth_delta_m=0.05,
         )
         np.testing.assert_array_equal(images.surface_normals, expected)
+
+    def test_geometry_camera_selects_v1_unmasked_or_v2_masked_normals_from_contract(self):
+        depth = np.full((480, 640), 1_200, dtype=np.uint16)
+        camera = object.__new__(TeleimagerCamera)
+        camera._depth_encoding = None
+        camera._depth_scale_m_per_unit = 0.001
+
+        camera._surface_normal_encoding = SurfaceNormalEncodingContract(
+            intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+            max_neighbor_depth_delta_m=0.05,
+            encoding_version=LEGACY_SURFACE_NORMAL_ENCODING_VERSION,
+        )
+        _, legacy = camera._encode_geometry(depth)
+        self.assertIsNotNone(legacy)
+        np.testing.assert_array_equal(legacy[240, 320], [128, 128, 1])
+
+        camera._surface_normal_encoding = SurfaceNormalEncodingContract(
+            intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+            max_neighbor_depth_delta_m=0.05,
+            encoding_version=2,
+            depth_near_m=0.25,
+            depth_far_m=1.0,
+        )
+        _, masked = camera._encode_geometry(depth)
+        self.assertIsNotNone(masked)
+        np.testing.assert_array_equal(masked[240, 320], [0, 0, 0])
 
     def test_geometry_camera_uses_atomic_packet_sequence_and_paired_images(self):
         bgr = np.zeros((480, 640, 3), dtype=np.uint8)

@@ -80,15 +80,36 @@ from unitree_lerobot.utils.depth_encoding import DEPTH_OUTPUT_KEY
 from unitree_lerobot.utils.surface_normal_encoding import SURFACE_NORMAL_OUTPUT_KEY
 
 
+def _vision_recording_metadata(
+    *,
+    end_effector: str,
+    execution_horizon: int,
+    image_host: str,
+    inference_mode: str,
+    surface_normal_encoding: SurfaceNormalEncodingContract | None,
+) -> dict[str, object]:
+    """Describe the exact model-visible pixels persisted by the recorder."""
+
+    metadata: dict[str, object] = {
+        "end_effector": end_effector,
+        "execution_horizon": execution_horizon,
+        "image_host": image_host,
+        "inference_mode": inference_mode,
+    }
+    if surface_normal_encoding is not None:
+        metadata["surface_normals_encoding"] = surface_normal_encoding.to_metadata()
+    return metadata
+
+
 LOGGER = logging.getLogger("eval_groot_g1")
 LOCAL_POLICY_HOSTS = {"127.0.0.1", "localhost"}
-OPERATOR_CONFIRMATION_TIMEOUT_S = 180.0
+OPERATOR_CONFIRMATION_TIMEOUT_S = 600.0
 ALT_ESCAPE_WINDOW_S = 0.1
 # A confirmation key belongs to the prompt that is visible after this quiet
 # boundary.  This prevents keyboard repeat or a rapid extra ``r`` from a
 # completed stage from authorizing the next distinct motion stage.
 CONFIRMATION_INPUT_QUIET_S = 0.1
-CONFIRMATION_PROMPT_REFRESH_S = 5.0
+CONFIRMATION_PROMPT_REFRESH_S = 60.0
 GOAL_MODE_TOGGLE = "\t"
 RETURN_TO_START = "\x1b[Z"
 PREVIEW_WINDOWS = (
@@ -3078,16 +3099,18 @@ def run(args: argparse.Namespace) -> None:
             if run_log_dir is None:
                 raise DeploymentError("--record-vision requires the CLI per-run log directory")
             vision_recording_dir = Path(run_log_dir) / "vision_recording"
+            recording_metadata = _vision_recording_metadata(
+                end_effector=end_effector,
+                execution_horizon=args.execution_horizon,
+                image_host=image_host,
+                inference_mode=inference_mode,
+                surface_normal_encoding=surface_normal_encoding,
+            )
             try:
                 vision_recorder = NonBlockingVisionRecorder(
                     vision_recording_dir,
                     contract.video_keys,
-                    metadata={
-                        "end_effector": end_effector,
-                        "execution_horizon": args.execution_horizon,
-                        "image_host": image_host,
-                        "inference_mode": inference_mode,
-                    },
+                    metadata=recording_metadata,
                 )
             except Exception as exc:
                 raise DeploymentError(f"Could not start policy-vision recording: {exc}") from exc

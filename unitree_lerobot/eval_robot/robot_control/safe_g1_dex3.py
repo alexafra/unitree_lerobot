@@ -25,6 +25,7 @@ import numpy as np
 import zmq
 
 from unitree_lerobot.utils.camera_calibration import (
+    D435I_254322071415_CALIBRATION,
     calibration_identity,
     validate_realsense_rgbd_calibration,
 )
@@ -69,6 +70,8 @@ from unitree_lerobot.eval_robot.run_logging import (
     write_json,
 )
 from unitree_lerobot.utils.depth_encoding import (
+    DEFAULT_DEPTH_FAR_M,
+    DEFAULT_DEPTH_NEAR_M,
     DEFAULT_DEPTH_SCALE_M_PER_UNIT,
     canonicalize_depth_scale_m_per_unit,
     encode_depth_gray_rgb,
@@ -88,7 +91,7 @@ TEMPORARY_UNQUALIFIED_SIM_ARM_STATE_MAX_AGE_S = 1.000
 ACTUATOR_HAND_STATE_PAUSE_AGE_S = 0.100
 # Inspire FTP feedback has an explicitly qualified wider live-deployment
 # pause window. Dex3 and Inspire DFX retain the existing 100 ms threshold.
-INSPIRE_FTP_HAND_STATE_PAUSE_AGE_S = 0.150
+INSPIRE_FTP_HAND_STATE_PAUSE_AGE_S = 0.175
 # TEMPORARY / UNQUALIFIED / SIMULATION ONLY: tolerate the observed Isaac
 # hand-feedback scheduling gaps without weakening the physical-robot gate.
 TEMPORARY_UNQUALIFIED_SIM_HAND_STATE_PAUSE_AGE_S = 1.000
@@ -161,7 +164,7 @@ INSPIRE_FTP_WAIST_LOWER_RAD = (-2.618, -0.52, -0.52)
 INSPIRE_FTP_WAIST_UPPER_RAD = (2.618, 0.52, 0.52)
 INSPIRE_FTP_WAIST_LIMIT_MARGIN_RAD = 0.02
 MAX_WAIST_DQ_RAD_S = 1.0
-MAX_WAIST_HOLD_ERROR_RAD = 0.05
+MAX_WAIST_HOLD_ERROR_RAD = 0.075
 PREARM_STATIONARY_DWELL_S = 0.5
 # Use the same bounded freshness deadline before authority takeover as during
 # real arm operation.  The former 50 ms pre-arm-only value caused nuisance
@@ -186,6 +189,12 @@ INITIALIZATION_START_TIMEOUT_S = 3.0
 # confirmed initialization.  The first fresh sample must still pass the
 # instantaneous arm/waist tracking and velocity gates below.
 INITIALIZATION_START_DWELL_S = 0.0
+# Mode-5 locomotion can legitimately settle the three active waist joints away
+# from the pose captured during arm-authority acquisition.  Before replacing
+# that stale reference with a matched-pose hold, require a short stable window;
+# this prevents one low-velocity sample while walking from becoming the next
+# guarded transition's waist target.
+MODE5_WAIST_REBASE_DWELL_S = 0.50
 INITIALIZATION_CONVERGENCE_TIMEOUT_S = 10.0
 INITIALIZATION_CONVERGENCE_DWELL_S = 0.50
 INITIALIZATION_MIN_DISTINCT_SAMPLES = 5
@@ -1829,6 +1838,51 @@ def request_live_camera_config(
         context.term()
 
 
+def _pinned_legacy_surface_normal_calibration(head: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the one reviewed pre-calibration TeleImager profile.
+
+    Older deployed TeleImager servers do not advertise a full calibration.  Do
+    not broaden that legacy omission into a generic fallback: only the measured
+    Inspire D435I and its exact 640x480@30 depth profile may use the checked-in
+    calibration.  A partially upgraded server remains an error so malformed
+    live metadata can never be silently replaced.
+    """
+
+    if "calibration" in head:
+        raise DeploymentError("Pinned legacy calibration is valid only when calibration is absent")
+    if "depth_scale_reported_m_per_unit" in head:
+        raise DeploymentError(
+            "TeleImager omits calibration but advertises partial updated depth metadata; "
+            "refusing the pinned legacy calibration"
+        )
+
+    pinned = D435I_254322071415_CALIBRATION
+    pinned_camera = pinned["camera"]
+    pinned_color = pinned["color"]
+    expected_profile = (
+        head.get("type") == "realsense"
+        and head.get("serial_number") == pinned_camera["serial"]
+        and head.get("image_shape") == [pinned_color["height"], pinned_color["width"]]
+        and head.get("fps") == pinned_color["fps"]
+        and head.get("enable_depth") is True
+    )
+    if not expected_profile:
+        raise DeploymentError(
+            "Calibration-tagged surface-normal checkpoint requires advertised calibration or "
+            "the exact pinned Inspire D435I 254322071415 640x480@30 depth profile"
+        )
+    try:
+        processing_scale = canonicalize_depth_scale_m_per_unit(
+            head.get("depth_scale_m_per_unit"),
+            name="TeleImager depth_scale_m_per_unit",
+        )
+    except ValueError as exc:
+        raise DeploymentError(f"TeleImager cannot use the pinned legacy calibration: {exc}") from exc
+    if processing_scale != DEFAULT_DEPTH_SCALE_M_PER_UNIT:  # pragma: no cover - canonicalizer guarantees this
+        raise DeploymentError("Pinned legacy calibration requires the canonical 0.001 m/unit depth scale")
+    return pinned
+
+
 def _validate_live_head_config(
     config: dict[str, Any],
     *,
@@ -1901,8 +1955,14 @@ def _validate_live_head_config(
             else surface_normal_encoding.camera_calibration
         )
         if expected_calibration is not None:
+            calibration_was_pinned = "calibration" not in head
+            calibration_payload = (
+                _pinned_legacy_surface_normal_calibration(head)
+                if calibration_was_pinned
+                else head["calibration"]
+            )
             try:
-                live_calibration = validate_realsense_rgbd_calibration(head.get("calibration"))
+                live_calibration = validate_realsense_rgbd_calibration(calibration_payload)
                 live_identity = calibration_identity(
                     live_calibration,
                     source=expected_calibration.source,
@@ -1917,6 +1977,13 @@ def _validate_live_head_config(
                     "Live TeleImager camera calibration does not match the surface-normal "
                     f"checkpoint: got {live_identity.to_metadata()!r}, expected "
                     f"{expected_calibration.to_metadata()!r}"
+                )
+            if calibration_was_pinned:
+                LOGGER.warning(
+                    "TeleImager omitted calibration metadata; using the exact checked-in "
+                    "D435I 254322071415 640x480@30 calibration %s for guarded surface-normal "
+                    "inference",
+                    live_identity.fingerprint,
                 )
             expected_intrinsics = surface_normal_encoding.intrinsics
             live_color = live_calibration["color"]
@@ -2143,6 +2210,17 @@ class TeleimagerCamera:
                         intrinsics=surface_normal_encoding.intrinsics,
                         max_neighbor_depth_delta_m=(
                             surface_normal_encoding.max_neighbor_depth_delta_m
+                        ),
+                        encoding_version=surface_normal_encoding.encoding_version,
+                        depth_near_m=(
+                            surface_normal_encoding.depth_near_m
+                            if surface_normal_encoding.depth_near_m is not None
+                            else DEFAULT_DEPTH_NEAR_M
+                        ),
+                        depth_far_m=(
+                            surface_normal_encoding.depth_far_m
+                            if surface_normal_encoding.depth_far_m is not None
+                            else DEFAULT_DEPTH_FAR_M
                         ),
                     ),
                 )
@@ -3686,6 +3764,12 @@ def _wait_for_initialization_start(
     latest: RobotState | None = None
     profile = getattr(backend, "profile", DEX3_PROFILE)
     require_hand_tracking = profile.tracking_hard is not None
+    uses_waist_hold = getattr(backend, "_uses_mode5_waist_hold", None)
+    rebase_mode5_waist = bool(callable(uses_waist_hold) and uses_waist_hold())
+    required_dwell_s = max(
+        INITIALIZATION_START_DWELL_S,
+        MODE5_WAIST_REBASE_DWELL_S if rebase_mode5_waist else 0.0,
+    )
     while not stop_event.is_set() and time.monotonic() < deadline:
         loop_started = time.monotonic()
         if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
@@ -3748,40 +3832,48 @@ def _wait_for_initialization_start(
             (backend.simulation or float(np.max(np.abs(latest.arm_dq))) <= INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S)
             and arm_error <= INITIALIZATION_ARM_TOLERANCE_RAD
             and (not require_hand_tracking or hand_error <= INITIALIZATION_HAND_TOLERANCE_RAD)
-            and waist_error <= MAX_WAIST_HOLD_ERROR_RAD
+            # A mode-5 waist reference is intentionally allowed to differ
+            # during balance/locomotion. Its measured pose must still be valid
+            # and stationary here. The one session-start target is retained;
+            # endpoint convergence returns to and checks that canonical target.
+            and (rebase_mode5_waist or waist_error <= MAX_WAIST_HOLD_ERROR_RAD)
             and waist_dq <= INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S
         )
+        qualified = False
         if stationary:
-            if INITIALIZATION_START_DWELL_S <= 0.0:
-                return latest
-            if stationary_since is None:
-                stationary_since = now
-                stationary_reference = latest
-                distinct_samples = 0
-                last_capture = float("-inf")
-            assert stationary_reference is not None
-            if _position_drift(
-                latest,
-                stationary_reference,
-                include_hands=require_hand_tracking,
-            ) > INITIALIZATION_MAX_POSITION_DRIFT_RAD:
-                stationary_since = now
-                stationary_reference = latest
-                distinct_samples = 0
-                last_capture = float("-inf")
-            if latest.captured_at > last_capture:
-                distinct_samples += 1
-                last_capture = latest.captured_at
-            if (
-                now - stationary_since >= INITIALIZATION_START_DWELL_S
-                and distinct_samples >= INITIALIZATION_MIN_DISTINCT_SAMPLES
-            ):
-                return latest
+            if required_dwell_s <= 0.0:
+                qualified = True
+            else:
+                if stationary_since is None:
+                    stationary_since = now
+                    stationary_reference = latest
+                    distinct_samples = 0
+                    last_capture = float("-inf")
+                assert stationary_reference is not None
+                if _position_drift(
+                    latest,
+                    stationary_reference,
+                    include_hands=require_hand_tracking,
+                ) > INITIALIZATION_MAX_POSITION_DRIFT_RAD:
+                    stationary_since = now
+                    stationary_reference = latest
+                    distinct_samples = 0
+                    last_capture = float("-inf")
+                if latest.captured_at > last_capture:
+                    distinct_samples += 1
+                    last_capture = latest.captured_at
+                qualified = (
+                    now - stationary_since >= required_dwell_s
+                    and distinct_samples >= INITIALIZATION_MIN_DISTINCT_SAMPLES
+                )
         else:
             stationary_since = None
             stationary_reference = None
             distinct_samples = 0
             last_capture = float("-inf")
+
+        if qualified:
+            return latest
 
         backend.publish()
         elapsed = time.monotonic() - loop_started

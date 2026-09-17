@@ -28,8 +28,12 @@ from unitree_lerobot.eval_robot.groot_contract import (
     SURFACE_NORMAL_VIDEO_KEYS,
     TASKS,
     ModelContract,
+    SurfaceNormalEncodingContract,
 )
 from unitree_lerobot.eval_robot.vision_recorder import NonBlockingVisionRecorder
+from unitree_lerobot.utils.surface_normal_encoding import (
+    DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+)
 
 
 class _FakeStateReader:
@@ -77,6 +81,57 @@ def test_record_vision_cli_is_strictly_opt_in() -> None:
 
     assert parser.parse_args([]).record_vision is False
     assert parser.parse_args(["--record-vision"]).record_vision is True
+
+
+@pytest.mark.parametrize(
+    ("contract", "expected_version", "expected_range"),
+    [
+        (
+            SurfaceNormalEncodingContract(
+                intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+                max_neighbor_depth_delta_m=0.05,
+                encoding_version=1,
+            ),
+            1,
+            None,
+        ),
+        (
+            SurfaceNormalEncodingContract(
+                intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+                max_neighbor_depth_delta_m=0.05,
+                encoding_version=2,
+                depth_near_m=0.25,
+                depth_far_m=1.0,
+            ),
+            2,
+            {
+                "near_m": 0.25,
+                "far_m": 1.0,
+                "inclusive": True,
+                "required_samples": ["center", "left", "right", "up", "down"],
+            },
+        ),
+    ],
+)
+def test_vision_recording_metadata_preserves_selected_surface_normal_contract(
+    contract: SurfaceNormalEncodingContract,
+    expected_version: int,
+    expected_range: dict[str, object] | None,
+) -> None:
+    metadata = eval_groot_g1._vision_recording_metadata(
+        end_effector="inspire-ftp",
+        execution_horizon=8,
+        image_host="192.168.123.164",
+        inference_mode="rtc",
+        surface_normal_encoding=contract,
+    )
+
+    encoding = metadata["surface_normals_encoding"]
+    assert encoding["encoding_version"] == expected_version
+    if expected_range is None:
+        assert "depth_valid_range_m" not in encoding
+    else:
+        assert encoding["depth_valid_range_m"] == expected_range
 
 
 @pytest.mark.parametrize(
