@@ -117,6 +117,7 @@ PREVIEW_WINDOWS = (
     f"GR00T input: {DEPTH_OUTPUT_KEY}",
     f"GR00T input: {SURFACE_NORMAL_OUTPUT_KEY}",
 )
+_CAMERA_PREVIEW_ACTIVE = False
 STOP_COMMANDS = {"stop", "s"}
 EXIT_COMMANDS = {"quit", "q"}
 VOICE_STOP_COMMANDS = {"stop", "pause"}
@@ -328,6 +329,7 @@ def _readline_before_authority(
         print(prompt, end="", flush=True)
         if external_pending is not None:
             while True:
+                _pump_camera_preview_events()
                 if external_pending():
                     print()
                     return VOICE_INPUT_AVAILABLE
@@ -375,6 +377,7 @@ def _readline_before_authority(
                 return buffered_control
         print(prompt, end="", flush=True)
         while True:
+            _pump_camera_preview_events()
             if external_pending is not None and external_pending():
                 print()
                 return VOICE_INPUT_AVAILABLE
@@ -446,6 +449,7 @@ def _wait_for_confirmation_input_boundary(
         if actuator is not None:
             actuator.heartbeat()
             actuator.assert_healthy()
+        _pump_camera_preview_events()
         remaining = quiet_deadline - time.monotonic()
         if remaining <= 0.0:
             break
@@ -1024,6 +1028,7 @@ def _readline_while_armed(
     while True:
         actuator.heartbeat()
         status_output = actuator.assert_healthy() is True
+        _pump_camera_preview_events()
         if confirmation_mode and status_output:
             print(f"\n{prompt}", end="", flush=True)
             next_prompt_refresh_at = time.monotonic() + CONFIRMATION_PROMPT_REFRESH_S
@@ -1114,6 +1119,7 @@ def _readline_with_immediate_prompt_controls(
         while True:
             actuator.heartbeat()
             status_output = actuator.assert_healthy() is True
+            _pump_camera_preview_events()
             if confirmation_mode and status_output:
                 # Auxiliary actuator status was just rendered on the shared
                 # terminal. Put the named gate back on the final line.
@@ -1704,6 +1710,18 @@ def confirm_policy_continue(
     )
 
 
+def _pump_camera_preview_events() -> None:
+    """Keep an already-open HighGUI preview responsive during operator waits."""
+
+    if not _CAMERA_PREVIEW_ACTIVE:
+        return
+    try:
+        if cv2.pollKey() & 0xFF == ord("q"):
+            raise DeploymentError("Camera preview closed by user")
+    except cv2.error as exc:
+        raise DeploymentError("Camera preview could not process desktop events") from exc
+
+
 def show_camera_preview(
     rgb: np.ndarray,
     geometry: np.ndarray | None,
@@ -1711,19 +1729,23 @@ def show_camera_preview(
 ) -> None:
     """Display exactly the decoded image arrays being placed in the observation."""
 
+    global _CAMERA_PREVIEW_ACTIVE
     try:
         cv2.imshow(PREVIEW_WINDOWS[0], cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
         if geometry is not None:
             if geometry_key not in (DEPTH_OUTPUT_KEY, SURFACE_NORMAL_OUTPUT_KEY):
                 raise DeploymentError(f"Cannot preview unsupported geometry view {geometry_key!r}")
             cv2.imshow(f"GR00T input: {geometry_key}", cv2.cvtColor(geometry, cv2.COLOR_RGB2BGR))
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            raise DeploymentError("Camera preview closed by user")
+        _CAMERA_PREVIEW_ACTIVE = True
+        _pump_camera_preview_events()
     except cv2.error as exc:
+        _CAMERA_PREVIEW_ACTIVE = False
         raise DeploymentError("Camera preview could not open; check DISPLAY/desktop access") from exc
 
 
 def close_camera_preview() -> None:
+    global _CAMERA_PREVIEW_ACTIVE
+    _CAMERA_PREVIEW_ACTIVE = False
     for window in PREVIEW_WINDOWS:
         try:
             cv2.destroyWindow(window)

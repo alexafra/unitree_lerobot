@@ -29,6 +29,7 @@ from unitree_lerobot.eval_robot.eval_groot_g1 import (
     _confirm_goal_transition,
     _OperatorTerminal,
     _prepare_policy_goal,
+    _pump_camera_preview_events,
     _readline_before_authority,
     _readline_while_armed,
     _run_blocking_motion_with_immediate_release,
@@ -546,8 +547,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
         depth = np.array([[[7, 8, 9], [10, 11, 12]]], dtype=np.uint8)
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
         with (
+            mock.patch(f"{module}._CAMERA_PREVIEW_ACTIVE", False),
             mock.patch(f"{module}.cv2.imshow") as imshow,
-            mock.patch(f"{module}.cv2.waitKey", return_value=-1),
+            mock.patch(f"{module}.cv2.pollKey", return_value=-1),
         ):
             show_camera_preview(rgb, depth)
 
@@ -563,8 +565,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
         normals = np.full((1, 2, 3), 128, dtype=np.uint8)
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
         with (
+            mock.patch(f"{module}._CAMERA_PREVIEW_ACTIVE", False),
             mock.patch(f"{module}.cv2.imshow") as imshow,
-            mock.patch(f"{module}.cv2.waitKey", return_value=-1),
+            mock.patch(f"{module}.cv2.pollKey", return_value=-1),
         ):
             show_camera_preview(rgb, normals, "surface_normals_view")
 
@@ -577,11 +580,21 @@ class GrootG1DeploymentTests(unittest.TestCase):
     def test_camera_preview_q_requests_normal_runner_cleanup(self):
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
         with (
+            mock.patch(f"{module}._CAMERA_PREVIEW_ACTIVE", False),
             mock.patch(f"{module}.cv2.imshow"),
-            mock.patch(f"{module}.cv2.waitKey", return_value=ord("q")),
+            mock.patch(f"{module}.cv2.pollKey", return_value=ord("q")),
             self.assertRaisesRegex(DeploymentError, "closed by user"),
         ):
             show_camera_preview(np.zeros((1, 1, 3), dtype=np.uint8), None)
+
+    def test_camera_preview_event_pump_is_inactive_until_a_window_opens(self):
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        with (
+            mock.patch(f"{module}._CAMERA_PREVIEW_ACTIVE", False),
+            mock.patch(f"{module}.cv2.pollKey") as poll_key,
+        ):
+            _pump_camera_preview_events()
+        poll_key.assert_not_called()
 
     def test_deployment_safety_values_match_reviewed_local_configuration(self):
         # Relaxed local values remain pinned deliberately. CHANGEDSAFETY comments beside
@@ -2159,6 +2172,32 @@ class GrootG1DeploymentTests(unittest.TestCase):
                     stdin.close()
                     os.close(master_fd)
                     os.close(slave_fd)
+
+    def test_pre_authority_confirmation_services_open_camera_preview(self):
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        master_fd, slave_fd = pty.openpty()
+        stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+
+        def delayed_confirmation():
+            time.sleep(0.25)
+            os.write(master_fd, b"r")
+
+        writer = threading.Thread(target=delayed_confirmation, daemon=True)
+        try:
+            writer.start()
+            with (
+                mock.patch.object(sys, "stdin", stdin),
+                mock.patch("builtins.print"),
+                mock.patch(f"{module}._CAMERA_PREVIEW_ACTIVE", True),
+                mock.patch(f"{module}.cv2.pollKey", return_value=-1) as poll_key,
+            ):
+                self.assertEqual(_confirm_before_authority("Confirm> "), "continue")
+            self.assertGreaterEqual(poll_key.call_count, 2)
+        finally:
+            writer.join(timeout=1.0)
+            stdin.close()
+            os.close(master_fd)
+            os.close(slave_fd)
 
     def test_pre_authority_confirmation_release_keys_need_no_enter(self):
         for key in (b"q", b"Q", b"\x11"):
