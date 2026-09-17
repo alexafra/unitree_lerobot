@@ -9,6 +9,7 @@ Script Json to Lerobot.
 # --depth-near-m Fixed near bound used for depth normalization
 # --depth-far-m  Fixed far bound used for depth normalization
 # --include-surface-normals Include camera-frame normals derived from aligned depth_0
+# --surface-normals-encoding-version 2 masks normals to the depth near/far range; 1 reproduces legacy bytes
 # --camera-calibration-profile Named calibration for legacy raw data without recorded metadata
 
 python unitree_lerobot/utils/convert_unitree_json_to_lerobot.py \
@@ -33,14 +34,16 @@ import shutil
 import tempfile
 import time
 import numpy as np
+from collections import defaultdict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from PIL import Image
-from collections import defaultdict
-from typing import Literal
+from typing import Callable, Iterator, Literal, TypeVar
 
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import write_info
+from lerobot.datasets.video_utils import encode_video_frames
 
 from unitree_lerobot.utils.constants import ROBOT_CONFIGS
 from unitree_lerobot.utils.camera_calibration import (
@@ -65,10 +68,61 @@ from unitree_lerobot.utils.surface_normal_encoding import (
     DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
     DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M,
     PinholeIntrinsics,
+    SURFACE_NORMAL_ENCODING_VERSION,
     SURFACE_NORMAL_OUTPUT_KEY,
     encode_surface_normals_rgb,
     surface_normals_encoding_metadata,
 )
+
+
+DEFAULT_DEPTH_PROCESSING_WORKERS = 8
+DEFAULT_VIDEO_ENCODING_WORKERS = 3
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+
+
+def _positive_worker_count(value: int, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return int(value)
+
+
+def _ordered_bounded_parallel_map(
+    function: Callable[[_T], _R],
+    items: list[_T],
+    *,
+    max_workers: int,
+) -> Iterator[_R]:
+    """Evaluate concurrently while preserving order and bounding memory."""
+
+    workers = _positive_worker_count(max_workers, name="max_workers")
+    if workers == 1 or len(items) <= 1:
+        for item in items:
+            yield function(item)
+        return
+
+    executor = ThreadPoolExecutor(
+        max_workers=min(workers, len(items)),
+        thread_name_prefix="lerobot-depth",
+    )
+    pending: deque[Future[_R]] = deque()
+    next_index = 0
+    try:
+        while next_index < len(items) and len(pending) < workers:
+            pending.append(executor.submit(function, items[next_index]))
+            next_index += 1
+
+        while pending:
+            # Consume in submission order so a corrupt earlier frame remains
+            # the reported failure even if a later worker finishes first.
+            yield pending.popleft().result()
+            if next_index < len(items):
+                pending.append(executor.submit(function, items[next_index]))
+                next_index += 1
+    finally:
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,6 +131,8 @@ class DatasetConfig:
     tolerance_s: float = 0.0001
     image_writer_processes: int = 10
     image_writer_threads: int = 5
+    depth_processing_workers: int = DEFAULT_DEPTH_PROCESSING_WORKERS
+    video_encoding_workers: int = DEFAULT_VIDEO_ENCODING_WORKERS
     video_backend: str | None = None
 
 
@@ -86,6 +142,7 @@ CameraCalibrationProfile = Literal[
     "legacy-untagged",
     "d435i-254322071415",
 ]
+SurfaceNormalEncodingVersion = Literal[1, 2]
 
 
 def _intrinsics_from_calibration(calibration: dict) -> PinholeIntrinsics:
@@ -104,8 +161,17 @@ def _intrinsics_from_calibration(calibration: dict) -> PinholeIntrinsics:
 def _resolve_recorded_camera_calibration(
     episodes: list[dict],
     episode_paths: list[Path],
+    *,
+    selected_profile_calibration: dict | None = None,
 ) -> dict | None:
-    """Return one validated calibration or reject a heterogeneous raw dataset."""
+    """Return one recorded calibration or validate a profile-backed legacy mix.
+
+    A tagged/legacy mix is ambiguous unless the caller supplied an explicit
+    calibration profile.  In that narrow case, every recorded calibration must
+    exactly equal the selected profile.  Returning ``None`` for the accepted
+    mix deliberately makes the caller canonicalize the complete dataset to the
+    explicit profile, including its provenance identity.
+    """
 
     records = []
     for path, episode in zip(episode_paths, episodes, strict=True):
@@ -122,6 +188,26 @@ def _resolve_recorded_camera_calibration(
     if not any(present):
         return None
     if not all(present):
+        if selected_profile_calibration is not None:
+            expected = validate_realsense_rgbd_calibration(
+                selected_profile_calibration
+            )
+            for path, record in zip(episode_paths, records, strict=True):
+                if record is None:
+                    continue
+                try:
+                    validated = validate_realsense_rgbd_calibration(record)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Invalid info.depth.calibration in {path}: {exc}"
+                    ) from exc
+                if validated != expected:
+                    raise ValueError(
+                        "Explicit camera calibration profile conflicts with "
+                        f"recorded calibration in {path}: "
+                        f"{validated['fingerprint']} != {expected['fingerprint']}"
+                    )
+            return None
         missing = [str(path) for path, has_record in zip(episode_paths, present, strict=True) if not has_record]
         raise ValueError(
             "Raw dataset mixes calibration-tagged and legacy episodes; every episode must carry "
@@ -218,23 +304,138 @@ def encode_lossless_geometry_video(
 class GeometryVideoLeRobotDataset(LeRobotDataset):
     """Use byte-exact RGB H.264 for model geometry views only."""
 
-    def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
-        geometry_video_keys = {
+    _parallel_video_encoding_active = False
+    _pending_temporary_videos: dict[str, Path] | None = None
+    _temporary_video_dirs: list[Path] | None = None
+
+    @staticmethod
+    def _geometry_video_keys() -> set[str]:
+        return {
             f"observation.images.{DEPTH_OUTPUT_KEY}",
             f"observation.images.{SURFACE_NORMAL_OUTPUT_KEY}",
         }
-        if video_key not in geometry_video_keys:
+
+    def _encode_one_temporary_episode_video(
+        self,
+        video_key: str,
+        episode_index: int,
+    ) -> Path:
+        if (
+            video_key not in self._geometry_video_keys()
+            and not self._parallel_video_encoding_active
+        ):
             return super()._encode_temporary_episode_video(video_key, episode_index)
 
         temp_path = Path(tempfile.mkdtemp(dir=self.root)) / f"{video_key}_{episode_index:03d}.mp4"
+        temporary_dirs = self._temporary_video_dirs
+        if temporary_dirs is not None:
+            temporary_dirs.append(temp_path.parent)
         img_dir = self._get_image_file_dir(episode_index, video_key)
-        encode_lossless_geometry_video(
-            img_dir,
-            temp_path,
-            self.fps,
-        )
+        try:
+            if video_key in self._geometry_video_keys():
+                encode_lossless_geometry_video(
+                    img_dir,
+                    temp_path,
+                    self.fps,
+                )
+            else:
+                # This is byte-for-byte the upstream RGB encoding call, with
+                # only transactional cleanup added around a failed encoder.
+                encode_video_frames(
+                    img_dir,
+                    temp_path,
+                    self.fps,
+                    overwrite=True,
+                )
+        except BaseException:
+            shutil.rmtree(temp_path.parent, ignore_errors=True)
+            raise
         shutil.rmtree(img_dir)
         return temp_path
+
+    def _cleanup_pending_temporary_videos(self) -> None:
+        pending = self._pending_temporary_videos or {}
+        self._pending_temporary_videos = None
+        for path in pending.values():
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def _prepare_temporary_episode_videos(self, episode_index: int) -> None:
+        video_keys = list(self.meta.video_keys)
+        workers = min(
+            _positive_worker_count(
+                getattr(self, "video_encoding_workers", DEFAULT_VIDEO_ENCODING_WORKERS),
+                name="video_encoding_workers",
+            ),
+            len(video_keys),
+        )
+        if workers <= 1:
+            self._pending_temporary_videos = {
+                key: self._encode_one_temporary_episode_video(key, episode_index)
+                for key in video_keys
+            }
+            return
+
+        executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="lerobot-video",
+        )
+        futures: dict[str, Future[Path]] = {}
+        completed: dict[str, Path] = {}
+        try:
+            for key in video_keys:
+                futures[key] = executor.submit(
+                    self._encode_one_temporary_episode_video,
+                    key,
+                    episode_index,
+                )
+            # Consume futures in feature order so failures remain deterministic.
+            for key in video_keys:
+                completed[key] = futures[key].result()
+        except BaseException:
+            for future in futures.values():
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+            for future in futures.values():
+                if future.cancelled() or not future.done() or future.exception() is not None:
+                    continue
+                path = future.result()
+                shutil.rmtree(path.parent, ignore_errors=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
+        self._pending_temporary_videos = completed
+
+    def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
+        if not self._parallel_video_encoding_active:
+            return self._encode_one_temporary_episode_video(video_key, episode_index)
+
+        if self._pending_temporary_videos is None:
+            self._prepare_temporary_episode_videos(episode_index)
+        assert self._pending_temporary_videos is not None
+        try:
+            return self._pending_temporary_videos.pop(video_key)
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Temporary video {video_key!r} was not prepared for episode {episode_index}"
+            ) from exc
+
+    def save_episode(self, episode_data: dict | None = None) -> None:
+        """Encode independent modalities concurrently; commit metadata serially."""
+
+        if self._parallel_video_encoding_active:
+            raise RuntimeError("Nested save_episode calls are not supported")
+        self._parallel_video_encoding_active = True
+        self._temporary_video_dirs = []
+        try:
+            super().save_episode(episode_data)
+        finally:
+            self._parallel_video_encoding_active = False
+            # Normally empty because upstream consumed every prepared path.
+            # On any encoding/metadata failure, remove uncommitted temp videos.
+            self._cleanup_pending_temporary_videos()
+            for directory in self._temporary_video_dirs:
+                shutil.rmtree(directory, ignore_errors=True)
+            self._temporary_video_dirs = None
 
 
 class JsonDataset:
@@ -247,11 +448,15 @@ class JsonDataset:
         depth_near_m: float = DEFAULT_DEPTH_NEAR_M,
         depth_far_m: float = DEFAULT_DEPTH_FAR_M,
         include_surface_normals: bool = False,
+        surface_normal_encoding_version: SurfaceNormalEncodingVersion = (
+            SURFACE_NORMAL_ENCODING_VERSION
+        ),
         surface_normal_intrinsics: PinholeIntrinsics = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
         surface_normal_max_neighbor_depth_delta_m: float = (DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M),
         camera_calibration_profile: CameraCalibrationProfile = (
             LEGACY_UNTAGGED_CAMERA_CALIBRATION_PROFILE
         ),
+        depth_processing_workers: int = DEFAULT_DEPTH_PROCESSING_WORKERS,
     ) -> None:
         """
         Initialize the dataset for loading and processing HDF5 files containing robot manipulation data.
@@ -271,10 +476,15 @@ class JsonDataset:
         self.depth_near_m = depth_near_m
         self.depth_far_m = depth_far_m
         self.include_surface_normals = include_surface_normals
+        self.surface_normal_encoding_version = surface_normal_encoding_version
         self.surface_normal_intrinsics = surface_normal_intrinsics
         self.camera_calibration: dict | None = None
         self.camera_calibration_identity: CameraCalibrationIdentity | None = None
         self.surface_normal_max_neighbor_depth_delta_m = surface_normal_max_neighbor_depth_delta_m
+        self.depth_processing_workers = _positive_worker_count(
+            depth_processing_workers,
+            name="depth_processing_workers",
+        )
         if camera_calibration_profile != LEGACY_UNTAGGED_CAMERA_CALIBRATION_PROFILE:
             if camera_calibration_profile not in NAMED_CAMERA_CALIBRATIONS:
                 raise ValueError(f"Unknown camera calibration profile {camera_calibration_profile!r}")
@@ -301,7 +511,20 @@ class JsonDataset:
         surface_normals_encoding_metadata(
             intrinsics=surface_normal_intrinsics,
             max_neighbor_depth_delta_m=surface_normal_max_neighbor_depth_delta_m,
+            encoding_version=surface_normal_encoding_version,
+            depth_near_m=depth_near_m,
+            depth_far_m=depth_far_m,
         )
+        if (
+            include_surface_normals
+            and surface_normal_encoding_version == SURFACE_NORMAL_ENCODING_VERSION
+            and not include_depth
+            and (depth_near_m != DEFAULT_DEPTH_NEAR_M or depth_far_m != DEFAULT_DEPTH_FAR_M)
+        ):
+            raise ValueError(
+                "Surface-normal v2 without a depth_gray_view must use the canonical "
+                f"depth bounds [{DEFAULT_DEPTH_NEAR_M}, {DEFAULT_DEPTH_FAR_M}]"
+            )
 
         # Initialize paths and cache
         self._init_paths()
@@ -310,6 +533,7 @@ class JsonDataset:
             recorded_calibration = _resolve_recorded_camera_calibration(
                 self.episodes_data_cached,
                 self.episode_paths,
+                selected_profile_calibration=selected_profile_calibration,
             )
             if recorded_calibration is not None:
                 recorded_identity = calibration_identity(
@@ -485,7 +709,7 @@ class JsonDataset:
         if rgb_camera_key is None:
             raise ValueError(f"No image mapping exists for {DEPTH_COLOR_SOURCE_KEY}")
 
-        for sample_data in episode_data["data"]:
+        def process_frame(sample_data: dict) -> tuple[np.ndarray | None, np.ndarray | None]:
             relative_path = sample_data.get("depths", {}).get(DEPTH_SOURCE_KEY)
 
             if not relative_path:
@@ -509,6 +733,7 @@ class JsonDataset:
                     f"Expected HxW uint16 depth at {depth_path}; got shape={depth_u16.shape}, dtype={depth_u16.dtype}"
                 )
 
+            depth_rgb = None
             if include_depth:
                 depth_rgb = encode_depth_gray_rgb(
                     depth_u16,
@@ -516,15 +741,37 @@ class JsonDataset:
                     near_m=self.depth_near_m,
                     far_m=self.depth_far_m,
                 )
-                images[DEPTH_OUTPUT_KEY].append(depth_rgb)
 
+            surface_normals_rgb = None
             if include_surface_normals:
                 surface_normals_rgb = encode_surface_normals_rgb(
                     depth_u16,
                     scale_m_per_unit=depth_scale,
                     intrinsics=self.surface_normal_intrinsics,
                     max_neighbor_depth_delta_m=self.surface_normal_max_neighbor_depth_delta_m,
+                    encoding_version=getattr(
+                        self,
+                        "surface_normal_encoding_version",
+                        SURFACE_NORMAL_ENCODING_VERSION,
+                    ),
+                    depth_near_m=self.depth_near_m,
+                    depth_far_m=self.depth_far_m,
                 )
+            return depth_rgb, surface_normals_rgb
+
+        frames = episode_data["data"]
+        for depth_rgb, surface_normals_rgb in _ordered_bounded_parallel_map(
+            process_frame,
+            frames,
+            max_workers=getattr(
+                self,
+                "depth_processing_workers",
+                DEFAULT_DEPTH_PROCESSING_WORKERS,
+            ),
+        ):
+            if depth_rgb is not None:
+                images[DEPTH_OUTPUT_KEY].append(depth_rgb)
+            if surface_normals_rgb is not None:
                 images[SURFACE_NORMAL_OUTPUT_KEY].append(surface_normals_rgb)
 
         return images
@@ -720,7 +967,7 @@ def create_empty_dataset(
         shutil.rmtree(HF_LEROBOT_HOME / repo_id)
 
     dataset_type = GeometryVideoLeRobotDataset if include_depth or include_surface_normals else LeRobotDataset
-    return dataset_type.create(
+    dataset = dataset_type.create(
         repo_id=repo_id,
         fps=30,
         robot_type=robot_type,
@@ -731,6 +978,12 @@ def create_empty_dataset(
         image_writer_threads=dataset_config.image_writer_threads,
         video_backend=dataset_config.video_backend,
     )
+    if isinstance(dataset, GeometryVideoLeRobotDataset):
+        dataset.video_encoding_workers = _positive_worker_count(
+            dataset_config.video_encoding_workers,
+            name="dataset_config.video_encoding_workers",
+        )
+    return dataset
 
 
 def populate_dataset(
@@ -742,6 +995,9 @@ def populate_dataset(
     depth_near_m: float = DEFAULT_DEPTH_NEAR_M,
     depth_far_m: float = DEFAULT_DEPTH_FAR_M,
     include_surface_normals: bool = False,
+    surface_normal_encoding_version: SurfaceNormalEncodingVersion = (
+        SURFACE_NORMAL_ENCODING_VERSION
+    ),
     surface_normal_intrinsics: PinholeIntrinsics = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
     surface_normal_max_neighbor_depth_delta_m: float = DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M,
     camera_calibration_profile: CameraCalibrationProfile = (
@@ -757,9 +1013,11 @@ def populate_dataset(
             depth_near_m=depth_near_m,
             depth_far_m=depth_far_m,
             include_surface_normals=include_surface_normals,
+            surface_normal_encoding_version=surface_normal_encoding_version,
             surface_normal_intrinsics=surface_normal_intrinsics,
             surface_normal_max_neighbor_depth_delta_m=surface_normal_max_neighbor_depth_delta_m,
             camera_calibration_profile=camera_calibration_profile,
+            depth_processing_workers=DEFAULT_DEPTH_PROCESSING_WORKERS,
         )
     for i in tqdm.tqdm(range(len(json_dataset))):
         episode = json_dataset.get_item(i)
@@ -799,6 +1057,9 @@ def json_to_lerobot(
     depth_near_m: float = DEFAULT_DEPTH_NEAR_M,
     depth_far_m: float = DEFAULT_DEPTH_FAR_M,
     include_surface_normals: bool = False,
+    surface_normals_encoding_version: SurfaceNormalEncodingVersion = (
+        SURFACE_NORMAL_ENCODING_VERSION
+    ),
     surface_normals_width: int = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480.width,
     surface_normals_height: int = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480.height,
     surface_normals_fx: float = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480.fx,
@@ -829,15 +1090,20 @@ def json_to_lerobot(
         depth_near_m=depth_near_m,
         depth_far_m=depth_far_m,
         include_surface_normals=include_surface_normals,
+        surface_normal_encoding_version=surface_normals_encoding_version,
         surface_normal_intrinsics=surface_normal_intrinsics,
         surface_normal_max_neighbor_depth_delta_m=surface_normals_max_neighbor_depth_delta_m,
         camera_calibration_profile=camera_calibration_profile,
+        depth_processing_workers=dataset_config.depth_processing_workers,
     )
     resolved_surface_normal_intrinsics = json_dataset.surface_normal_intrinsics
     surface_normal_metadata = surface_normals_encoding_metadata(
         intrinsics=resolved_surface_normal_intrinsics,
         max_neighbor_depth_delta_m=surface_normals_max_neighbor_depth_delta_m,
         camera_calibration=json_dataset.camera_calibration_identity,
+        encoding_version=surface_normals_encoding_version,
+        depth_near_m=depth_near_m,
+        depth_far_m=depth_far_m,
     )
 
     dataset = create_empty_dataset(
@@ -887,6 +1153,7 @@ def json_to_lerobot(
         depth_near_m=depth_near_m,
         depth_far_m=depth_far_m,
         include_surface_normals=include_surface_normals,
+        surface_normal_encoding_version=surface_normals_encoding_version,
         surface_normal_intrinsics=resolved_surface_normal_intrinsics,
         surface_normal_max_neighbor_depth_delta_m=surface_normals_max_neighbor_depth_delta_m,
         camera_calibration_profile=camera_calibration_profile,

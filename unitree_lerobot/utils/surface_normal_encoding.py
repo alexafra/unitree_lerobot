@@ -17,6 +17,8 @@ from unitree_lerobot.utils.camera_calibration import (
     validate_calibration_identity,
 )
 from unitree_lerobot.utils.depth_encoding import (
+    DEFAULT_DEPTH_FAR_M,
+    DEFAULT_DEPTH_NEAR_M,
     DEFAULT_DEPTH_SCALE_M_PER_UNIT,
     DEPTH_COLOR_SOURCE_KEY,
     DEPTH_SOURCE_KEY,
@@ -27,7 +29,18 @@ SURFACE_NORMAL_SOURCE_KEY = DEPTH_SOURCE_KEY
 SURFACE_NORMAL_COLOR_SOURCE_KEY = DEPTH_COLOR_SOURCE_KEY
 SURFACE_NORMAL_OUTPUT_KEY = "surface_normals_view"
 SURFACE_NORMAL_ENCODING = "camera_xyz_uint8"
-SURFACE_NORMAL_ENCODING_VERSION = 1
+LEGACY_SURFACE_NORMAL_ENCODING_VERSION = 1
+SURFACE_NORMAL_ENCODING_VERSION = 2
+SUPPORTED_SURFACE_NORMAL_ENCODING_VERSIONS = frozenset(
+    {LEGACY_SURFACE_NORMAL_ENCODING_VERSION, SURFACE_NORMAL_ENCODING_VERSION}
+)
+SURFACE_NORMAL_DEPTH_RANGE_REQUIRED_SAMPLES = (
+    "center",
+    "left",
+    "right",
+    "up",
+    "down",
+)
 
 SURFACE_NORMAL_COORDINATE_FRAME = "camera_optical_x_right_y_down_z_forward"
 SURFACE_NORMAL_ORIENTATION = "camera_facing_dot_normal_point_lte_zero"
@@ -73,6 +86,8 @@ REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480 = PinholeIntrinsics(
 
 
 def _finite_float(value: float, *, name: str) -> float:
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
     try:
         result = float(value)
     except (OverflowError, TypeError, ValueError) as exc:
@@ -139,6 +154,9 @@ def encode_surface_normals_rgb(
     scale_m_per_unit: float,
     intrinsics: PinholeIntrinsics = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
     max_neighbor_depth_delta_m: float = DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M,
+    encoding_version: int = SURFACE_NORMAL_ENCODING_VERSION,
+    depth_near_m: float = DEFAULT_DEPTH_NEAR_M,
+    depth_far_m: float = DEFAULT_DEPTH_FAR_M,
 ) -> np.ndarray:
     """Encode aligned uint16 depth as camera-frame XYZ surface normals.
 
@@ -147,7 +165,10 @@ def encode_surface_normals_rgb(
     XYZ components in ``[-1, 1]`` map to ``[1, 255]``. ``[0, 0, 0]`` is
     reserved for invalid pixels, including the one-pixel image border, missing
     depth, degenerate geometry, and depth discontinuities larger than the
-    configured metric threshold.
+    configured metric threshold. Version 2 additionally requires the centre
+    and all four neighbours to lie inside the inclusive fixed metric depth
+    range. Version 1 retains the historical unbounded transform byte-for-byte
+    for existing datasets and checkpoints.
     """
 
     depth = np.asarray(depth_u16)
@@ -168,6 +189,20 @@ def encode_surface_normals_rgb(
         raise ValueError(f"scale_m_per_unit must be positive, got {scale}")
     if discontinuity <= 0:
         raise ValueError(f"max_neighbor_depth_delta_m must be positive, got {discontinuity}")
+    if (
+        isinstance(encoding_version, bool)
+        or not isinstance(encoding_version, (int, np.integer))
+        or int(encoding_version) not in SUPPORTED_SURFACE_NORMAL_ENCODING_VERSIONS
+    ):
+        raise ValueError(
+            "encoding_version must be one of "
+            f"{sorted(SUPPORTED_SURFACE_NORMAL_ENCODING_VERSIONS)}, got {encoding_version!r}"
+        )
+    version = int(encoding_version)
+    near = _finite_float(depth_near_m, name="depth_near_m")
+    far = _finite_float(depth_far_m, name="depth_far_m")
+    if near < 0.0 or far <= near:
+        raise ValueError(f"depth_far_m ({far}) must be greater than depth_near_m ({near})")
 
     depth_m = depth.astype(np.float32) * np.float32(scale)
     x_scale = (np.arange(camera.width, dtype=np.float32) - np.float32(camera.cx)) / np.float32(camera.fx)
@@ -200,6 +235,22 @@ def encode_surface_normals_rgb(
         & (depth[:-2, 1:-1] != 0)
         & (depth[2:, 1:-1] != 0)
     )
+    if version == SURFACE_NORMAL_ENCODING_VERSION:
+        # Inclusive bounds intentionally match the depth-view contract. Do not
+        # clamp here: a clamped out-of-range sample would manufacture a false
+        # flat surface at the near/far plane.
+        source_valid &= (
+            (center_depth >= near)
+            & (center_depth <= far)
+            & (left_depth >= near)
+            & (left_depth <= far)
+            & (right_depth >= near)
+            & (right_depth <= far)
+            & (up_depth >= near)
+            & (up_depth <= far)
+            & (down_depth >= near)
+            & (down_depth <= far)
+        )
     locally_continuous = (
         (np.abs(left_depth - center_depth) <= discontinuity)
         & (np.abs(right_depth - center_depth) <= discontinuity)
@@ -237,6 +288,9 @@ def surface_normals_encoding_metadata(
     intrinsics: PinholeIntrinsics = DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
     max_neighbor_depth_delta_m: float = DEFAULT_SURFACE_NORMAL_MAX_NEIGHBOR_DEPTH_DELTA_M,
     camera_calibration: CameraCalibrationIdentity | dict[str, object] | None = None,
+    encoding_version: int = SURFACE_NORMAL_ENCODING_VERSION,
+    depth_near_m: float = DEFAULT_DEPTH_NEAR_M,
+    depth_far_m: float = DEFAULT_DEPTH_FAR_M,
 ) -> dict[str, object]:
     """Return the versioned, JSON-serializable contract for this encoding."""
 
@@ -247,13 +301,27 @@ def surface_normals_encoding_metadata(
     )
     if discontinuity <= 0:
         raise ValueError(f"max_neighbor_depth_delta_m must be positive, got {discontinuity}")
+    if (
+        isinstance(encoding_version, bool)
+        or not isinstance(encoding_version, (int, np.integer))
+        or int(encoding_version) not in SUPPORTED_SURFACE_NORMAL_ENCODING_VERSIONS
+    ):
+        raise ValueError(
+            "encoding_version must be one of "
+            f"{sorted(SUPPORTED_SURFACE_NORMAL_ENCODING_VERSIONS)}, got {encoding_version!r}"
+        )
+    version = int(encoding_version)
+    near = _finite_float(depth_near_m, name="depth_near_m")
+    far = _finite_float(depth_far_m, name="depth_far_m")
+    if near < 0.0 or far <= near:
+        raise ValueError(f"depth_far_m ({far}) must be greater than depth_near_m ({near})")
 
     metadata: dict[str, object] = {
         "source_key": SURFACE_NORMAL_SOURCE_KEY,
         "aligned_to": SURFACE_NORMAL_COLOR_SOURCE_KEY,
         "feature_key": f"observation.images.{SURFACE_NORMAL_OUTPUT_KEY}",
         "encoding": SURFACE_NORMAL_ENCODING,
-        "encoding_version": SURFACE_NORMAL_ENCODING_VERSION,
+        "encoding_version": version,
         "depth_scale_source": "episode.info.depth.scale_m_per_unit",
         "default_scale_m_per_unit": DEFAULT_DEPTH_SCALE_M_PER_UNIT,
         "intrinsics": {
@@ -274,6 +342,13 @@ def surface_normals_encoding_metadata(
         "invalid_value": [0, 0, 0],
         "valid_component_range": [1, 255],
     }
+    if version == SURFACE_NORMAL_ENCODING_VERSION:
+        metadata["depth_valid_range_m"] = {
+            "near_m": near,
+            "far_m": far,
+            "inclusive": True,
+            "required_samples": list(SURFACE_NORMAL_DEPTH_RANGE_REQUIRED_SAMPLES),
+        }
     if camera_calibration is not None:
         identity = (
             camera_calibration

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import unittest
 
 import numpy as np
@@ -10,6 +11,7 @@ from unitree_lerobot.utils.camera_calibration import (
 )
 from unitree_lerobot.utils.surface_normal_encoding import (
     DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+    LEGACY_SURFACE_NORMAL_ENCODING_VERSION,
     PinholeIntrinsics,
     REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
     encode_surface_normals_rgb,
@@ -68,6 +70,7 @@ class SurfaceNormalEncodingTest(unittest.TestCase):
             depth_u16,
             scale_m_per_unit=2e-5,
             intrinsics=intrinsics,
+            encoding_version=LEGACY_SURFACE_NORMAL_ENCODING_VERSION,
         )
 
         decoded_center = (encoded[3, 4].astype(np.float32) - 1.0) / 127.0 - 1.0
@@ -140,7 +143,7 @@ class SurfaceNormalEncodingTest(unittest.TestCase):
                 scale_m_per_unit=0.001,
                 intrinsics=self.intrinsics,
             )
-        for scale in (0, -0.001, np.inf, np.nan):
+        for scale in (False, np.bool_(True), 0, -0.001, np.inf, np.nan):
             with self.subTest(scale=scale):
                 with self.assertRaises(ValueError):
                     encode_surface_normals_rgb(
@@ -148,7 +151,7 @@ class SurfaceNormalEncodingTest(unittest.TestCase):
                         scale_m_per_unit=scale,
                         intrinsics=self.intrinsics,
                     )
-        for discontinuity in (0, -0.1, np.inf, np.nan):
+        for discontinuity in (False, np.bool_(True), 0, -0.1, np.inf, np.nan):
             with self.subTest(discontinuity=discontinuity):
                 with self.assertRaises(ValueError):
                     encode_surface_normals_rgb(
@@ -157,6 +160,17 @@ class SurfaceNormalEncodingTest(unittest.TestCase):
                         intrinsics=self.intrinsics,
                         max_neighbor_depth_delta_m=discontinuity,
                     )
+        for range_kwargs in ({"depth_near_m": False}, {"depth_far_m": np.bool_(True)}):
+            with self.subTest(range_kwargs=range_kwargs):
+                with self.assertRaisesRegex(ValueError, "must be a finite number"):
+                    encode_surface_normals_rgb(
+                        np.zeros((5, 7), dtype=np.uint16),
+                        scale_m_per_unit=0.001,
+                        intrinsics=self.intrinsics,
+                        **range_kwargs,
+                    )
+                with self.assertRaisesRegex(ValueError, "must be a finite number"):
+                    surface_normals_encoding_metadata(**range_kwargs)
 
     def test_metadata_is_versioned_and_serializes_the_exact_transform(self):
         metadata = surface_normals_encoding_metadata()
@@ -165,7 +179,16 @@ class SurfaceNormalEncodingTest(unittest.TestCase):
         self.assertEqual(metadata["aligned_to"], "color_0")
         self.assertEqual(metadata["feature_key"], "observation.images.surface_normals_view")
         self.assertEqual(metadata["encoding"], "camera_xyz_uint8")
-        self.assertEqual(metadata["encoding_version"], 1)
+        self.assertEqual(metadata["encoding_version"], 2)
+        self.assertEqual(
+            metadata["depth_valid_range_m"],
+            {
+                "near_m": 0.25,
+                "far_m": 1.0,
+                "inclusive": True,
+                "required_samples": ["center", "left", "right", "up", "down"],
+            },
+        )
         self.assertEqual(metadata["axis_order"], ["x", "y", "z"])
         self.assertEqual(metadata["orientation"], "camera_facing_dot_normal_point_lte_zero")
         self.assertEqual(metadata["method"], "central_difference_3d")
@@ -215,6 +238,77 @@ class SurfaceNormalEncodingTest(unittest.TestCase):
         self.assertEqual(
             pinhole_intrinsics_from_metadata(metadata["intrinsics"]),
             REALSENSE_D435I_254322071415_COLOR_INTRINSICS_640X480,
+        )
+
+    def test_v2_masks_out_of_range_center_or_neighbor_with_inclusive_boundaries(self):
+        expected_normal = np.array([128, 128, 1], dtype=np.uint8)
+        for depth_mm in (250, 1_000):
+            with self.subTest(boundary_mm=depth_mm):
+                depth = np.full((5, 7), depth_mm, dtype=np.uint16)
+                encoded = encode_surface_normals_rgb(
+                    depth,
+                    scale_m_per_unit=0.001,
+                    intrinsics=self.intrinsics,
+                )
+                np.testing.assert_array_equal(encoded[2, 3], expected_normal)
+
+        for row, column, depth_mm in (
+            (2, 3, 249),
+            (2, 3, 1_001),
+            (2, 2, 249),
+            (2, 4, 1_001),
+            (1, 3, 249),
+            (3, 3, 1_001),
+        ):
+            with self.subTest(row=row, column=column, depth_mm=depth_mm):
+                depth = np.full((5, 7), 500, dtype=np.uint16)
+                depth[row, column] = depth_mm
+                encoded = encode_surface_normals_rgb(
+                    depth,
+                    scale_m_per_unit=0.001,
+                    intrinsics=self.intrinsics,
+                    max_neighbor_depth_delta_m=1.0,
+                )
+                np.testing.assert_array_equal(encoded[2, 3], [0, 0, 0])
+
+    def test_v1_retains_unmasked_bytes_and_metadata(self):
+        for depth_mm in (100, 1_200):
+            with self.subTest(depth_mm=depth_mm):
+                depth = np.full((5, 7), depth_mm, dtype=np.uint16)
+                legacy = encode_surface_normals_rgb(
+                    depth,
+                    scale_m_per_unit=0.001,
+                    intrinsics=self.intrinsics,
+                    encoding_version=LEGACY_SURFACE_NORMAL_ENCODING_VERSION,
+                )
+                np.testing.assert_array_equal(legacy[2, 3], [128, 128, 1])
+
+                current = encode_surface_normals_rgb(
+                    depth,
+                    scale_m_per_unit=0.001,
+                    intrinsics=self.intrinsics,
+                )
+                np.testing.assert_array_equal(current[2, 3], [0, 0, 0])
+
+        metadata = surface_normals_encoding_metadata(
+            encoding_version=LEGACY_SURFACE_NORMAL_ENCODING_VERSION
+        )
+        self.assertEqual(metadata["encoding_version"], 1)
+        self.assertNotIn("depth_valid_range_m", metadata)
+
+    def test_v1_randomized_bytes_match_the_pre_v2_encoder_fixture(self):
+        generator = np.random.default_rng(17092026)
+        depth = generator.integers(0, 2_001, size=(480, 640), dtype=np.uint16)
+
+        encoded = encode_surface_normals_rgb(
+            depth,
+            scale_m_per_unit=0.001,
+            encoding_version=LEGACY_SURFACE_NORMAL_ENCODING_VERSION,
+        )
+
+        self.assertEqual(
+            hashlib.sha256(encoded.tobytes()).hexdigest(),
+            "1ac86e8c9a42410db9ee57ae83d1105fc0d28f9f27134482fa48d618ed3931b1",
         )
 
 

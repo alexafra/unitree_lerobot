@@ -28,8 +28,8 @@ from PyQt5.QtWidgets import (
 )
 
 # Keep the documented ``cd data_editor && python data_editor_EN_rgbd.py``
-# launch path working while using the exact same encoder as conversion and
-# deployment.
+# launch path working while using the canonical v2 encoder used by new
+# conversions and v2 deployments. Legacy v1 checkpoints remain unmasked.
 REPOSITORY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPOSITORY_ROOT not in sys.path:
     sys.path.insert(0, REPOSITORY_ROOT)
@@ -331,12 +331,14 @@ def aligned_depth_to_surface_normals_rgb(
     depth_scale_m_per_unit=DEFAULT_DEPTH_SCALE_M_PER_UNIT,
     intrinsics=DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
 ):
-    """Derive the training/deployment surface-normal view from aligned depth."""
+    """Derive the canonical masked surface-normal v2 view from aligned depth."""
 
     return encode_surface_normals_rgb(
         depth,
         scale_m_per_unit=canonicalize_depth_scale_m_per_unit(depth_scale_m_per_unit),
         intrinsics=intrinsics,
+        depth_near_m=DEPTH_NEAR_M,
+        depth_far_m=DEPTH_FAR_M,
     )
 
 
@@ -590,7 +592,10 @@ class DatasetPlayer(QWidget):
     DISPLAY_STREAMS = {
         "color_0": ("RGB Camera 0", "color"),
         "depth_0": ("Aligned Depth", "depth"),
-        SURFACE_NORMAL_OUTPUT_KEY: ("Surface Normals (from Aligned Depth)", "surface_normals"),
+        SURFACE_NORMAL_OUTPUT_KEY: (
+            "Surface Normals v2 Masked (from Aligned Depth)",
+            "surface_normals",
+        ),
         "raw_depth_0": ("Raw Depth", "depth"),
     }
 
@@ -726,8 +731,28 @@ class DatasetPlayer(QWidget):
         """)
         self.health_details_btn.hide()
 
+        self.refresh_health_btn = QPushButton("Refresh Health")
+        self.refresh_health_btn.clicked.connect(self.refresh_episode_health)
+        self.refresh_health_btn.setToolTip(
+            "Run the full dataset-wide health scan. This can take a while for large datasets."
+        )
+        self.refresh_health_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 13px;
+                font-weight: bold;
+                padding: 9px 12px;
+                border-radius: 6px;
+                background-color: #555555;
+                color: white;
+            }
+            QPushButton:hover:!disabled {
+                background-color: #444444;
+            }
+        """)
+
         health_layout = QHBoxLayout()
         health_layout.addWidget(self.health_warning_label, 1)
+        health_layout.addWidget(self.refresh_health_btn)
         health_layout.addWidget(self.health_details_btn)
 
         self.prev_btn = QPushButton("◀")
@@ -1734,11 +1759,15 @@ class DatasetPlayer(QWidget):
         try:
             self.delete_and_renumber_frames(delete_frame_ids)
             self.load_episode(self.current_episode_index)
-            self.refresh_episode_health()
             QMessageBox.information(
                 self,
                 "Done",
-                f"Trim completed.\n{delete_count} frames were deleted and the remaining frames were renumbered."
+                (
+                    f"Trim completed.\n{delete_count} frames were deleted and the "
+                    "remaining frames were renumbered.\n\n"
+                    "Playback remains paused. The health result is stale; click "
+                    "Refresh Health when you want to run the full dataset scan."
+                ),
             )
         except Exception as e:
             self.mark_episode_health_stale(
@@ -1787,12 +1816,23 @@ class DatasetPlayer(QWidget):
 
             next_index = min(current_index, len(self.episodes) - 1)
             self.load_episode(next_index)
-            self.refresh_episode_health()
-            self.is_playing = True
+            # Deleting an episode invalidates the previous dataset-wide health
+            # result.  Do not immediately parse every remaining data.json or
+            # restart four-view RGB-D/normal playback: together those two jobs
+            # caused the prolonged CPU and disk load observed after deletion.
+            # The stale warning remains visible until the operator deliberately
+            # clicks Refresh Health.
+            self.is_playing = False
             self.update_play_button_text()
             self.update_range_info()
 
-            QMessageBox.information(self, "Done", "The current dataset has been deleted.")
+            QMessageBox.information(
+                self,
+                "Done",
+                "The current dataset has been deleted.\n\n"
+                "Playback remains paused. The health result is stale; click "
+                "Refresh Health when you want to run the full dataset scan.",
+            )
 
         except Exception as e:
             self.mark_episode_health_stale(

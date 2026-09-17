@@ -230,6 +230,26 @@ class DataEditorRgbdSurfaceNormalsTest(unittest.TestCase):
         np.testing.assert_array_equal(preview, production)
         self.assertGreater(np.count_nonzero(preview), 100_000)
 
+    def test_normals_preview_masks_samples_outside_depth_preview_range(self):
+        intrinsics = self.editor.PinholeIntrinsics(
+            width=7,
+            height=5,
+            fx=100.0,
+            fy=100.0,
+            cx=3.0,
+            cy=2.0,
+        )
+        depth = np.full((5, 7), 600, dtype=np.uint16)
+        depth[2, 2] = 1_001
+
+        normals = self.editor.aligned_depth_to_surface_normals_rgb(
+            depth,
+            0.001,
+            intrinsics,
+        )
+
+        np.testing.assert_array_equal(normals[2, 3], [0, 0, 0])
+
     def test_editor_uses_recorded_color_intrinsics_for_normals(self):
         payload = {
             "info": {
@@ -289,6 +309,8 @@ class DataEditorRgbdSurfaceNormalsTest(unittest.TestCase):
             depth,
             scale_m_per_unit=0.001,
             intrinsics=self.editor.DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480,
+            depth_near_m=0.25,
+            depth_far_m=1.0,
         )
 
     def test_show_frame_dispatches_aligned_depth_to_normals_renderer(self):
@@ -505,6 +527,40 @@ class DataEditorRgbdSurfaceNormalsTest(unittest.TestCase):
         self.assertEqual(calls.mock_calls[1], mock.call.trim([0]))
         self.assertEqual(calls.mock_calls[2][0], "mark_stale")
 
+    def test_successful_trim_stays_paused_without_health_rescan(self):
+        player = object.__new__(self.editor.DatasetPlayer)
+        player.frame_keys = [0, 1, 2]
+        player.range_slider = mock.Mock()
+        player.range_slider.get_selected_range.return_value = (0, 0)
+        player.current_episode_index = 0
+        player.current_episode_name = "episode_0001"
+        player.is_playing = True
+        player.update_play_button_text = mock.Mock()
+        player.mark_episode_health_stale = mock.Mock()
+        player.delete_and_renumber_frames = mock.Mock()
+        player.load_episode = mock.Mock()
+        player.refresh_episode_health = mock.Mock()
+
+        with (
+            mock.patch.object(self.editor.QMessageBox, "Yes", 1, create=True),
+            mock.patch.object(self.editor.QMessageBox, "No", 0, create=True),
+            mock.patch.object(
+                self.editor.QMessageBox,
+                "question",
+                return_value=1,
+                create=True,
+            ),
+            mock.patch.object(self.editor.QMessageBox, "information", create=True),
+        ):
+            player.trim_selected_frames()
+
+        player.delete_and_renumber_frames.assert_called_once_with([0])
+        player.load_episode.assert_called_once_with(0)
+        player.refresh_episode_health.assert_not_called()
+        player.mark_episode_health_stale.assert_called_once()
+        self.assertFalse(player.is_playing)
+        player.update_play_button_text.assert_called_once_with()
+
     def test_failed_episode_delete_marks_health_stale_before_and_after_mutation(self):
         player = object.__new__(self.editor.DatasetPlayer)
         player.episodes = ["episode_0001"]
@@ -541,6 +597,42 @@ class DataEditorRgbdSurfaceNormalsTest(unittest.TestCase):
             mock.call.delete("/selected/task/episode_0001"),
         )
         self.assertEqual(calls.mock_calls[2][0], "mark_stale")
+
+    def test_successful_episode_delete_stays_paused_without_health_rescan(self):
+        player = object.__new__(self.editor.DatasetPlayer)
+        player.episodes = ["episode_0001", "episode_0002"]
+        player.current_episode_name = "episode_0001"
+        player.current_episode_index = 0
+        player.root_dir = "/selected/task"
+        player.is_playing = True
+        player.mark_episode_health_stale = mock.Mock()
+        player.update_play_button_text = mock.Mock()
+        player.update_range_info = mock.Mock()
+        player.find_episodes = mock.Mock(return_value=["episode_0002"])
+        player.load_episode = mock.Mock()
+        player.refresh_episode_health = mock.Mock()
+
+        with (
+            mock.patch.object(self.editor.QMessageBox, "Yes", 1, create=True),
+            mock.patch.object(self.editor.QMessageBox, "Cancel", 0, create=True),
+            mock.patch.object(
+                self.editor.QMessageBox,
+                "question",
+                return_value=1,
+                create=True,
+            ),
+            mock.patch.object(self.editor.QMessageBox, "information", create=True),
+            mock.patch.object(self.editor.os.path, "isdir", return_value=True),
+            mock.patch.object(self.editor.shutil, "rmtree") as rmtree,
+        ):
+            player.delete_current_episode()
+
+        rmtree.assert_called_once_with("/selected/task/episode_0001")
+        player.load_episode.assert_called_once_with(0)
+        player.refresh_episode_health.assert_not_called()
+        self.assertFalse(player.is_playing)
+        player.update_play_button_text.assert_called()
+        player.update_range_info.assert_called()
 
     def test_trim_color_only_episode_without_depth(self):
         with tempfile.TemporaryDirectory() as temp_dir:

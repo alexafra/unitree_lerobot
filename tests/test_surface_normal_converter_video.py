@@ -3,8 +3,11 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import shutil
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -211,10 +214,57 @@ class SurfaceNormalConverterVideoTest(unittest.TestCase):
         contract = dataset.meta.info["surface_normals_encoding"]
         self.assertEqual(contract["feature_key"], "observation.images.surface_normals_view")
         self.assertEqual(contract["encoding"], "camera_xyz_uint8")
+        self.assertEqual(contract["encoding_version"], 2)
+        self.assertEqual(
+            contract["depth_valid_range_m"],
+            {
+                "near_m": 0.25,
+                "far_m": 1.0,
+                "inclusive": True,
+                "required_samples": ["center", "left", "right", "up", "down"],
+            },
+        )
         self.assertNotIn("camera_calibration", contract)
         self.assertNotIn("camera_calibration", dataset.meta.info)
         write_info.assert_called_once_with(dataset.meta.info, dataset.meta.root)
         dataset.finalize.assert_called_once_with()
+
+    def test_explicit_v1_conversion_reproduces_legacy_unmasked_contract(self):
+        metadata = types.SimpleNamespace(info={"features": {}}, root=Path("/tmp/fake-v1"))
+        dataset = types.SimpleNamespace(
+            meta=metadata,
+            finalize=mock.Mock(),
+            push_to_hub=mock.Mock(),
+        )
+        json_dataset = types.SimpleNamespace(
+            surface_normal_intrinsics=(
+                self.converter.DEFAULT_REALSENSE_COLOR_INTRINSICS_640X480
+            ),
+            camera_calibration=None,
+            camera_calibration_identity=None,
+        )
+
+        with (
+            mock.patch.object(self.converter, "JsonDataset", return_value=json_dataset) as source,
+            mock.patch.object(self.converter, "create_empty_dataset", return_value=dataset),
+            mock.patch.object(self.converter, "populate_dataset", return_value=dataset),
+            mock.patch.object(self.converter, "write_info"),
+        ):
+            self.converter.json_to_lerobot(
+                raw_dir=Path("/tmp/raw"),
+                repo_id="owner/dataset",
+                robot_type="Unitree_G1_Dex3_HeadOnly",
+                include_surface_normals=True,
+                surface_normals_encoding_version=1,
+            )
+
+        self.assertEqual(
+            source.call_args.kwargs["surface_normal_encoding_version"],
+            1,
+        )
+        contract = dataset.meta.info["surface_normals_encoding"]
+        self.assertEqual(contract["encoding_version"], 1)
+        self.assertNotIn("depth_valid_range_m", contract)
 
     def test_recorded_calibration_is_homogeneous_and_drives_surface_normal_k(self):
         calibration = self.converter.NAMED_CAMERA_CALIBRATIONS["d435i-254322071415"]
@@ -396,6 +446,64 @@ class SurfaceNormalConverterVideoTest(unittest.TestCase):
                 paths,
             )
 
+    def test_explicit_matching_profile_canonicalizes_mixed_calibration(self):
+        calibration = self.converter.NAMED_CAMERA_CALIBRATIONS["d435i-254322071415"]
+        paths = [Path("episode_0000"), Path("episode_0001")]
+        tagged = {"info": {"depth": {"calibration": calibration}}, "data": []}
+        legacy = {"info": {"depth": {}}, "data": []}
+
+        resolved = self.converter._resolve_recorded_camera_calibration(
+            [tagged, legacy],
+            paths,
+            selected_profile_calibration=calibration,
+        )
+
+        self.assertIsNone(resolved)
+
+        with tempfile.TemporaryDirectory() as root:
+            for index, payload in enumerate((tagged, legacy)):
+                episode = Path(root) / f"episode_{index:04d}"
+                episode.mkdir()
+                (episode / "data.json").write_text(
+                    json.dumps(payload),
+                    encoding="utf-8",
+                )
+
+            dataset = self.converter.JsonDataset(
+                Path(root),
+                "Unitree_G1_Dex3_HeadOnly",
+                include_surface_normals=True,
+                camera_calibration_profile="d435i-254322071415",
+            )
+
+        self.assertEqual(dataset.camera_calibration, calibration)
+        self.assertEqual(
+            dataset.camera_calibration_identity.source,
+            "converter.profile.d435i-254322071415",
+        )
+
+    def test_explicit_profile_rejects_conflicting_calibration_in_mixed_data(self):
+        expected = self.converter.NAMED_CAMERA_CALIBRATIONS["d435i-254322071415"]
+        different = copy.deepcopy(expected)
+        different["camera"]["serial"] = "other"
+        fingerprint_payload = {
+            key: value for key, value in different.items() if key != "fingerprint"
+        }
+        different["fingerprint"] = calibration_fingerprint(fingerprint_payload)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Explicit camera calibration profile conflicts with recorded calibration",
+        ):
+            self.converter._resolve_recorded_camera_calibration(
+                [
+                    {"info": {"depth": {"calibration": different}}},
+                    {"info": {"depth": {}}},
+                ],
+                [Path("episode_0000"), Path("episode_0001")],
+                selected_profile_calibration=expected,
+            )
+
     def test_explicit_profile_rejects_conflicting_recorded_calibration(self):
         calibration = copy.deepcopy(
             self.converter.NAMED_CAMERA_CALIBRATIONS["d435i-254322071415"]
@@ -454,6 +562,229 @@ class SurfaceNormalConverterVideoTest(unittest.TestCase):
         imread.assert_called_with("/raw/episode_0000/depth.png", -1)
         self.assertEqual(sleep.call_args_list, [mock.call(0.05), mock.call(0.05)])
         self.assertEqual(len(images[self.converter.DEPTH_OUTPUT_KEY]), 1)
+
+    def test_converter_uses_one_custom_metric_range_for_depth_and_normals(self):
+        dataset = object.__new__(self.converter.JsonDataset)
+        dataset.camera_to_image_key = {
+            self.converter.DEPTH_COLOR_SOURCE_KEY: "observation.images.ego_view"
+        }
+        dataset.depth_near_m = 0.4
+        dataset.depth_far_m = 0.8
+        dataset.surface_normal_intrinsics = self.converter.PinholeIntrinsics(
+            width=7,
+            height=5,
+            fx=100.0,
+            fy=100.0,
+            cx=3.0,
+            cy=2.0,
+        )
+        dataset.surface_normal_max_neighbor_depth_delta_m = 0.05
+        dataset.depth_processing_workers = 1
+        episode_data = {
+            "info": {"depth": {"scale_m_per_unit": 0.001}},
+            "data": [{"idx": 0, "depths": {self.converter.DEPTH_SOURCE_KEY: "depth.png"}}],
+        }
+        depth = np.full((5, 7), 600, dtype=np.uint16)
+        depth[2, 2] = 399
+
+        with mock.patch.object(
+            self.converter.cv2,
+            "imread",
+            return_value=depth,
+            create=True,
+        ):
+            images = dataset._parse_depth_derived_images(
+                "/raw/episode_0000",
+                episode_data,
+                include_depth=True,
+                include_surface_normals=True,
+            )
+
+        # The same sample is clipped to the depth view's near value and masks
+        # any surface normal whose stencil depends on it.
+        self.assertEqual(images[self.converter.DEPTH_OUTPUT_KEY][0][2, 2, 0], 1)
+        np.testing.assert_array_equal(
+            images[self.converter.SURFACE_NORMAL_OUTPUT_KEY][0][2, 3],
+            [0, 0, 0],
+        )
+
+    def test_parallel_depth_processing_is_byte_identical_and_ordered(self):
+        dataset = object.__new__(self.converter.JsonDataset)
+        dataset.camera_to_image_key = {
+            self.converter.DEPTH_COLOR_SOURCE_KEY: "observation.images.ego_view"
+        }
+        dataset.depth_near_m = 0.25
+        dataset.depth_far_m = 1.0
+        dataset.surface_normal_intrinsics = self.converter.PinholeIntrinsics(
+            width=8,
+            height=6,
+            fx=7.0,
+            fy=7.5,
+            cx=3.5,
+            cy=2.5,
+        )
+        dataset.surface_normal_max_neighbor_depth_delta_m = 0.05
+        frames = [
+            {"idx": index, "depths": {self.converter.DEPTH_SOURCE_KEY: f"depth-{index}.png"}}
+            for index in range(12)
+        ]
+        episode_data = {
+            "info": {"depth": {"scale_m_per_unit": 0.001}},
+            "data": frames,
+        }
+        yy, xx = np.indices((6, 8), dtype=np.uint16)
+        depths = {
+            f"/raw/episode/depth-{index}.png": (
+                np.uint16(400 + index * 11) + xx + yy
+            ).astype(np.uint16)
+            for index in range(len(frames))
+        }
+
+        def read_depth(path, _mode):
+            return depths[path].copy()
+
+        outputs = []
+        with mock.patch.object(
+            self.converter.cv2,
+            "imread",
+            side_effect=read_depth,
+            create=True,
+        ):
+            for workers in (1, 4):
+                dataset.depth_processing_workers = workers
+                outputs.append(
+                    dataset._parse_depth_derived_images(
+                        "/raw/episode",
+                        episode_data,
+                        include_depth=True,
+                        include_surface_normals=True,
+                    )
+                )
+
+        serial, parallel = outputs
+        self.assertEqual(list(serial), list(parallel))
+        for key in serial:
+            self.assertEqual(len(serial[key]), len(frames))
+            for expected, actual in zip(serial[key], parallel[key], strict=True):
+                np.testing.assert_array_equal(actual, expected)
+        # Distinct first pixels prove results were restored to frame order.
+        self.assertEqual(
+            [int(frame[0, 0, 0]) for frame in parallel[self.converter.DEPTH_OUTPUT_KEY]],
+            sorted(
+                int(frame[0, 0, 0])
+                for frame in parallel[self.converter.DEPTH_OUTPUT_KEY]
+            ),
+        )
+
+    def test_ordered_parallel_map_is_bounded_and_reports_first_input_error(self):
+        lock = threading.Lock()
+        active = 0
+        peak_active = 0
+
+        def work(index):
+            nonlocal active, peak_active
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            try:
+                if index == 0:
+                    time.sleep(0.04)
+                    return index
+                if index in {1, 2}:
+                    raise ValueError(f"frame {index}")
+                time.sleep(0.01)
+                return index
+            finally:
+                with lock:
+                    active -= 1
+
+        with self.assertRaisesRegex(ValueError, "frame 1"):
+            list(
+                self.converter._ordered_bounded_parallel_map(
+                    work,
+                    list(range(20)),
+                    max_workers=3,
+                )
+            )
+
+        self.assertLessEqual(peak_active, 3)
+        self.assertEqual(active, 0)
+
+    def test_temporary_modalities_encode_concurrently_and_return_in_key_order(self):
+        dataset = object.__new__(self.converter.GeometryVideoLeRobotDataset)
+        dataset.meta = types.SimpleNamespace(video_keys=["rgb", "depth", "normals"])
+        dataset.video_encoding_workers = 3
+        dataset._parallel_video_encoding_active = True
+        dataset._pending_temporary_videos = None
+        lock = threading.Lock()
+        active = 0
+        peak_active = 0
+
+        with tempfile.TemporaryDirectory() as root:
+            dataset.root = Path(root)
+
+            def encode_one(key, _episode_index):
+                nonlocal active, peak_active
+                with lock:
+                    active += 1
+                    peak_active = max(peak_active, active)
+                try:
+                    time.sleep({"rgb": 0.04, "depth": 0.02, "normals": 0.01}[key])
+                    directory = Path(tempfile.mkdtemp(dir=root))
+                    path = directory / f"{key}.mp4"
+                    path.touch()
+                    return path
+                finally:
+                    with lock:
+                        active -= 1
+
+            with mock.patch.object(
+                dataset,
+                "_encode_one_temporary_episode_video",
+                side_effect=encode_one,
+            ):
+                returned = [
+                    dataset._encode_temporary_episode_video(key, 7)
+                    for key in dataset.meta.video_keys
+                ]
+
+            self.assertEqual([path.stem for path in returned], dataset.meta.video_keys)
+            self.assertEqual(peak_active, 3)
+            self.assertEqual(dataset._pending_temporary_videos, {})
+            for path in returned:
+                shutil.rmtree(path.parent)
+
+    def test_parallel_video_failure_removes_all_completed_temporary_outputs(self):
+        dataset = object.__new__(self.converter.GeometryVideoLeRobotDataset)
+        dataset.meta = types.SimpleNamespace(video_keys=["rgb", "depth", "normals"])
+        dataset.video_encoding_workers = 3
+        dataset._parallel_video_encoding_active = True
+        dataset._pending_temporary_videos = None
+
+        with tempfile.TemporaryDirectory() as root:
+            dataset.root = Path(root)
+
+            def encode_one(key, _episode_index):
+                if key == "depth":
+                    time.sleep(0.02)
+                    raise RuntimeError("depth encoder failed")
+                directory = Path(tempfile.mkdtemp(dir=root))
+                path = directory / f"{key}.mp4"
+                path.touch()
+                return path
+
+            with (
+                mock.patch.object(
+                    dataset,
+                    "_encode_one_temporary_episode_video",
+                    side_effect=encode_one,
+                ),
+                self.assertRaisesRegex(RuntimeError, "depth encoder failed"),
+            ):
+                dataset._encode_temporary_episode_video("rgb", 8)
+
+            self.assertEqual(list(Path(root).iterdir()), [])
+            self.assertIsNone(dataset._pending_temporary_videos)
 
     def test_converter_validates_sdk_scale_but_encodes_with_exact_canonical_constant(self):
         dataset = object.__new__(self.converter.JsonDataset)
