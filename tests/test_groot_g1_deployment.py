@@ -410,32 +410,32 @@ class GrootG1DeploymentTests(unittest.TestCase):
     def test_inspire_warmup1_pose_is_exact_frozen_training_start_medoid(self):
         expected = np.array(
             [
-                -0.5636061429977417,
-                0.28611138463020325,
-                0.2579364776611328,
-                1.2384618520736694,
-                -0.052682653069496155,
-                -0.8750162124633789,
-                -0.1916637122631073,
-                -0.5884613990783691,
-                -0.10392720252275467,
-                -0.32727721333503723,
-                1.2397561073303223,
-                0.1675993949174881,
-                -1.0738584995269775,
-                0.4185490608215332,
-                0.7570000290870667,
-                0.8569999933242798,
-                0.925000011920929,
-                0.9210000038146973,
+                -0.4093931317329407,
+                0.20677582919597626,
+                0.26564234495162964,
+                0.9761511087417603,
+                -0.22572287917137146,
+                -0.8953654170036316,
+                -0.4879257380962372,
+                -0.35373836755752563,
+                -0.11657056212425232,
+                -0.11414974182844162,
+                0.6982728838920593,
+                0.049195244908332825,
+                -0.6964153051376343,
+                0.1946837455034256,
+                0.7450000047683716,
+                0.8410000205039978,
+                0.8820000290870667,
+                0.8960000276565552,
                 0.9990000128746033,
-                0.7699999809265137,
-                0.5989999771118164,
-                0.6769999861717224,
-                0.7549999952316284,
-                0.796999990940094,
-                0.875,
-                0.40799999237060547,
+                0.7990000247955322,
+                0.6690000295639038,
+                0.7620000243186951,
+                0.8169999718666077,
+                0.8429999947547913,
+                0.906000018119812,
+                0.4830000102519989,
             ],
             dtype=np.float64,
         )
@@ -445,19 +445,19 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertFalse(INSPIRE_TRAINING_START_JOINTS.flags.writeable)
         self.assertTrue(
             INSPIRE_TRAINING_START_SOURCE["dataset_path"].endswith(
-                "inspire/pick_place_red_cup_08_13/train"
+                "inspire/all_tasks_713eps_20260917_normals_range_mask_v2/train"
             )
         )
-        self.assertEqual(INSPIRE_TRAINING_START_SOURCE["episode_index"], 56)
-        self.assertEqual(INSPIRE_TRAINING_START_SOURCE["split_episode"], "episode_0057")
-        self.assertEqual(INSPIRE_TRAINING_START_SOURCE["source_episode"], "episode_0079")
+        self.assertEqual(INSPIRE_TRAINING_START_SOURCE["episode_index"], 428)
+        self.assertEqual(INSPIRE_TRAINING_START_SOURCE["split_episode"], "episode_000428")
+        self.assertEqual(INSPIRE_TRAINING_START_SOURCE["source_episode"], "episode_0084")
         self.assertEqual(
             INSPIRE_TRAINING_START_SOURCE["data_json_sha256"],
-            "9a8776c3c3767689392cfe063df40174c603038403a67878b8f034e26fdc7eb5",
+            "4675ad296f03ad83feff7811ae01dc1aad0e740fed5f734408aad2f0f256774b",
         )
         self.assertEqual(INSPIRE_TRAINING_START_SOURCE["frame_index"], 0)
         self.assertEqual(INSPIRE_TRAINING_START_SOURCE["timestamp_s"], 0.0)
-        self.assertEqual(INSPIRE_TRAINING_START_SOURCE["task"], "pick up the red cup.")
+        self.assertEqual(INSPIRE_TRAINING_START_SOURCE["task"], "stack the three red cups.")
         self.assertEqual(
             training_start_source("inspire-ftp"),
             INSPIRE_TRAINING_START_SOURCE,
@@ -472,7 +472,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 spec = training_start_spec(profile)
                 self.assertEqual(spec.mode, "training-start")
                 self.assertEqual(spec.end_effector, profile)
-                self.assertIn("episode 56 frame 0", spec.label)
+                self.assertIn("episode 428 frame 0", spec.label)
                 np.testing.assert_array_equal(spec.arm, expected[:14])
                 np.testing.assert_array_equal(spec.left_hand, expected[14:20])
                 np.testing.assert_array_equal(spec.right_hand, expected[20:])

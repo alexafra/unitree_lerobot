@@ -70,18 +70,18 @@ TRAINING_START_JOINTS_RAD = DEX3_TRAINING_START_JOINTS_RAD
 INSPIRE_TRAINING_START_SOURCE = {
     "dataset_path": (
         "/home/alex/Development/Datasets/lerobot2/inspire/"
-        "pick_place_red_cup_08_13/train"
+        "all_tasks_713eps_20260917_normals_range_mask_v2/train"
     ),
     # LeRobot episode indices are zero-based. The split manifest maps this
-    # converted episode to source episode_0079.
-    "episode_index": 56,
-    "split_episode": "episode_0057",
-    "source_episode": "episode_0079",
-    "data_json_sha256": "9a8776c3c3767689392cfe063df40174c603038403a67878b8f034e26fdc7eb5",
+    # converted episode to stack_red_cups_09_15 source episode_0084.
+    "episode_index": 428,
+    "split_episode": "episode_000428",
+    "source_episode": "episode_0084",
+    "data_json_sha256": "4675ad296f03ad83feff7811ae01dc1aad0e740fed5f734408aad2f0f256774b",
     "frame_index": 0,
     "timestamp_s": 0.0,
-    "task": "pick up the red cup.",
-    "selection": "medoid of all 109 training episode-start states",
+    "task": "stack the three red cups.",
+    "selection": "medoid of all 115 stack-task training episode-start states",
 }
 
 # Reviewed demonstrated medoid from observation.state, not action, in the
@@ -90,32 +90,32 @@ INSPIRE_TRAINING_START_SOURCE = {
 # open fractions. Values retain the exact float32 values stored in Parquet.
 INSPIRE_TRAINING_START_JOINTS = np.array(
     [
-        -0.5636061429977417,
-        0.28611138463020325,
-        0.2579364776611328,
-        1.2384618520736694,
-        -0.052682653069496155,
-        -0.8750162124633789,
-        -0.1916637122631073,
-        -0.5884613990783691,
-        -0.10392720252275467,
-        -0.32727721333503723,
-        1.2397561073303223,
-        0.1675993949174881,
-        -1.0738584995269775,
-        0.4185490608215332,
-        0.7570000290870667,
-        0.8569999933242798,
-        0.925000011920929,
-        0.9210000038146973,
+        -0.4093931317329407,
+        0.20677582919597626,
+        0.26564234495162964,
+        0.9761511087417603,
+        -0.22572287917137146,
+        -0.8953654170036316,
+        -0.4879257380962372,
+        -0.35373836755752563,
+        -0.11657056212425232,
+        -0.11414974182844162,
+        0.6982728838920593,
+        0.049195244908332825,
+        -0.6964153051376343,
+        0.1946837455034256,
+        0.7450000047683716,
+        0.8410000205039978,
+        0.8820000290870667,
+        0.8960000276565552,
         0.9990000128746033,
-        0.7699999809265137,
-        0.5989999771118164,
-        0.6769999861717224,
-        0.7549999952316284,
-        0.796999990940094,
-        0.875,
-        0.40799999237060547,
+        0.7990000247955322,
+        0.6690000295639038,
+        0.7620000243186951,
+        0.8169999718666077,
+        0.8429999947547913,
+        0.906000018119812,
+        0.4830000102519989,
     ],
     dtype=np.float64,
 )
@@ -144,7 +144,7 @@ def training_start_spec(end_effector: str = "dex3") -> InitializationSpec:
         values = INSPIRE_TRAINING_START_JOINTS
         hand_dof = 6
         mode = TRAINING_START_MODE
-        label = "Warmup1: Inspire training episode 56 frame 0 measured pose"
+        label = "Warmup1: Inspire stack training episode 428 frame 0 measured pose"
     else:
         raise ValueError(f"No reviewed training-start pose for end effector {end_effector!r}")
 
