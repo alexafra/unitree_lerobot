@@ -13,13 +13,11 @@ data/
 laptop_latency_diagnostic_h8_c100.log
 unitree_lerobot/cam_config_client.yaml
 dex3_hand_status_probe_10s.log
-.gitignore
 dds_state_profile_20s.log
 dds_state_profile_300s.log
-g1_authority_ramp_debug.log
 /logs/
 /unitree_lerobot/logs/
 run gr00t commands
-g1_authority_ramp_debug.log
-g1_authority_ramp_debug.log
-g1_authority_ramp_debug.log
+
+# Local hardware qualification and timing captures
+/*.log
