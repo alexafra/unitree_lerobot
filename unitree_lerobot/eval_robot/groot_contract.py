@@ -138,6 +138,10 @@ INITIALIZATION_MODES = ("measured", "xr-home", "pose-file")
 # deliberately absent from INITIALIZATION_MODES so argparse and public
 # pose-file initialization cannot select it.
 TRAINING_START_MODE = "training-start"
+# Internal-only mode for the one-time Inspire elbow settle performed after an
+# explicit startup XR-home. It is deliberately absent from INITIALIZATION_MODES
+# so neither the CLI nor a pose file can request it directly.
+STARTUP_SETTLE_MODE = "startup-settle"
 INITIAL_POSE_SCHEMA_VERSION = 1
 
 # Inspire hands hang slightly lower than Dex3 at the historical all-zero XR
@@ -149,6 +153,14 @@ INSPIRE_XR_HOME_ELBOW_RAD = -0.15
 INSPIRE_XR_HOME_ARM = np.zeros(ARM_DOF, dtype=np.float64)
 INSPIRE_XR_HOME_ARM[[3, 10]] = INSPIRE_XR_HOME_ELBOW_RAD
 INSPIRE_XR_HOME_ARM.flags.writeable = False
+
+# Keep the canonical XR-home above unchanged: Return-to-Start intentionally
+# replays it. This separate target is used exactly once at initial startup,
+# after XR-home and before optional Warmup1/Warmup2.
+INSPIRE_STARTUP_ELBOW_SETTLE_RAD = -0.05
+INSPIRE_STARTUP_ELBOW_SETTLE_ARM = np.zeros(ARM_DOF, dtype=np.float64)
+INSPIRE_STARTUP_ELBOW_SETTLE_ARM[[3, 10]] = INSPIRE_STARTUP_ELBOW_SETTLE_RAD
+INSPIRE_STARTUP_ELBOW_SETTLE_ARM.flags.writeable = False
 
 # These are deliberately fixed deployment ceilings, not tuning flags.  They need
 # hardware qualification before being relaxed.
@@ -1057,11 +1069,14 @@ def validate_initialization_spec(
     *,
     allow_policy_warm_start: bool = False,
     allow_training_start: bool = False,
+    allow_startup_settle: bool = False,
 ) -> None:
     profile = _end_effector_profile(spec.end_effector)
     allowed_modes = INITIALIZATION_MODES
     if allow_training_start:
         allowed_modes = (*allowed_modes, TRAINING_START_MODE)
+    if allow_startup_settle:
+        allowed_modes = (*allowed_modes, STARTUP_SETTLE_MODE)
     if spec.mode not in allowed_modes:
         raise DeploymentError(f"Unsupported initialization mode {spec.mode!r}")
     if not isinstance(spec.label, str) or not spec.label.strip() or len(spec.label) > 120:
@@ -1071,11 +1086,16 @@ def validate_initialization_spec(
     if profile.name != "dex3":
         if spec.mode == "measured":
             return
-        if spec.mode == "xr-home":
+        if spec.mode in {"xr-home", STARTUP_SETTLE_MODE}:
             if profile.home is None:
                 raise DeploymentError(f"{profile.name} has no configured XR-home hand target")
+            expected_arm = (
+                INSPIRE_XR_HOME_ARM
+                if spec.mode == "xr-home"
+                else INSPIRE_STARTUP_ELBOW_SETTLE_ARM
+            )
             expected = (
-                ("arm", spec.arm, INSPIRE_XR_HOME_ARM),
+                ("arm", spec.arm, expected_arm),
                 ("left hand", spec.left_hand, profile.home),
                 ("right hand", spec.right_hand, profile.home),
             )
@@ -1088,13 +1108,10 @@ def validate_initialization_spec(
                     or not np.all(np.isfinite(values))
                     or not np.array_equal(values, required)
                 ):
-                    semantics = (
-                        "the configured symmetric elbow-lift pose"
-                        if name == "arm"
-                        else "fully open (normalized one)"
-                    )
+                    semantics = "the configured symmetric elbow pose" if name == "arm" else "fully open (normalized one)"
+                    stage = "XR-home" if spec.mode == "xr-home" else "startup elbow settle"
                     raise DeploymentError(
-                        f"{profile.name} XR-home {name} target must be exactly {semantics}"
+                        f"{profile.name} {stage} {name} target must be exactly {semantics}"
                     )
             return
         policy_warm_start = allow_policy_warm_start and spec.mode == "pose-file"
@@ -1151,6 +1168,8 @@ def validate_initialization_spec(
                 unit=unit,
             )
         return
+    if spec.mode == STARTUP_SETTLE_MODE:
+        raise DeploymentError("Startup elbow settle is supported only for Inspire profiles")
     if spec.mode == "xr-home":
         expected_sizes = (ARM_DOF, HAND_DOF, HAND_DOF)
         for name, target, size in zip(
@@ -1249,6 +1268,27 @@ def validate_initialization_spec(
             margin_constant=margin_constant,
             tolerance_constant=tolerance_constant,
         )
+
+
+def inspire_startup_elbow_settle_spec(end_effector: str) -> InitializationSpec:
+    """Return the exact one-time post-XR-home Inspire elbow settle target."""
+
+    profile = _end_effector_profile(end_effector)
+    if profile.name == "dex3" or profile.home is None:
+        raise ValueError(f"No startup elbow settle pose for end effector {end_effector!r}")
+    spec = InitializationSpec(
+        mode=STARTUP_SETTLE_MODE,
+        label=(
+            "Inspire startup elbow settle (shoulders/wrists zero; both elbows "
+            f"{INSPIRE_STARTUP_ELBOW_SETTLE_RAD:+.2f} rad; both hands fully open)"
+        ),
+        arm=np.array(INSPIRE_STARTUP_ELBOW_SETTLE_ARM, dtype=np.float64, copy=True),
+        left_hand=np.array(profile.home, dtype=np.float64, copy=True),
+        right_hand=np.array(profile.home, dtype=np.float64, copy=True),
+        end_effector=profile.name,
+    )
+    validate_initialization_spec(spec, allow_startup_settle=True)
+    return spec
 
 
 def load_initialization_spec(

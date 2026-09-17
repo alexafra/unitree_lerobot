@@ -58,6 +58,9 @@ from unitree_lerobot.eval_robot.groot_contract import (
     EXPECTED_EGO_VIEW_SHAPE,
     EXPECTED_JOINT_NAMES,
     EXPECTED_ROBOT_TYPE,
+    INSPIRE_STARTUP_ELBOW_SETTLE_ARM,
+    INSPIRE_STARTUP_ELBOW_SETTLE_RAD,
+    INSPIRE_XR_HOME_ARM,
     INITIAL_POSE_SCHEMA_VERSION,
     JOINT_LIMIT_MARGIN_RAD,
     HAND_LIMIT_TOLERANCE_RAD,
@@ -65,10 +68,12 @@ from unitree_lerobot.eval_robot.groot_contract import (
     MAX_ARM_STEP_RAD,
     MAX_HAND_STEP_RAD,
     MEASURED_LIMIT_TOLERANCE_RAD,
+    ModelContract,
     RGBD_VIDEO_KEYS,
     SURFACE_NORMAL_VIDEO_KEYS,
     SurfaceNormalEncodingContract,
     TASKS,
+    inspire_startup_elbow_settle_spec,
     load_initialization_spec,
     make_observation,
     parse_action_chunk,
@@ -512,6 +517,44 @@ class GrootG1DeploymentTests(unittest.TestCase):
         np.testing.assert_array_equal(chunk.arm[-1], spec.arm)
         np.testing.assert_array_equal(chunk.left_hand[-1], spec.left_hand)
         np.testing.assert_array_equal(chunk.right_hand[-1], spec.right_hand)
+
+    def test_inspire_startup_elbow_settle_is_exact_and_internal_only(self):
+        for profile in ("inspire-ftp", "inspire-dfx"):
+            with self.subTest(profile=profile):
+                spec = inspire_startup_elbow_settle_spec(profile)
+                expected_arm = np.zeros(14)
+                expected_arm[[3, 10]] = -0.05
+                self.assertEqual(INSPIRE_STARTUP_ELBOW_SETTLE_RAD, -0.05)
+                np.testing.assert_array_equal(INSPIRE_STARTUP_ELBOW_SETTLE_ARM, expected_arm)
+                np.testing.assert_array_equal(spec.arm, expected_arm)
+                np.testing.assert_array_equal(spec.left_hand, np.ones(6))
+                np.testing.assert_array_equal(spec.right_hand, np.ones(6))
+                self.assertIn("both elbows -0.05 rad", spec.label)
+                with self.assertRaisesRegex(DeploymentError, "Unsupported initialization mode"):
+                    validate_initialization_spec(spec)
+                validate_initialization_spec(spec, allow_startup_settle=True)
+
+                measured = RobotState(
+                    captured_at=1.0,
+                    mode_machine=5,
+                    arm=INSPIRE_XR_HOME_ARM.copy(),
+                    arm_dq=np.zeros(14),
+                    left_hand=np.ones(6),
+                    right_hand=np.ones(6),
+                )
+                chunk = build_initialization_chunk(
+                    measured,
+                    spec,
+                    allow_startup_settle=True,
+                )
+                np.testing.assert_array_equal(chunk.arm[-1], expected_arm)
+
+        # The startup settle must not mutate or replace canonical XR-home,
+        # because Return-to-Start deliberately retains the -0.15 target.
+        self.assertEqual(INSPIRE_XR_HOME_ARM[3], -0.15)
+        self.assertEqual(INSPIRE_XR_HOME_ARM[10], -0.15)
+        with self.assertRaisesRegex(ValueError, "No startup elbow settle"):
+            inspire_startup_elbow_settle_spec("dex3")
 
     def test_custom_goal_is_validated_and_mutually_exclusive_with_trained_task(self):
         parser = build_parser()
@@ -1091,6 +1134,155 @@ class GrootG1DeploymentTests(unittest.TestCase):
         ]
         positions = [events.index(event) for event in ordered]
         self.assertEqual(positions, sorted(positions))
+
+    def test_inspire_elbow_settle_is_startup_only_and_independent_of_warmups(self):
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+
+        for warmup1_enabled in (False, True):
+            with self.subTest(warmup1_enabled=warmup1_enabled):
+                events = []
+                initialized = []
+                guarded_poses = []
+                policy_start_poses = []
+
+                class FakePolicy:
+                    def ping(self):
+                        return True
+
+                    def get_modality_config(self):
+                        return {}
+
+                    def get_policy_metadata(self):
+                        return {}
+
+                    def reset(self):
+                        events.append("policy.reset")
+
+                    def close(self):
+                        events.append("policy.close")
+
+                class FakeReader:
+                    def close(self):
+                        events.append("reader.close")
+
+                class FakeCamera:
+                    config = {
+                        "head_camera": {
+                            "type": "fake",
+                            "image_shape": [480, 640],
+                            "binocular": False,
+                            "fps": 30,
+                        }
+                    }
+
+                    def close(self):
+                        events.append("camera.close")
+
+                class FakeActuator:
+                    def start(self):
+                        events.append("actuator.start")
+
+                    def arm(self):
+                        events.append("actuator.arm")
+
+                    def initialize(self, spec):
+                        initialized.append(spec)
+                        events.append("actuator.initialize")
+
+                    def warmup_pose(self, spec):
+                        guarded_poses.append(spec)
+                        events.append(f"actuator.pose:{spec.mode}")
+
+                    def hold(self):
+                        events.append("actuator.hold")
+
+                    def close(self):
+                        events.append("actuator.close")
+
+                args = argparse.Namespace(
+                    task="pick-red-cup",
+                    custom_goal=None,
+                    end_effector="inspire-ftp",
+                    policy_host="127.0.0.1",
+                    policy_port=5555,
+                    image_host="camera",
+                    network_interface=None,
+                    execution_horizon=1,
+                    max_chunks=1,
+                    initialization="xr-home",
+                    initial_pose_file=None,
+                    warmup1=warmup1_enabled,
+                    policy_warm_start=False,
+                    future_goal_warmup2=False,
+                    return_to_start=True,
+                    show_camera=False,
+                    sim=True,
+                    actuate=True,
+                    allow_unqualified_real=False,
+                    confirm_sim_network_isolated=True,
+                )
+                contract = ModelContract(
+                    action_horizon=16,
+                    video_keys=COLOUR_VIDEO_KEYS,
+                    end_effector="inspire-ftp",
+                )
+                preflight = ActionChunk(
+                    arm=np.zeros((1, 14)),
+                    left_hand=np.zeros((1, 6)),
+                    right_hand=np.zeros((1, 6)),
+                    end_effector="inspire-dfx",
+                )
+                with (
+                    mock.patch(f"{module}.Gr00tClient", return_value=FakePolicy()),
+                    mock.patch(f"{module}.validate_model_contract", return_value=contract),
+                    mock.patch(f"{module}.validate_policy_metadata", return_value=None),
+                    mock.patch(f"{module}.initialize_dds"),
+                    mock.patch(f"{module}.G1InspireDfxStateReader", return_value=FakeReader()),
+                    mock.patch(f"{module}.TeleimagerCamera", return_value=FakeCamera()),
+                    mock.patch(f"{module}.SafeG1Dex3Actuator", return_value=FakeActuator()),
+                    mock.patch(f"{module}.infer_chunk", return_value=(preflight, 0.01)),
+                    mock.patch(f"{module}.chunk_delta_summary", return_value="bounded"),
+                    mock.patch(f"{module}.confirm_actuation"),
+                    mock.patch(f"{module}.confirm_initialization"),
+                    mock.patch(
+                        f"{module}.confirm_policy_start",
+                        side_effect=lambda _actuator, spec: policy_start_poses.append(spec),
+                    ),
+                    mock.patch(f"{module}._prepare_policy_goal", return_value="ready"),
+                    mock.patch(f"{module}._run_active_goal", return_value="complete"),
+                    mock.patch(
+                        f"{module}._select_next_goal_while_holding",
+                        side_effect=(RETURN_TO_START, None),
+                    ),
+                    mock.patch(f"{module}.confirm_return_to_start", return_value="continue"),
+                    mock.patch(
+                        f"{module}.confirm_return_to_start_complete",
+                        return_value="continue",
+                    ),
+                ):
+                    run_groot(args)
+
+                self.assertEqual(len(initialized), 1)
+                np.testing.assert_array_equal(initialized[0].arm, INSPIRE_XR_HOME_ARM)
+                expected_modes = ["startup-settle"]
+                if warmup1_enabled:
+                    expected_modes.append("training-start")
+                # Return-to-Start retains XR-home + optional Warmup1 and must
+                # never repeat the initial-only elbow settle.
+                expected_modes.append("xr-home")
+                if warmup1_enabled:
+                    expected_modes.append("training-start")
+                self.assertEqual([spec.mode for spec in guarded_poses], expected_modes)
+                self.assertEqual(
+                    sum(spec.mode == "startup-settle" for spec in guarded_poses),
+                    1,
+                )
+                np.testing.assert_array_equal(
+                    guarded_poses[0].arm,
+                    INSPIRE_STARTUP_ELBOW_SETTLE_ARM,
+                )
+                expected_policy_start = guarded_poses[1] if warmup1_enabled else guarded_poses[0]
+                self.assertIs(policy_start_poses[0], expected_policy_start)
 
     def test_live_runner_holds_then_warm_starts_a_second_goal(self):
         events = []

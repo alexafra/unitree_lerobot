@@ -37,6 +37,7 @@ from unitree_lerobot.eval_robot.groot_contract import (
     InitializationSpec,
     ModelContract,
     SurfaceNormalEncodingContract,
+    inspire_startup_elbow_settle_spec,
     load_initialization_spec,
     make_observation,
     parse_action_chunk,
@@ -1606,12 +1607,18 @@ def confirm_initialization(
     elif stage == "WARMUP1":
         profile = get_end_effector_profile(spec.end_effector)
         task_description = (
-            "cereal-box-pick" if spec.end_effector == "dex3" else "red-cup-pick"
+            "cereal-box-pick" if spec.end_effector == "dex3" else "stack-three-cups"
         )
         warning += (
             f" Warmup1 commands all 14 arms and both {profile.hand_dof}-channel hands from "
             f"one recorded {task_description} frame. Both hands must be empty. It does not "
             "reproduce the recorded legs, waist, pelvis height, world pose, or object layout."
+        )
+    elif stage == "STARTUP ELBOW SETTLE":
+        warning += (
+            " This one-time startup stage retains zero shoulder/wrist targets and both fully-open "
+            "Inspire hand targets while changing only the two elbow targets from -0.15 to -0.05 rad. "
+            "It is not replayed by Return-to-Start."
         )
     elif spec.moves_hands:
         warning += " This pose explicitly moves one or both hands; verify their contents."
@@ -2974,7 +2981,14 @@ def run(args: argparse.Namespace) -> None:
     warmup1_enabled = bool(getattr(args, "warmup1", False))
     warmup1 = training_start_spec(runtime_end_effector) if warmup1_enabled else None
     warmup1_source = training_start_source(runtime_end_effector) if warmup1_enabled else None
+    startup_elbow_settle = (
+        inspire_startup_elbow_settle_spec(runtime_end_effector)
+        if configured_initialization.mode == "xr-home" and runtime_end_effector != "dex3"
+        else None
+    )
     return_to_start_enabled = bool(getattr(args, "return_to_start", False))
+    # The -0.05 elbow settle is deliberately initial-start only. Return-to-Start
+    # continues to replay the canonical -0.15 XR-home and optional Warmup1.
     return_to_start_specs = tuple(
         spec
         for spec in (configured_initialization, warmup1)
@@ -3304,6 +3318,21 @@ def run(args: argparse.Namespace) -> None:
                 "to DDS, but hand convergence is not software-verified",
                 configured_initialization.label,
             )
+        if startup_elbow_settle is not None:
+            confirm_initialization(
+                actuator,
+                startup_elbow_settle,
+                stage="STARTUP ELBOW SETTLE",
+            )
+            _run_blocking_motion_with_immediate_release(
+                actuator,
+                lambda: actuator.warmup_pose(startup_elbow_settle),
+                stage="STARTUP ELBOW SETTLE",
+            )
+            LOGGER.warning(
+                "Initial-only Inspire elbow settle completed: %s",
+                startup_elbow_settle.label,
+            )
         if warmup1_enabled:
             assert warmup1 is not None
             assert warmup1_source is not None
@@ -3322,7 +3351,11 @@ def run(args: argparse.Namespace) -> None:
             )
         confirm_policy_start(
             actuator,
-            warmup1 if warmup1 is not None else configured_initialization,
+            warmup1
+            if warmup1 is not None
+            else startup_elbow_settle
+            if startup_elbow_settle is not None
+            else configured_initialization,
         )
         if voice_enabled:
             voice_server = _start_voice_server(
@@ -3608,7 +3641,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Pose before policy execution: preserve measured q (default), target the selected hand "
             "profile's XR home with guarded motion (Dex3: zero; Inspire: normalized one/fully open), "
-            "or load an experimental reviewed task-bound Dex3 JSON pose. This stage runs before Warmup1"
+            "or load an experimental reviewed task-bound Dex3 JSON pose. Inspire XR-home is followed "
+            "once by the startup elbow settle; this initialization stage runs before Warmup1"
         ),
     )
     parser.add_argument(
@@ -3655,7 +3689,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Offer Shift+Tab in powered HOLD to replay the fixed initialization target and then "
             "Warmup1 when enabled (default: disabled); the next selected goal follows Warmup2. "
-            "It is invalid with --no-warmup1 --initialization measured. Inspire requires xr-home"
+            "The initial-only Inspire elbow settle is not replayed. It is invalid with "
+            "--no-warmup1 --initialization measured. Inspire requires xr-home"
         ),
     )
     parser.add_argument(

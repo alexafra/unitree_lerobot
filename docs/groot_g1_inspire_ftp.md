@@ -124,32 +124,36 @@ joint zero, both elbows target `-0.15 rad` to raise the lower Inspire hands
 slightly, and both hands are all one (fully open). The move follows a bounded
 interpolation, but it can drop an object. Both hands must be empty.
 
+At initial startup only, an additional guarded settle follows `xr-home` and
+changes both elbow targets from `-0.15 rad` to `-0.05 rad` while retaining the
+zero shoulder/wrist and fully-open hand targets. This stage runs whether or not
+Warmup1 or Warmup2 is enabled. It is intentionally not replayed by
+Return-to-Start, which retains the established `xr-home` and optional Warmup1
+stages.
+
 Warmup1 is profile-aware. For either Inspire transport it uses one complete,
 real 26D `observation.state` row rather than reusing the 28D Dex3 target or
 assembling a per-joint mean/median. The frozen source is converted training
-episode 56, frame 0, from
-`/home/alex/Development/Datasets/lerobot2/inspire/pick_place_red_cup_08_13/train`
-(converted timestamp `0.0`; original processed-raw `episode_0079`, frame 0,
-task `pick up the red cup.`).
-That row was the whole-frame medoid of the 109 training-episode starts and its
-recorded image shows both hands empty. It is still a joint-space target, not a
+episode 428, frame 0, from
+`/home/alex/Development/Datasets/lerobot2/inspire/all_tasks_713eps_20260917_normals_range_mask_v2/train`
+(converted timestamp `0.0`; original processed-raw stack `episode_0084`, frame
+0, task `stack the three red cups.`). That row is the whole-frame medoid of the
+115 stack-task training episode starts. It is still a joint-space target, not a
 collision-aware plan, and it does not reproduce the recorded legs, waist,
-pelvis height, object placement, or world pose. In particular, it is an
-empty-hand pick start and does not recreate the put demonstrations' cup-held
-right-hand condition.
+pelvis height, object placement, or world pose.
 
 With the options shown above, startup is an explicit pose chain: guarded
-`xr-home`, guarded Inspire Warmup1, RUN, then (when enabled) a fresh inferred
-Warmup2 target followed by CONTINUE and a fresh strict inference. Each moving
-stage retains its displayed operator gate. Inspire endpoint completion verifies
-the arm target and DDS submission, not physical hand convergence, so the
-displayed visual hand checks remain required.
+`xr-home`, guarded initial-only elbow settle, guarded Inspire Warmup1, RUN, then
+(when enabled) a fresh inferred Warmup2 target followed by CONTINUE and a fresh
+strict inference. Each moving stage retains its displayed operator gate.
+Inspire endpoint completion verifies the arm target and DDS submission, not
+physical hand convergence, so the displayed visual hand checks remain required.
 
-`--return-to-start` replays that same enabled fixed pose chain instead of
-shortcutting directly to its last target. With `--initialization xr-home
---warmup1`, Shift+Tab therefore moves to XR-home first and then to the Inspire
-Warmup1 target, with a separate pre-motion confirmation for each stage and one
-post-chain Inspire hand visual check. The next selected goal then follows
+`--return-to-start` replays the established fixed reset chain, not the
+initial-only elbow settle. With `--initialization xr-home --warmup1`, Shift+Tab
+therefore moves to XR-home first and then to the Inspire Warmup1 target, with a
+separate pre-motion confirmation for each stage and one post-chain Inspire hand
+visual check. The next selected goal then follows
 `--warmup2` when enabled. Inspire Return-to-Start deliberately requires the
 fixed `xr-home` initialization even when Warmup1 is enabled; measured
 initialization is not accepted for this workflow. Return-to-Start never
@@ -181,7 +185,8 @@ bridge or device acceptance. The physical emergency stop remains the
 authoritative stop mechanism.
 
 There is no qualified Inspire hand tracking-error threshold. Initialization,
-Warmup1, Warmup2, and each Return-to-Start stage completion therefore mean the
+startup elbow settle, Warmup1, Warmup2, and each Return-to-Start stage
+completion therefore mean the
 arm endpoint and stability dwell passed while valid hand DDS callbacks
 continued and the hand target was submitted; they do **not** mean the hands
 were observed to reach the target. After the startup pose chain and Warmup2,
@@ -192,7 +197,8 @@ target; press `q` to release authority.
 
 At each displayed gate, `r` advances, `s` stays in or enters powered HOLD, and
 `q` starts orderly release. During the subsequent blocking startup,
-initialization, Warmup1, Warmup2, or Return-to-Start motion, `s` and `q` both
+initialization, startup elbow settle, Warmup1, Warmup2, or Return-to-Start
+motion, `s` and `q` both
 cancel by starting orderly release: the client cannot service the powered-HOLD
 barrier until that blocking transition returns. During active policy motion, `s`
 instead discards timed work and enters powered HOLD. These software keys do not

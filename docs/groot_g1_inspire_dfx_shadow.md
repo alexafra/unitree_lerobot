@@ -100,16 +100,20 @@ laboratory choices, not manufacturer-qualified limits or safety certification.
    discontinuous startup command. It can drop an object, so both hands must be
    empty. `--initialization measured` remains the default no-home-motion
    alternative.
-7. Warmup1 is profile-aware and uses a reviewed complete 26D Inspire training
+7. At initial startup only, a separately guarded stage changes both elbow
+   targets from `-0.15 rad` to `-0.05 rad`, retaining zero shoulder/wrist and
+   fully-open hand targets. It runs independently of Warmup1/Warmup2 and is not
+   replayed by Return-to-Start.
+8. Warmup1 is profile-aware and uses a reviewed complete 26D Inspire training
    observation, not the 28D Dex3 target or a synthetic per-joint average. Its
-   exact source is converted training episode 56, frame 0, from
-   `/home/alex/Development/Datasets/lerobot2/inspire/pick_place_red_cup_08_13/train`
-   (converted timestamp `0.0`; original processed-raw `episode_0079`, frame 0, task
-   `pick up the red cup.`). It was selected as the whole-frame medoid of all 109
-   training-episode starts, and its recorded image shows both hands empty. It
-   does not recreate legs, waist, pelvis height, object placement, or world
-   pose, and it does not reproduce a put demonstration's cup-held start.
-8. At INITIALIZE, WARMUP1, RUN, and WARMUP2, `r` advances after inspection.
+   exact source is converted training episode 428, frame 0, from
+   `/home/alex/Development/Datasets/lerobot2/inspire/all_tasks_713eps_20260917_normals_range_mask_v2/train`
+   (converted timestamp `0.0`; original processed-raw stack `episode_0084`, frame
+   0, task `stack the three red cups.`). It is the whole-frame medoid of the 115
+   stack-task training episode starts. It does not recreate legs, waist, pelvis
+   height, object placement, or world pose.
+9. At INITIALIZE, STARTUP ELBOW SETTLE, WARMUP1, RUN, and WARMUP2, `r`
+   advances after inspection.
    Because no qualified Inspire hand tracking-error threshold exists, endpoint
    completion verifies arm convergence only: the hand target was submitted, but
    hand convergence is not software-verified. Visually confirm both hands at RUN
@@ -163,16 +167,17 @@ and DDS write success. Arm tracking remains hard-gated by the existing client.
   brake and can continue exerting force. A newly selected goal is freshly
   inferred; initialization and Warmup1 are not repeated unless the operator
   first requests the explicit Return-to-Start pose-chain replay.
-- During blocking startup, initialization, Warmup1, Warmup2, or
-  Return-to-Start motion,
+- During blocking startup, initialization, startup elbow settle, Warmup1,
+  Warmup2, or Return-to-Start motion,
   `s` and `q` both cancel via orderly release. A powered-HOLD barrier cannot be
   serviced until the blocking transition returns.
 - During active motion or HOLD, `q` starts orderly release and exit. `Ctrl-C`
   uses the same cleanup path.
 
-Return-to-Start replays the enabled fixed startup pose chain. With the command
-above, Shift+Tab from powered HOLD separately confirms and replays XR-home and
-then the reviewed Inspire Warmup1 target. One post-chain visual hand gate
+Return-to-Start replays the established fixed reset chain and omits the
+initial-only elbow settle. With the command above, Shift+Tab from powered HOLD
+separately confirms and replays XR-home and then the reviewed Inspire Warmup1
+target. One post-chain visual hand gate
 follows the final stage. The replay does not reacquire authority or reuse policy
 output. The next goal follows the ordinary Warmup2 gate when that stage is
 enabled. Inspire Return-to-Start deliberately requires the fixed `xr-home`

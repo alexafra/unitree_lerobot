@@ -1431,6 +1431,7 @@ def build_initialization_chunk(
     *,
     allow_policy_warm_start: bool = False,
     allow_training_start: bool = False,
+    allow_startup_settle: bool = False,
     speed_scale: float = 1.0,
 ) -> ActionChunk:
     """Resolve measured targets and create a bounded smooth joint-space path."""
@@ -1441,6 +1442,7 @@ def build_initialization_chunk(
         spec,
         allow_policy_warm_start=allow_policy_warm_start,
         allow_training_start=allow_training_start,
+        allow_startup_settle=allow_startup_settle,
     )
     profile = get_end_effector_profile(spec.end_effector)
     validate_measured_state(
@@ -5067,6 +5069,7 @@ def _actuator_main(
                         command_start,
                         warmup_pose,
                         allow_training_start=True,
+                        allow_startup_settle=True,
                     )
                     _status(
                         status_queue,
@@ -6448,7 +6451,11 @@ class SafeG1Dex3Actuator:
             raise DeploymentError(
                 "Guarded warmup pose requires initialized HOLD with no chunk in flight"
             )
-        validate_initialization_spec(spec, allow_training_start=True)
+        validate_initialization_spec(
+            spec,
+            allow_training_start=True,
+            allow_startup_settle=True,
+        )
         self._wait_for_hand_feedback()
         self.heartbeat()
         try:
