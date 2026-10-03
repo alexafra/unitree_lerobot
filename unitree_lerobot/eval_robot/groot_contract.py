@@ -30,6 +30,10 @@ from unitree_lerobot.utils.depth_encoding import (
     DEPTH_OUTPUT_KEY,
     DEPTH_SOURCE_KEY,
 )
+from unitree_lerobot.utils.depth_colormap import (
+    FIXED_TURBO_DEPTH_COLORMAP,
+    fixed_turbo_depth_colormap_contract,
+)
 from unitree_lerobot.utils.surface_normal_encoding import (
     LEGACY_SURFACE_NORMAL_ENCODING_VERSION,
     PinholeIntrinsics,
@@ -57,6 +61,8 @@ TASKS = {
     "down-cerealbox": "put down the cereal box.",
     "stack-three-cups": "stack the three red cups.",
     "build-cup-pyramid-left-to-right": "build a cup pyramid left-to-right.",
+    "pick-water-bottle": "pick up the empty water bottle.",
+    "down-water-bottle": "put down the empty water bottle.",
 }
 
 COLOUR_VIDEO_KEYS = ("ego_view",)
@@ -140,9 +146,9 @@ INITIALIZATION_MODES = ("measured", "xr-home", "pose-file")
 # deliberately absent from INITIALIZATION_MODES so argparse and public
 # pose-file initialization cannot select it.
 TRAINING_START_MODE = "training-start"
-# Internal-only mode for the one-time Inspire elbow settle performed after an
-# explicit startup XR-home. It is deliberately absent from INITIALIZATION_MODES
-# so neither the CLI nor a pose file can request it directly.
+# Internal-only mode for the Inspire desk pose after explicit startup XR-home
+# and on repeated Return-to-Start. Keep the historical mode name; it is absent
+# from INITIALIZATION_MODES so neither CLI nor pose files can request it directly.
 STARTUP_SETTLE_MODE = "startup-settle"
 INITIAL_POSE_SCHEMA_VERSION = 1
 
@@ -156,9 +162,9 @@ INSPIRE_XR_HOME_ARM = np.zeros(ARM_DOF, dtype=np.float64)
 INSPIRE_XR_HOME_ARM[[3, 10]] = INSPIRE_XR_HOME_ELBOW_RAD
 INSPIRE_XR_HOME_ARM.flags.writeable = False
 
-# Keep the canonical XR-home above unchanged: Return-to-Start intentionally
-# replays it. This separate target is used exactly once at initial startup,
-# after XR-home and before optional Warmup1/Warmup2.
+# Keep canonical XR-home unchanged for initial walking/staging only. This desk
+# target follows it at startup and replaces it on repeated Return-to-Start,
+# before optional Warmup1/Warmup2.
 INSPIRE_STARTUP_ELBOW_SETTLE_RAD = -0.05
 INSPIRE_STARTUP_ELBOW_SETTLE_ARM = np.zeros(ARM_DOF, dtype=np.float64)
 INSPIRE_STARTUP_ELBOW_SETTLE_ARM[[3, 10]] = INSPIRE_STARTUP_ELBOW_SETTLE_RAD
@@ -228,6 +234,29 @@ ARM_UPPER = np.array(
     ],
     dtype=np.float64,
 )
+# Inspire's external hand wiring restricts sideways wrist yaw before the G1
+# motor's ±1.6144-rad physical stop. In the zero-pose front view, +yaw moves
+# the left hand outward and -yaw moves the right hand outward. Keep these
+# deployment command bounds separate from the official physical bounds used
+# to validate measured robot state.
+INSPIRE_WRIST_YAW_OUTWARD_LIMIT_RAD = float(np.deg2rad(60.0))
+INSPIRE_WRIST_YAW_INWARD_LIMIT_RAD = float(np.deg2rad(80.0))
+INSPIRE_ARM_COMMAND_LOWER = ARM_LOWER + JOINT_LIMIT_MARGIN_RAD
+INSPIRE_ARM_COMMAND_UPPER = ARM_UPPER - JOINT_LIMIT_MARGIN_RAD
+INSPIRE_ARM_COMMAND_LOWER[6] = -INSPIRE_WRIST_YAW_INWARD_LIMIT_RAD
+INSPIRE_ARM_COMMAND_UPPER[6] = INSPIRE_WRIST_YAW_OUTWARD_LIMIT_RAD
+INSPIRE_ARM_COMMAND_LOWER[13] = -INSPIRE_WRIST_YAW_OUTWARD_LIMIT_RAD
+INSPIRE_ARM_COMMAND_UPPER[13] = INSPIRE_WRIST_YAW_INWARD_LIMIT_RAD
+INSPIRE_ARM_COMMAND_LOWER.flags.writeable = False
+INSPIRE_ARM_COMMAND_UPPER.flags.writeable = False
+
+
+def arm_command_bounds(end_effector: str) -> tuple[np.ndarray, np.ndarray]:
+    """Return strict live command bounds without changing physical limits."""
+
+    if _end_effector_profile(end_effector).name.startswith("inspire-"):
+        return INSPIRE_ARM_COMMAND_LOWER, INSPIRE_ARM_COMMAND_UPPER
+    return ARM_LOWER + JOINT_LIMIT_MARGIN_RAD, ARM_UPPER - JOINT_LIMIT_MARGIN_RAD
 # OFFICIAL: Unitree-derived g1_body29_hand14.urdf left Dex3 lower position bounds.
 LEFT_HAND_LOWER = DEX3_PROFILE.left_lower
 # OFFICIAL: Unitree-derived g1_body29_hand14.urdf left Dex3 upper position bounds.
@@ -251,6 +280,7 @@ class ModelContract:
     video_keys: tuple[str, ...] = COLOUR_VIDEO_KEYS
     vision_input_contract: dict[str, Any] | None = None  # earlyfusion
     end_effector: str = "dex3"
+    depth_colormap: str | None = None
 
     @property
     def requires_depth(self) -> bool:
@@ -326,8 +356,21 @@ def _task_contract_sha256(instructions: list[str]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
-def validate_policy_instruction(metadata: dict[str, Any], instruction: str) -> tuple[str, ...]:
-    """Require an exact instruction advertised by the checkpoint-bound dataset."""
+def validate_policy_instruction(
+    metadata: dict[str, Any],
+    instruction: str,
+    *,
+    allow_custom_instruction: bool = False,
+) -> tuple[str, ...]:
+    """Validate the task contract; require membership only in trained-task mode."""
+
+    if (
+        not isinstance(instruction, str)
+        or not instruction.strip()
+        or len(instruction) > 256
+        or any(ord(character) < 32 for character in instruction)
+    ):
+        raise DeploymentError("Instruction must be 1..256 printable characters")
 
     contract = metadata.get("task_contract")
     if not isinstance(contract, dict):
@@ -369,7 +412,7 @@ def validate_policy_instruction(metadata: dict[str, Any], instruction: str) -> t
             "GR00T checkpoint task contract SHA-256 mismatch: "
             f"got {advertised_hash!r}, expected {expected_hash!r}"
         )
-    if instruction not in instructions:
+    if not allow_custom_instruction and instruction not in instructions:
         raise DeploymentError(
             f"Instruction {instruction!r} is not advertised by this checkpoint; "
             f"allowed instructions are {instructions!r}"
@@ -383,6 +426,7 @@ def _vision_input_contract(
     *,
     post_vision_fusion: Any = False,
     post_vision_fusion_stage: Any = None,
+    depth_colormap: Any = None,
 ) -> dict[str, Any]:  # earlyfusion
     if not isinstance(post_vision_fusion, bool):
         raise DeploymentError(
@@ -398,6 +442,24 @@ def _vision_input_contract(
             "Server post_vision_fusion_stage must be absent when "
             "post_vision_fusion is disabled"
         )
+
+    if depth_colormap not in {None, FIXED_TURBO_DEPTH_COLORMAP}:
+        raise DeploymentError(
+            "Server depth_colormap must be absent or exactly "
+            f"{FIXED_TURBO_DEPTH_COLORMAP!r}, got {depth_colormap!r}"
+        )
+    if depth_colormap is not None and (
+        fusion is not None or video_keys != RGBD_VIDEO_KEYS
+    ):
+        raise DeploymentError(
+            "Server depth_colormap requires separate ordered video keys "
+            f"{RGBD_VIDEO_KEYS!r} and cannot use early channel fusion"
+        )
+    depth_colormap_contract = (
+        fixed_turbo_depth_colormap_contract()
+        if depth_colormap is not None
+        else None
+    )
 
     layout = ["ego_view:0", "ego_view:1", "ego_view:2"]  # earlyfusion
     if fusion is not None:  # earlyfusion
@@ -430,7 +492,7 @@ def _vision_input_contract(
         parameters_per_adapter = (
             adapter_input_dim * adapter_output_dim + adapter_output_dim
         )
-        return {
+        contract = {
             "version": 2,
             "mode": POST_VISION_LATE_FUSION_MODE,
             "input_channels": 3,
@@ -458,9 +520,15 @@ def _vision_input_contract(
                 "source_keys": list(video_keys),
             },
         }
+        if depth_colormap_contract is not None:
+            contract["depth_colormap"] = depth_colormap_contract
+        return contract
 
     channels = len(layout)  # earlyfusion
-    return {"version": 1, "mode": "early_channel_fusion" if fusion is not None else "separate_views", "input_channels": channels, "channel_layout": layout, "patch_embed_init": {3: "original_rgb", 4: "rgb_mean", 6: "zeros"}[channels], "wire_video_keys": list(video_keys)}  # earlyfusion
+    contract = {"version": 1, "mode": "early_channel_fusion" if fusion is not None else "separate_views", "input_channels": channels, "channel_layout": layout, "patch_embed_init": {3: "original_rgb", 4: "rgb_mean", 6: "zeros"}[channels], "wire_video_keys": list(video_keys)}  # earlyfusion
+    if depth_colormap_contract is not None:
+        contract["depth_colormap"] = depth_colormap_contract
+    return contract
 
 
 @dataclass(frozen=True)
@@ -695,6 +763,7 @@ def validate_policy_metadata(
     *,
     end_effector: str = "dex3",
     instruction: str | None = None,
+    allow_custom_instruction: bool = False,
     requires_depth: bool = False,
     requires_surface_normals: bool = False,
     vision_input_contract: dict[str, Any] | None = None,  # earlyfusion
@@ -708,7 +777,9 @@ def validate_policy_metadata(
             f"'{EXPECTED_TRAINING_TAG}', got {metadata.get('embodiment_tag')!r}"
         )
     if instruction is not None:
-        validate_policy_instruction(metadata, instruction)
+        validate_policy_instruction(
+            metadata, instruction, allow_custom_instruction=allow_custom_instruction,
+        )
     contract = metadata.get("dataset_contract")
     if not isinstance(contract, dict):
         raise DeploymentError(
@@ -838,6 +909,7 @@ def validate_model_contract(config: dict[str, Any], *, end_effector: str = "dex3
         )
     video_config = config["video"]  # earlyfusion
     fusion = _optional_config_value(video_config, "channel_fusion")  # earlyfusion
+    depth_colormap = _optional_config_value(video_config, "depth_colormap")
     vision_input_contract = _vision_input_contract(  # earlyfusion
         video_keys,
         fusion,
@@ -847,6 +919,7 @@ def validate_model_contract(config: dict[str, Any], *, end_effector: str = "dex3
         post_vision_fusion_stage=_optional_config_value(
             video_config, "post_vision_fusion_stage"
         ),
+        depth_colormap=depth_colormap,
     )
     for modality, keys in expected.items():
         actual = tuple(_config_field(config, modality, "modality_keys"))
@@ -887,6 +960,7 @@ def validate_model_contract(config: dict[str, Any], *, end_effector: str = "dex3
         video_keys=video_keys,
         vision_input_contract=vision_input_contract,
         end_effector=profile.name,
+        depth_colormap=depth_colormap,
     )  # earlyfusion
 
 
@@ -1169,6 +1243,15 @@ def validate_initialization_spec(
                 margin_constant="JOINT_LIMIT_MARGIN_RAD" if name == "arm" else None,
                 unit=unit,
             )
+        _check_limits(
+            "arm",
+            np.asarray(spec.arm, dtype=np.float64)[None],
+            INSPIRE_ARM_COMMAND_LOWER,
+            INSPIRE_ARM_COMMAND_UPPER,
+            joint_names=ARM_JOINT_NAMES,
+            lower_constant="INSPIRE_ARM_COMMAND_LOWER",
+            upper_constant="INSPIRE_ARM_COMMAND_UPPER",
+        )
         return
     if spec.mode == STARTUP_SETTLE_MODE:
         raise DeploymentError("Startup elbow settle is supported only for Inspire profiles")
@@ -1273,7 +1356,7 @@ def validate_initialization_spec(
 
 
 def inspire_startup_elbow_settle_spec(end_effector: str) -> InitializationSpec:
-    """Return the exact one-time post-XR-home Inspire elbow settle target."""
+    """Return the exact Inspire desk target, also reused for Return-to-Start."""
 
     profile = _end_effector_profile(end_effector)
     if profile.name == "dex3" or profile.home is None:
@@ -1573,6 +1656,16 @@ def validate_action_chunk_limits(chunk: ActionChunk) -> None:
         margin=JOINT_LIMIT_MARGIN_RAD,
         margin_constant="JOINT_LIMIT_MARGIN_RAD",
     )
+    if profile.name.startswith("inspire-"):
+        _check_limits(
+            "arm",
+            arm,
+            INSPIRE_ARM_COMMAND_LOWER,
+            INSPIRE_ARM_COMMAND_UPPER,
+            joint_names=ARM_JOINT_NAMES,
+            lower_constant="INSPIRE_ARM_COMMAND_LOWER",
+            upper_constant="INSPIRE_ARM_COMMAND_UPPER",
+        )
     _check_limits(
         "left hand",
         left,
@@ -1661,8 +1754,7 @@ def _parse_full_action(
         for key in ACTION_KEYS
     }
     full_arm = np.concatenate((chunks["left_arm"], chunks["right_arm"]), axis=1)
-    safe_lower = ARM_LOWER + JOINT_LIMIT_MARGIN_RAD
-    safe_upper = ARM_UPPER - JOINT_LIMIT_MARGIN_RAD
+    safe_lower, safe_upper = arm_command_bounds(profile.name)
     clamped_arm = np.clip(full_arm, safe_lower, safe_upper)
     changed = np.argwhere(clamped_arm != full_arm)
     if changed.size:

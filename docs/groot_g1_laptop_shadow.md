@@ -17,9 +17,11 @@ XR laptop: Unitree GR00T client, camera subscriber, DDS state subscriber
 GPU PC: Isaac-GR00T PolicyServer on 127.0.0.1:5555
 ```
 
-The laptop client must remain in its default shadow mode. Every client command below
-deliberately omits `--actuate`, `--allow-unqualified-real`, and `--sim`. Shadow mode
-does not construct arm or Dex3 command publishers.
+The runner now defaults to the Inspire FTP profile with actuation enabled.
+Every deployment command below explicitly selects `--end-effector dex3 --no-actuate`
+and omits `--sim`. Do not rely on omitting `--actuate` to obtain shadow mode.
+`--no-actuate` also disables Return-to-Start by default. Shadow mode does not
+construct arm or Dex3 command publishers.
 
 ## 1. Freeze and record the software versions
 
@@ -161,6 +163,8 @@ conda activate unitree_lerobot
 ROBOT_NIC="REPLACE_WITH_EXPLICIT_ROBOT_ETHERNET_INTERFACE"
 
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --end-effector dex3 \
+    --no-actuate \
     --task pick-red-cup \
     --policy-host 127.0.0.1 \
     --policy-port 5555 \
@@ -198,6 +202,8 @@ ROBOT_NIC="REPLACE_WITH_EXPLICIT_ROBOT_ETHERNET_INTERFACE"
 SHADOW_LOG="laptop_shadow_h8_c100.log"
 
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --end-effector dex3 \
+    --no-actuate \
     --task pick-red-cup \
     --policy-host 127.0.0.1 \
     --policy-port 5555 \
@@ -282,6 +288,8 @@ can exercise the RTC v1 request protocol without publishers:
 RTC_SHADOW_LOG="laptop_rtc_shadow_h8_c100.log"
 
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --end-effector dex3 \
+    --no-actuate \
     --task pick-red-cup \
     --policy-host 127.0.0.1 \
     --policy-port 5555 \
@@ -339,8 +347,9 @@ Paste the following into a Codex session running in the laptop's
 
 ```text
 I am validating the Unitree G1-29 + Dex3 GR00T pipeline in publisher-free shadow mode
-from this laptop. Do not add --actuate, --allow-unqualified-real, --sim, or create any
-DDS command publisher.
+from this laptop. Every deployment command must include --end-effector dex3
+--no-actuate; actuation and Inspire FTP are now the defaults. Do not add --actuate,
+--allow-unqualified-real, --sim, or create any DDS command publisher.
 
 Topology:
 - G1 PC2 at 192.168.123.164 runs only `python -m teleimager.image_server --rs`.

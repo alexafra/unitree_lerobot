@@ -20,9 +20,16 @@ from typing import Any
 import cv2
 import numpy as np
 
+from unitree_lerobot.utils.depth_colormap import (
+    FIXED_TURBO_DEPTH_COLORMAP,
+    apply_fixed_turbo_depth_colormap_array,
+    fixed_turbo_depth_colormap_contract,
+)
+from unitree_lerobot.utils.depth_encoding import DEPTH_OUTPUT_KEY
+
 
 LOGGER = logging.getLogger(__name__)
-VISION_RECORDING_SCHEMA_VERSION = 1
+VISION_RECORDING_SCHEMA_VERSION = 2
 VISION_RECORDING_QUEUE_CAPACITY = 1
 VISION_RECORDING_CLOSE_TIMEOUT_S = 2.0
 VISION_RECORDING_START_TIMEOUT_S = 5.0
@@ -122,6 +129,7 @@ def _recording_worker(
     output_dir_text: str,
     video_keys: tuple[str, ...],
     metadata: dict[str, Any],
+    depth_colormap: str | None,
     work_queue: Any,
     stopping: Any,
     ready: Any,
@@ -164,8 +172,13 @@ def _recording_worker(
                     "publisher-free preflight, Warmup2, and any safety-discarded recapture"
                 ),
                 "pixel_contract": (
-                    "lossless uint8 RGB arrays before server-side crop, resize, and normalization; "
-                    "batch/time axes removed from files"
+                    "lossless uint8 RGB arrays in the checkpoint-visible representation before "
+                    "server-side crop, resize, and normalization; batch/time axes removed from files"
+                ),
+                "view_transforms": (
+                    {DEPTH_OUTPUT_KEY: fixed_turbo_depth_colormap_contract()}
+                    if depth_colormap is not None
+                    else {}
                 ),
                 "queue": {
                     "capacity": VISION_RECORDING_QUEUE_CAPACITY,
@@ -205,7 +218,10 @@ def _recording_worker(
                 for key in video_keys:
                     relative = Path(key) / f"frame-{sample_index:06d}.png"
                     destination = output_dir / relative
-                    _write_png(destination, views[key])
+                    view = views[key]
+                    if key == DEPTH_OUTPUT_KEY and depth_colormap is not None:
+                        view = apply_fixed_turbo_depth_colormap_array(view)
+                    _write_png(destination, view)
                     created.append(destination)
                     files[key] = relative.as_posix()
                 manifest_handle.write(
@@ -268,6 +284,7 @@ class NonBlockingVisionRecorder:
         output_dir: str | Path,
         video_keys: tuple[str, ...],
         metadata: dict[str, Any] | None = None,
+        depth_colormap: str | None = None,
     ) -> None:
         requested_output = Path(output_dir).expanduser()
         if requested_output.name in {"", ".", ".."}:
@@ -288,6 +305,12 @@ class NonBlockingVisionRecorder:
             raise ValueError("Vision recording requires distinct video keys")
         if any(not key or key in {".", ".."} or Path(key).name != key for key in self.video_keys):
             raise ValueError("Vision recording video keys must be safe single path components")
+        if depth_colormap not in {None, FIXED_TURBO_DEPTH_COLORMAP}:
+            raise ValueError(f"Unsupported vision-recording depth colormap {depth_colormap!r}")
+        if depth_colormap is not None and DEPTH_OUTPUT_KEY not in self.video_keys:
+            raise ValueError(
+                "Vision recording can apply a depth colormap only when depth_gray_view is selected"
+            )
         metadata = {} if metadata is None else dict(metadata)
         # Fail before spawning if caller metadata cannot be represented exactly.
         json.dumps(metadata, allow_nan=False)
@@ -318,6 +341,7 @@ class NonBlockingVisionRecorder:
                 str(self.output_dir),
                 self.video_keys,
                 metadata,
+                depth_colormap,
                 self._queue,
                 self._stopping,
                 ready_child,

@@ -7,7 +7,8 @@ the same six normalized-open fractions in ``[0, 1]`` used by teleoperation.
 
 Construction subscribes and creates publishers but never writes.  State
 freshness is tracked independently for the two hands, and every command is
-checked again against the teleop-derived 0.2 normalized per-write backstop.
+checked against the 0.35 normalized per-write fault threshold, then clamped to
+0.30 relative to the last successfully written command, including wire rounding.
 Successful DDS ``Write`` return values are tracked as transport completions;
 they are not bridge or physical-device acknowledgements.
 """
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import contextlib
+import logging
 import threading
 import time
 from typing import Any
@@ -24,6 +26,7 @@ import numpy as np
 
 from unitree_lerobot.eval_robot.g1_end_effectors import (
     INSPIRE_FTP_PROFILE,
+    UNQUALIFIED_INSPIRE_COMMAND_CLAMP_STEP,
     UNQUALIFIED_INSPIRE_COMMAND_MAX_STEP,
 )
 from unitree_lerobot.eval_robot.groot_client import DeploymentError
@@ -33,8 +36,10 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import RobotState, ST
 
 FTP_MOTORS_PER_HAND = 6
 FTP_WIRE_SCALE = 1000
+INSPIRE_FTP_COMMAND_CLAMP_STEP = UNQUALIFIED_INSPIRE_COMMAND_CLAMP_STEP
 INSPIRE_FTP_COMMAND_MAX_STEP = UNQUALIFIED_INSPIRE_COMMAND_MAX_STEP
 INSPIRE_FTP_WRITE_TIMEOUT_S = 0.5
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -239,14 +244,35 @@ class InspireFtpCommandWriter:
         return candidate_left, candidate_right
 
     @staticmethod
-    def _prepare_message(message: Any, values: np.ndarray) -> np.ndarray:
-        wire = _wire_values(values)
-        message.angle_set = wire
+    def _prepare_message(
+        message: Any, values: np.ndarray, *, previous: np.ndarray, side: str
+    ) -> np.ndarray:
+        wire = np.asarray(_wire_values(values), dtype=np.int64)
+        # Bound the integer codes themselves so truncation cannot turn a
+        # negative boundary step into a jump above the clamp. The tiny epsilon only
+        # compensates floating-point error at an exact integer-code boundary.
+        lower = np.maximum(0, np.ceil(
+            (previous - INSPIRE_FTP_COMMAND_CLAMP_STEP) * FTP_WIRE_SCALE - 1e-9
+        )).astype(np.int64)
+        upper = np.minimum(FTP_WIRE_SCALE, np.floor(
+            (previous + INSPIRE_FTP_COMMAND_CLAMP_STEP) * FTP_WIRE_SCALE + 1e-9
+        )).astype(np.int64)
+        clamped_wire = np.clip(wire, lower, upper)
+        changed = np.flatnonzero(wire != clamped_wire)
+        if changed.size:
+            LOGGER.warning(
+                "INSPIRE FTP HAND STEP CLAMP: %s joints=%s limited to %.3f "
+                "normalized units per write; continuing (fault threshold %.3f)",
+                side, changed.tolist(), INSPIRE_FTP_COMMAND_CLAMP_STEP,
+                INSPIRE_FTP_COMMAND_MAX_STEP,
+                extra={"terminal_yellow": True},
+            )
+        message.angle_set = clamped_wire.tolist()
         message.mode = 1
         # History and the next slew origin describe the exact integer command
         # passed to the last successful DDS Write call, not an unrepresentable
         # between-code target. This is not a bridge/device acknowledgement.
-        return np.asarray(wire, dtype=np.float64) / FTP_WIRE_SCALE
+        return clamped_wire.astype(np.float64) / FTP_WIRE_SCALE
 
     @staticmethod
     def _write_side(publisher: Any, message: Any, *, side: str) -> float:
@@ -268,8 +294,12 @@ class InspireFtpCommandWriter:
         if self._closed:
             raise DeploymentError("Inspire FTP command writer is closed")
         candidate_left, candidate_right = self._validated_candidates(left, right)
-        written_left = self._prepare_message(self._left_message, candidate_left)
-        written_right = self._prepare_message(self._right_message, candidate_right)
+        written_left = self._prepare_message(
+            self._left_message, candidate_left, previous=self._last_left, side="left"
+        )
+        written_right = self._prepare_message(
+            self._right_message, candidate_right, previous=self._last_right, side="right"
+        )
 
         assert self._left_publisher is not None and self._right_publisher is not None
         left_completed_at = self._write_side(

@@ -530,10 +530,10 @@ class ZMQ_SubscriberManager:
     # --------------------------------------------------------
     @classmethod
     def get_instance(cls) -> "ZMQ_SubscriberManager":
-        """Get or create the singleton instance with thread safety."""
-        if cls._instance is None:
+        """Get a live manager, including after an ImageClient has closed it."""
+        if cls._instance is None or not cls._instance._running:
             with cls._lock:
-                if cls._instance is None:
+                if cls._instance is None or not cls._instance._running:
                     cls._instance = cls()
         return cls._instance
 

@@ -164,11 +164,7 @@ def modality_config(
 ):
     if rgbd and surface_normals:
         raise ValueError("test config cannot request both geometry views")
-    video_keys = (
-        SURFACE_NORMAL_VIDEO_KEYS
-        if surface_normals
-        else RGBD_VIDEO_KEYS if rgbd else COLOUR_VIDEO_KEYS
-    )
+    video_keys = SURFACE_NORMAL_VIDEO_KEYS if surface_normals else RGBD_VIDEO_KEYS if rgbd else COLOUR_VIDEO_KEYS
     config = {
         "video": {
             "delta_indices": [0],
@@ -265,7 +261,7 @@ class FakeBackend:
 class GrootG1DeploymentTests(unittest.TestCase):
     def test_both_warmup_stages_are_default_with_independent_explicit_opt_outs(self):
         parser = build_parser()
-        defaults = parser.parse_args([])
+        defaults = parser.parse_args(["--no-actuate"])
         self.assertTrue(defaults.warmup1)
         self.assertTrue(defaults.policy_warm_start)
         self.assertTrue(defaults.future_goal_warmup2)
@@ -303,6 +299,8 @@ class GrootG1DeploymentTests(unittest.TestCase):
             [
                 "--return-to-start",
                 "--actuate",
+                "--end-effector",
+                "dex3",
                 "--sim",
                 "--confirm-sim-network-isolated",
             ]
@@ -311,13 +309,15 @@ class GrootG1DeploymentTests(unittest.TestCase):
         validate_args(enabled)
 
         with self.assertRaisesRegex(DeploymentError, "requires --actuate"):
-            validate_args(parser.parse_args(["--return-to-start"]))
+            validate_args(parser.parse_args(["--no-actuate", "--return-to-start"]))
         with self.assertRaisesRegex(DeploymentError, "has no fixed target"):
             validate_args(
                 parser.parse_args(
                     [
                         "--return-to-start",
                         "--actuate",
+                        "--end-effector",
+                        "dex3",
                         "--sim",
                         "--confirm-sim-network-isolated",
                         "--no-warmup1",
@@ -356,7 +356,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
     def test_warmup1_can_follow_each_explicit_initialization_mode(self):
         parser = build_parser()
-        common = ["--actuate", "--sim", "--confirm-sim-network-isolated"]
+        common = ["--end-effector", "dex3", "--actuate", "--sim", "--confirm-sim-network-isolated"]
 
         xr_home = parser.parse_args([*common, "--initialization", "xr-home"])
         validate_args(xr_home)
@@ -374,9 +374,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         validate_args(pose_file_then_warmup1)
         self.assertTrue(pose_file_then_warmup1.warmup1)
 
-        xr_home_without_warmup1 = parser.parse_args(
-            [*common, "--initialization", "xr-home", "--no-warmup1"]
-        )
+        xr_home_without_warmup1 = parser.parse_args([*common, "--initialization", "xr-home", "--no-warmup1"])
         validate_args(xr_home_without_warmup1)
         self.assertFalse(xr_home_without_warmup1.warmup1)
 
@@ -391,11 +389,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertEqual(TRAINING_START_SOURCE["frame_index"], 0)
         self.assertEqual(TRAINING_START_SOURCE["timestamp_s"], 0.0)
         self.assertEqual(TRAINING_START_SOURCE["task"], "pick up the cereal box.")
-        self.assertTrue(
-            TRAINING_START_SOURCE["dataset_path"].endswith(
-                "atomic_combined_09_08_And_10_08/train"
-            )
-        )
+        self.assertTrue(TRAINING_START_SOURCE["dataset_path"].endswith("atomic_combined_09_08_And_10_08/train"))
 
         spec = training_start_spec()
         # Preserve the existing Dex3 pose-file mode for zero_state_test and
@@ -549,8 +543,8 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 )
                 np.testing.assert_array_equal(chunk.arm[-1], expected_arm)
 
-        # The startup settle must not mutate or replace canonical XR-home,
-        # because Return-to-Start deliberately retains the -0.15 target.
+        # The desk settle must not mutate canonical XR-home: initial walking
+        # still requires -0.15 even though repeated returns use -0.05.
         self.assertEqual(INSPIRE_XR_HOME_ARM[3], -0.15)
         self.assertEqual(INSPIRE_XR_HOME_ARM[10], -0.15)
         with self.assertRaisesRegex(ValueError, "No startup elbow settle"):
@@ -937,9 +931,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             mock.patch(f"{module}.initialize_dds", side_effect=lambda *_args: events.append("dds.init")),
             mock.patch(f"{module}.G1Dex3StateReader", return_value=FakeReader()),
             mock.patch(f"{module}.TeleimagerCamera", return_value=FakeCamera()),
-            mock.patch(
-                f"{module}.SafeG1Dex3Actuator", return_value=FakeActuator()
-            ) as actuator_factory,
+            mock.patch(f"{module}.SafeG1Dex3Actuator", return_value=FakeActuator()) as actuator_factory,
             mock.patch(f"{module}.infer_chunk", side_effect=fake_infer),
             mock.patch(f"{module}.chunk_delta_summary", return_value="safe"),
             mock.patch(f"{module}.confirm_actuation", side_effect=lambda *_args: events.append("confirm.ACTUATE")),
@@ -1031,6 +1023,10 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 events.append(f"actuator.warmup_pose:{spec.label}")
                 warmup1_targets.append(spec)
 
+            def warmup1_pose(self, spec):
+                events.append(f"actuator.warmup_pose:{spec.label}")
+                warmup1_targets.append(spec)
+
             def warm_start(self, chunk):
                 events.append(f"actuator.warm_start:{chunk.name}")
 
@@ -1086,9 +1082,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             mock.patch(f"{module}.confirm_actuation", side_effect=lambda *_args: events.append("confirm.ACTUATE")),
             mock.patch(
                 f"{module}.confirm_initialization",
-                side_effect=lambda *_args, **kwargs: events.append(
-                    f"confirm.{kwargs.get('stage', 'INITIALIZE')}"
-                ),
+                side_effect=lambda *_args, **kwargs: events.append(f"confirm.{kwargs.get('stage', 'INITIALIZE')}"),
             ),
             mock.patch(f"{module}.confirm_policy_start", side_effect=lambda *_args: events.append("confirm.RUN")),
             mock.patch(
@@ -1135,14 +1129,20 @@ class GrootG1DeploymentTests(unittest.TestCase):
         positions = [events.index(event) for event in ordered]
         self.assertEqual(positions, sorted(positions))
 
-    def test_inspire_elbow_settle_is_startup_only_and_independent_of_warmups(self):
+    def test_inspire_returns_choose_warmup1_or_desk_independently_of_warmup2(self):
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
 
-        for warmup1_enabled in (False, True):
-            with self.subTest(warmup1_enabled=warmup1_enabled):
+        for warmup1_enabled, warmup2_enabled, runtime_profile in (
+            (warmup1_enabled, warmup2_enabled, runtime_profile)
+            for runtime_profile in ("inspire-ftp", "inspire-dfx")
+            for warmup1_enabled in (False, True)
+            for warmup2_enabled in (False, True)
+        ):
+            with self.subTest(warmup1=warmup1_enabled, warmup2=warmup2_enabled, profile=runtime_profile):
                 events = []
                 initialized = []
                 guarded_poses = []
+                return_warmup_flags = []
                 policy_start_poses = []
 
                 class FakePolicy:
@@ -1193,6 +1193,15 @@ class GrootG1DeploymentTests(unittest.TestCase):
                         guarded_poses.append(spec)
                         events.append(f"actuator.pose:{spec.mode}")
 
+                    def warmup1_pose(self, spec):
+                        guarded_poses.append(spec)
+                        events.append(f"actuator.pose:{spec.mode}")
+
+                    def return_to_start_pose(self, spec, *, warmup1=False):
+                        guarded_poses.append(spec)
+                        return_warmup_flags.append(warmup1)
+                        events.append(f"actuator.return:{spec.mode}")
+
                     def hold(self):
                         events.append("actuator.hold")
 
@@ -1212,7 +1221,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                     initialization="xr-home",
                     initial_pose_file=None,
                     warmup1=warmup1_enabled,
-                    policy_warm_start=False,
+                    policy_warm_start=warmup2_enabled,
                     future_goal_warmup2=False,
                     return_to_start=True,
                     show_camera=False,
@@ -1230,14 +1239,20 @@ class GrootG1DeploymentTests(unittest.TestCase):
                     arm=np.zeros((1, 14)),
                     left_hand=np.zeros((1, 6)),
                     right_hand=np.zeros((1, 6)),
-                    end_effector="inspire-dfx",
+                    end_effector=runtime_profile,
                 )
                 with (
+                    mock.patch.multiple(
+                        module,
+                        resolve_runtime_end_effector=mock.Mock(return_value=runtime_profile),
+                        initialize_dds=mock.Mock(),
+                        require_inspire_ftp_sdk=mock.Mock(),
+                        G1InspireDfxStateReader=mock.Mock(return_value=FakeReader()),
+                        G1InspireFtpStateReader=mock.Mock(return_value=FakeReader()),
+                    ),
                     mock.patch(f"{module}.Gr00tClient", return_value=FakePolicy()),
                     mock.patch(f"{module}.validate_model_contract", return_value=contract),
                     mock.patch(f"{module}.validate_policy_metadata", return_value=None),
-                    mock.patch(f"{module}.initialize_dds"),
-                    mock.patch(f"{module}.G1InspireDfxStateReader", return_value=FakeReader()),
                     mock.patch(f"{module}.TeleimagerCamera", return_value=FakeCamera()),
                     mock.patch(f"{module}.SafeG1Dex3Actuator", return_value=FakeActuator()),
                     mock.patch(f"{module}.infer_chunk", return_value=(preflight, 0.01)),
@@ -1248,11 +1263,16 @@ class GrootG1DeploymentTests(unittest.TestCase):
                         f"{module}.confirm_policy_start",
                         side_effect=lambda _actuator, spec: policy_start_poses.append(spec),
                     ),
-                    mock.patch(f"{module}._prepare_policy_goal", return_value="ready"),
-                    mock.patch(f"{module}._run_active_goal", return_value="complete"),
+                    mock.patch(f"{module}._prepare_policy_goal", return_value="ready") as prepare,
+                    mock.patch(f"{module}._run_active_goal", return_value="complete") as run_goal,
                     mock.patch(
                         f"{module}._select_next_goal_while_holding",
-                        side_effect=(RETURN_TO_START, None),
+                        side_effect=(
+                            RETURN_TO_START,
+                            ("down-red-cup", TASKS["down-red-cup"]),
+                            RETURN_TO_START,
+                            None,
+                        ),
                     ),
                     mock.patch(f"{module}.confirm_return_to_start", return_value="continue"),
                     mock.patch(
@@ -1264,23 +1284,35 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
                 self.assertEqual(len(initialized), 1)
                 np.testing.assert_array_equal(initialized[0].arm, INSPIRE_XR_HOME_ARM)
+                self.assertEqual(run_goal.call_count, 2)
+                self.assertEqual(
+                    [call.kwargs["warmup2_enabled"] for call in prepare.call_args_list],
+                    [warmup2_enabled, warmup2_enabled],
+                )
+                expected_return_flags = [True] if warmup1_enabled else [False]
+                self.assertEqual(return_warmup_flags, expected_return_flags * 2)
                 expected_modes = ["startup-settle"]
                 if warmup1_enabled:
                     expected_modes.append("training-start")
-                # Return-to-Start retains XR-home + optional Warmup1 and must
-                # never repeat the initial-only elbow settle.
-                expected_modes.append("xr-home")
-                if warmup1_enabled:
-                    expected_modes.append("training-start")
+                # Warmup1 resets skip the desk-pose detour. Without Warmup1,
+                # only the -0.05 desk target is used, never -0.15 walking.
+                for _ in range(2):
+                    expected_modes.append("training-start" if warmup1_enabled else "startup-settle")
                 self.assertEqual([spec.mode for spec in guarded_poses], expected_modes)
-                self.assertEqual(
-                    sum(spec.mode == "startup-settle" for spec in guarded_poses),
-                    1,
-                )
-                np.testing.assert_array_equal(
-                    guarded_poses[0].arm,
-                    INSPIRE_STARTUP_ELBOW_SETTLE_ARM,
-                )
+                desk_poses = [spec for spec in guarded_poses if spec.mode == "startup-settle"]
+                self.assertEqual(len(desk_poses), 1 if warmup1_enabled else 3)
+                for spec in desk_poses:
+                    np.testing.assert_array_equal(spec.arm, INSPIRE_STARTUP_ELBOW_SETTLE_ARM)
+                    np.testing.assert_array_equal(spec.left_hand, np.ones(6))
+                    np.testing.assert_array_equal(spec.right_hand, np.ones(6))
+                    self.assertEqual(spec.end_effector, runtime_profile)
+                    validate_initialization_spec(spec, allow_startup_settle=True)
+                for spec in desk_poses[1:]:
+                    self.assertIn("Return-to-Start", spec.label)
+                    self.assertIn("both elbows -0.05 rad", spec.label)
+                for spec in guarded_poses:
+                    if spec.mode == "training-start":
+                        np.testing.assert_array_equal(spec.arm, training_start_spec(runtime_profile).arm)
                 expected_policy_start = guarded_poses[1] if warmup1_enabled else guarded_poses[0]
                 self.assertIs(policy_start_poses[0], expected_policy_start)
 
@@ -1372,12 +1404,8 @@ class GrootG1DeploymentTests(unittest.TestCase):
             events.append(f"infer:{chunk.name}")
             return chunk, 0.01
 
-        def fake_select_next_goal(
-            _actuator, *, custom_goal_mode, mode_state, return_to_start=False
-        ):
-            goal_mode_calls.append(
-                (custom_goal_mode, mode_state["custom_goal_mode"], return_to_start)
-            )
+        def fake_select_next_goal(_actuator, *, custom_goal_mode, mode_state, return_to_start=False):
+            goal_mode_calls.append((custom_goal_mode, mode_state["custom_goal_mode"], return_to_start))
             if len(goal_mode_calls) == 1:
                 # The operator enables custom entry but still chooses an exact
                 # trained task. The UI preference must survive that choice.
@@ -1488,6 +1516,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 "--custom-goal",
                 "move it somewhere novel",
                 "--actuate",
+                "--end-effector",
+                "dex3",
+                "--no-return-to-start",
                 "--sim",
                 "--confirm-sim-network-isolated",
                 "--no-warmup1",
@@ -1500,12 +1531,8 @@ class GrootG1DeploymentTests(unittest.TestCase):
             requires_depth=False,
         )
 
-        def select_then_release(
-            _actuator, *, custom_goal_mode, mode_state, return_to_start=False
-        ):
-            mode_calls.append(
-                (custom_goal_mode, mode_state["custom_goal_mode"], return_to_start)
-            )
+        def select_then_release(_actuator, *, custom_goal_mode, mode_state, return_to_start=False):
+            mode_calls.append((custom_goal_mode, mode_state["custom_goal_mode"], return_to_start))
             return None
 
         with (
@@ -1583,6 +1610,14 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 warmup_specs.append(spec)
                 events.append("actuator.warmup1")
 
+            def warmup1_pose(self, spec):
+                warmup_specs.append(spec)
+                events.append("actuator.warmup1")
+
+            def return_to_start_pose(self, spec, *, warmup1=False):
+                warmup_specs.append(spec)
+                events.append("actuator.return")
+
             def hold(self):
                 events.append("actuator.hold")
 
@@ -1605,12 +1640,24 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 events.clear()
                 warmup_specs.clear()
                 args = argparse.Namespace(
-                    task="pick-red-cup", custom_goal=None, policy_host="127.0.0.1",
-                    policy_port=5555, image_host="camera", network_interface=None,
-                    execution_horizon=1, max_chunks=1, initialization="xr-home",
-                    initial_pose_file=None, warmup1=warmup1_enabled, policy_warm_start=True,
-                    future_goal_warmup2=False, return_to_start=True, show_camera=False,
-                    sim=True, actuate=True, allow_unqualified_real=False,
+                    task="pick-red-cup",
+                    custom_goal=None,
+                    policy_host="127.0.0.1",
+                    policy_port=5555,
+                    image_host="camera",
+                    network_interface=None,
+                    execution_horizon=1,
+                    max_chunks=1,
+                    initialization="xr-home",
+                    initial_pose_file=None,
+                    warmup1=warmup1_enabled,
+                    policy_warm_start=True,
+                    future_goal_warmup2=False,
+                    return_to_start=True,
+                    show_camera=False,
+                    sim=True,
+                    actuate=True,
+                    allow_unqualified_real=False,
                     confirm_sim_network_isolated=True,
                 )
                 with (
@@ -1648,7 +1695,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     confirm_return_to_start.call_count,
-                    int(returned_to_start) * (1 + int(warmup1_enabled)),
+                    int(returned_to_start),
                 )
                 self.assertEqual(events.count("actuator.initialize"), 1)
                 self.assertEqual(events.count("actuator.hold"), 2)
@@ -1656,9 +1703,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 if warmup1_enabled:
                     expected_arms.append(TRAINING_START_JOINTS_RAD[:14])
                 if returned_to_start:
-                    expected_arms.append(np.zeros(14))
-                    if warmup1_enabled:
-                        expected_arms.append(TRAINING_START_JOINTS_RAD[:14])
+                    expected_arms.append(TRAINING_START_JOINTS_RAD[:14] if warmup1_enabled else np.zeros(14))
                 self.assertEqual(len(warmup_specs), len(expected_arms))
                 for actual, expected in zip(warmup_specs, expected_arms, strict=True):
                     np.testing.assert_array_equal(actual.arm, expected)
@@ -1747,6 +1792,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
         module = "unitree_lerobot.eval_robot.eval_groot_g1"
         args = build_parser().parse_args(
             [
+                "--no-actuate",
+                "--end-effector",
+                "dex3",
                 "--task",
                 "pick-red-cup",
                 "--policy-host",
@@ -2022,9 +2070,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 prompt_calls = [
                     call
                     for call in printed.call_args_list
-                    if call.args
-                    and isinstance(call.args[0], str)
-                    and call.args[0].endswith(prompt)
+                    if call.args and isinstance(call.args[0], str) and call.args[0].endswith(prompt)
                 ]
                 self.assertEqual(len(prompt_calls), expected_prompt_count)
                 self.assertEqual(prompt_calls[0].args[0], prompt)
@@ -2072,9 +2118,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             prompt_calls = [call for call in printed.call_args_list if call.args == (prompt,)]
             self.assertEqual(prompt_count, 2)
             self.assertEqual(len(prompt_calls), 2)
-            self.assertTrue(
-                any("Discarded 1 buffered r key" in line for line in captured_logs.output)
-            )
+            self.assertTrue(any("Discarded 1 buffered r key" in line for line in captured_logs.output))
             actuator.request_immediate_hold.assert_called_once_with()
             actuator.hold.assert_not_called()
             finish_stop.assert_not_called()
@@ -2836,6 +2880,23 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
         actuator.request_immediate_release.assert_not_called()
 
+    def test_direct_warmup1_return_keeps_stage_rate_and_final_visual_gate(self):
+        module = "unitree_lerobot.eval_robot.eval_groot_g1"
+        for profile in ("dex3", "inspire-ftp", "inspire-dfx"):
+            target = training_start_spec(profile)
+            actuator = object()
+            with (
+                self.subTest(profile=profile),
+                mock.patch(f"{module}._run_return_to_start_from_hold", return_value="continue") as run_stage,
+            ):
+                self.assertEqual(
+                    _run_return_to_start_sequence_from_hold(actuator, (target,), warmup1_spec=target),
+                    "continue",
+                )
+                run_stage.assert_called_once_with(
+                    actuator, target, require_final_visual_check=True, warmup1=True,
+                )
+
     def test_return_to_start_sequence_orders_start_then_warmup1_with_one_final_visual_gate(self):
         start = load_initialization_spec("xr-home", task_name="pick-red-cup")
         warmup1 = training_start_spec()
@@ -2850,6 +2911,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 _run_return_to_start_sequence_from_hold(
                     actuator,
                     (start, warmup1),
+                    warmup1_spec=warmup1,
                 ),
                 "continue",
             )
@@ -2866,6 +2928,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                     actuator,
                     warmup1,
                     require_final_visual_check=True,
+                    warmup1=True,
                 ),
             ],
         )
@@ -3282,11 +3345,19 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
     def test_model_contract_preserves_separate_wire_views_for_early_fusion(self):  # earlyfusion
         config = modality_config(surface_normals=True)  # earlyfusion
-        config["video"]["channel_fusion"] = [{"key": "ego_view", "channels": [0, 1, 2]}, {"key": "surface_normals_view", "channels": [0, 1, 2]}]  # earlyfusion
+        config["video"]["channel_fusion"] = [
+            {"key": "ego_view", "channels": [0, 1, 2]},
+            {"key": "surface_normals_view", "channels": [0, 1, 2]},
+        ]  # earlyfusion
         contract = validate_model_contract(config)  # earlyfusion
         self.assertEqual(contract.vision_input_contract["input_channels"], 6)  # earlyfusion
-        self.assertEqual(contract.vision_input_contract["wire_video_keys"], list(SURFACE_NORMAL_VIDEO_KEYS))  # earlyfusion
-        self.assertEqual(contract.vision_input_contract["channel_layout"][-3:], ["surface_normals_view:0", "surface_normals_view:1", "surface_normals_view:2"])  # earlyfusion
+        self.assertEqual(
+            contract.vision_input_contract["wire_video_keys"], list(SURFACE_NORMAL_VIDEO_KEYS)
+        )  # earlyfusion
+        self.assertEqual(
+            contract.vision_input_contract["channel_layout"][-3:],
+            ["surface_normals_view:0", "surface_normals_view:1", "surface_normals_view:2"],
+        )  # earlyfusion
 
     def test_model_contract_derives_exact_late_fusion_architecture(self):
         cases = (
@@ -3334,8 +3405,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                             "adapter_input_dim": input_dim,
                             "adapter_output_dim": output_dim,
                             "parameters_per_adapter": parameters_per_adapter,
-                            "total_adapter_parameters": 4
-                            * parameters_per_adapter,
+                            "total_adapter_parameters": 4 * parameters_per_adapter,
                             "source_keys": list(video_keys),
                         },
                     },
@@ -3436,9 +3506,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             with self.subTest(field=field):
                 malformed = copy.deepcopy(metadata)
                 malformed["vision_input_contract"]["post_vision_fusion"][field] = value
-                with self.assertRaisesRegex(
-                    DeploymentError, "vision input contract mismatch"
-                ):
+                with self.assertRaisesRegex(DeploymentError, "vision input contract mismatch"):
                     validate_policy_metadata(
                         malformed,
                         requires_depth=True,
@@ -3476,12 +3544,24 @@ class GrootG1DeploymentTests(unittest.TestCase):
             ),
         )
         fusion_config = modality_config(surface_normals=True)  # earlyfusion
-        fusion_config["video"]["channel_fusion"] = [{"key": "ego_view", "channels": [0, 1, 2]}, {"key": "surface_normals_view", "channels": [0, 1, 2]}]  # earlyfusion
+        fusion_config["video"]["channel_fusion"] = [
+            {"key": "ego_view", "channels": [0, 1, 2]},
+            {"key": "surface_normals_view", "channels": [0, 1, 2]},
+        ]  # earlyfusion
         expected_vision = validate_model_contract(fusion_config).vision_input_contract  # earlyfusion
-        rgb_mean_metadata = {**metadata, "vision_input_contract": {**expected_vision, "patch_embed_init": "rgb_mean"}}  # earlyfusion
-        validate_policy_metadata(rgb_mean_metadata, requires_surface_normals=True, vision_input_contract=expected_vision)  # earlyfusion
+        rgb_mean_metadata = {
+            **metadata,
+            "vision_input_contract": {**expected_vision, "patch_embed_init": "rgb_mean"},
+        }  # earlyfusion
+        validate_policy_metadata(
+            rgb_mean_metadata, requires_surface_normals=True, vision_input_contract=expected_vision
+        )  # earlyfusion
         with self.assertRaisesRegex(DeploymentError, "vision input contract mismatch"):  # earlyfusion
-            validate_policy_metadata({**metadata, "vision_input_contract": {**expected_vision, "patch_embed_init": "unsupported"}}, requires_surface_normals=True, vision_input_contract=expected_vision)  # earlyfusion
+            validate_policy_metadata(
+                {**metadata, "vision_input_contract": {**expected_vision, "patch_embed_init": "unsupported"}},
+                requires_surface_normals=True,
+                vision_input_contract=expected_vision,
+            )  # earlyfusion
         malformed = {
             **metadata,
             "dataset_contract": {
@@ -3536,9 +3616,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         )
 
     def test_policy_metadata_keeps_legacy_surface_normal_contract_untagged(self):
-        encoding = surface_normals_encoding_metadata(
-            encoding_version=LEGACY_SURFACE_NORMAL_ENCODING_VERSION
-        )
+        encoding = surface_normals_encoding_metadata(encoding_version=LEGACY_SURFACE_NORMAL_ENCODING_VERSION)
         self.assertNotIn("camera_calibration", encoding)
         metadata = {
             "protocol_version": 1,
@@ -3577,9 +3655,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 "inclusive must be true",
             ),
             (
-                lambda value: value["depth_valid_range_m"].update(
-                    required_samples=["center"]
-                ),
+                lambda value: value["depth_valid_range_m"].update(required_samples=["center"]),
                 "required_samples must be exactly",
             ),
             (
@@ -3700,7 +3776,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
         metadata["vision_input_contract"] = vision_contract  # earlyfusion
         validate_policy_metadata(metadata, requires_depth=True, vision_input_contract=vision_contract)  # earlyfusion
         with self.assertRaisesRegex(DeploymentError, "vision input contract mismatch"):  # earlyfusion
-            validate_policy_metadata(metadata, requires_depth=True, vision_input_contract={**vision_contract, "input_channels": 4})  # earlyfusion
+            validate_policy_metadata(
+                metadata, requires_depth=True, vision_input_contract={**vision_contract, "input_channels": 4}
+            )  # earlyfusion
         validate_policy_metadata(metadata)
         depth_contract = validate_policy_metadata(metadata, requires_depth=True)
         self.assertEqual(depth_contract, DepthEncodingContract(near_m=0.25, far_m=1.0))
@@ -3849,9 +3927,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             np.testing.assert_array_equal(state.arm, np.zeros(14))
 
             last_left_update = reader._updated_at["left"]
-            zero_hand_message = SimpleNamespace(
-                motor_state=[SimpleNamespace(q=0.0) for _ in range(7)]
-            )
+            zero_hand_message = SimpleNamespace(motor_state=[SimpleNamespace(q=0.0) for _ in range(7)])
             FakeSubscriber.instances["rt/dex3/left/state"].handler(zero_hand_message)
             self.assertEqual(reader._updated_at["left"], last_left_update)
             self.assertEqual(reader._rejected_zero_hand_frames["left"], 1)
@@ -4040,9 +4116,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         action = valid_action()
         action["left_arm"][0, 15, 0] = 100.0
 
-        with self.assertLogs(
-            "unitree_lerobot.eval_robot.groot_contract", level="WARNING"
-        ) as captured:
+        with self.assertLogs("unitree_lerobot.eval_robot.groot_contract", level="WARNING") as captured:
             plan = parse_action_plan(
                 action,
                 16,
@@ -4065,9 +4139,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         action = valid_action(horizon=32)
         action["right_arm"][0, 29, 3] = 2.0910
 
-        with self.assertLogs(
-            "unitree_lerobot.eval_robot.groot_contract", level="WARNING"
-        ) as captured:
+        with self.assertLogs("unitree_lerobot.eval_robot.groot_contract", level="WARNING") as captured:
             plan = parse_action_plan(
                 action,
                 32,
@@ -4096,9 +4168,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         action["right_arm"][0, :, 3] = np.linspace(-0.3, 0.3, 32)
         expected = np.concatenate((action["left_arm"][0], action["right_arm"][0]), axis=1)
 
-        with mock.patch(
-            "unitree_lerobot.eval_robot.groot_contract.LOGGER.warning"
-        ) as warning:
+        with mock.patch("unitree_lerobot.eval_robot.groot_contract.LOGGER.warning") as warning:
             plan = parse_action_plan(
                 action,
                 32,
@@ -4326,8 +4396,8 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
             def enable_head_rgbd_stream(self):
                 self.atomic_enable_calls += 1
-                self._subscriber_manager._subscriber_threads[("camera-host", 5560)] = (
-                    SimpleNamespace(is_alive=lambda: True)
+                self._subscriber_manager._subscriber_threads[("camera-host", 5560)] = SimpleNamespace(
+                    is_alive=lambda: True
                 )
 
             def close(self):
@@ -4745,7 +4815,11 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
             def get_head_frame(self):
                 self.color_calls += 1
-                return SimpleNamespace(jpg=color_jpeg.tobytes(), fps=0.0 if self.color_calls == 1 else 30.0, received_monotonic_ns=received_ns)
+                return SimpleNamespace(
+                    jpg=color_jpeg.tobytes(),
+                    fps=0.0 if self.color_calls == 1 else 30.0,
+                    received_monotonic_ns=received_ns,
+                )
 
             def get_head_depth_frame(self):
                 return SimpleNamespace(jpg=depth_png.tobytes(), fps=30.0, received_monotonic_ns=received_ns + 1)
@@ -4797,8 +4871,12 @@ class GrootG1DeploymentTests(unittest.TestCase):
         camera._head_subscriber = SimpleNamespace(is_alive=lambda: True)
         camera._depth_subscriber = SimpleNamespace(is_alive=lambda: True)
         camera._client = SimpleNamespace(
-            get_head_frame=lambda: SimpleNamespace(jpg=color_jpeg.tobytes(), fps=30.0, received_monotonic_ns=received_ns),
-            get_head_depth_frame=lambda: SimpleNamespace(jpg=depth_png.tobytes(), fps=30.0, received_monotonic_ns=received_ns + 1),
+            get_head_frame=lambda: SimpleNamespace(
+                jpg=color_jpeg.tobytes(), fps=30.0, received_monotonic_ns=received_ns
+            ),
+            get_head_depth_frame=lambda: SimpleNamespace(
+                jpg=depth_png.tobytes(), fps=30.0, received_monotonic_ns=received_ns + 1
+            ),
         )
         camera.config = {
             "head_camera": {
@@ -4999,7 +5077,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
         camera._depth_subscriber = SimpleNamespace(is_alive=lambda: True)
         camera._client = SimpleNamespace(
             get_head_frame=lambda: SimpleNamespace(jpg=b"unused", fps=30.0, received_monotonic_ns=received_ns),
-            get_head_depth_frame=lambda: SimpleNamespace(jpg=b"unused", fps=30.0, received_monotonic_ns=received_ns + 1),
+            get_head_depth_frame=lambda: SimpleNamespace(
+                jpg=b"unused", fps=30.0, received_monotonic_ns=received_ns + 1
+            ),
         )
 
         with self.assertRaisesRegex(DeploymentError, "receive timestamp regressed"):
@@ -5370,12 +5450,8 @@ class GrootG1DeploymentTests(unittest.TestCase):
             self.assertTrue(all(weight == 1.0 for weight in backend.transmitted_weights))
             self.assertEqual(backend.gravity_scales[0], 0.0)
             self.assertEqual(backend.gravity_scales[-1], 1.0)
-            self.assertTrue(
-                all(a <= b for a, b in zip(backend.gravity_scales, backend.gravity_scales[1:]))
-            )
-            self.assertTrue(
-                all(np.array_equal(target, backend.captured_pose) for target in backend.target_history)
-            )
+            self.assertTrue(all(a <= b for a, b in zip(backend.gravity_scales, backend.gravity_scales[1:])))
+            self.assertTrue(all(np.array_equal(target, backend.captured_pose) for target in backend.target_history))
             self.assertFalse(any(np.array_equal(target, np.zeros(14)) for target in backend.target_history))
 
             stop.set()
@@ -5474,6 +5550,30 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 with self.assertRaisesRegex(DeploymentError, "initialized HOLD"):
                     actuator.warmup_pose(spec)
                 self.assertTrue(actuator._command_queue.empty())
+
+    def test_parent_warmup1_pose_uses_its_distinct_accelerated_command(self):
+        actuator = object.__new__(SafeG1Dex3Actuator)
+        actuator._initialized = True
+        actuator._holding = True
+        actuator._chunk_in_flight = False
+        actuator._command_queue = queue.Queue(maxsize=1)
+        spec = training_start_spec()
+
+        with (
+            mock.patch.object(actuator, "_wait_for_hand_feedback"),
+            mock.patch.object(actuator, "heartbeat"),
+            mock.patch.object(actuator, "_wait_status"),
+        ):
+            actuator.warmup1_pose(spec)
+
+        kind, created_at, queued_spec = actuator._command_queue.get_nowait()
+        self.assertEqual(kind, "warmup1_pose")
+        self.assertLessEqual(time.monotonic() - created_at, 0.1)
+        self.assertIs(queued_spec, spec)
+
+        with self.assertRaisesRegex(DeploymentError, "reviewed profile-specific"):
+            actuator.warmup1_pose(load_initialization_spec("xr-home", task_name="pick-red-cup"))
+        self.assertTrue(actuator._command_queue.empty())
 
     def test_parent_hold_is_acknowledged_idempotent_and_forbidden_during_a_chunk(self):
         actuator = object.__new__(SafeG1Dex3Actuator)
@@ -5654,19 +5754,19 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
             warmup1 = InitializationSpec(
                 mode="pose-file",
-                label="recorded start pose",
+                label="Warmup1: recorded start pose",
                 arm=np.zeros(14),
                 left_hand=np.zeros(7),
                 right_hand=np.zeros(7),
             )
-            commands.put(("warmup_pose", time.monotonic(), warmup1))
+            commands.put(("warmup1_pose", time.monotonic(), warmup1))
             kind, details = statuses.get(timeout=1.0)
             self.assertEqual(kind, "warmup_pose_started")
-            self.assertEqual(details["label"], "recorded start pose")
+            self.assertEqual(details["label"], "Warmup1: recorded start pose")
             self.assertGreaterEqual(details["steps"], 1)
             self.assertEqual(
                 statuses.get(timeout=1.0),
-                ("warmup_pose_completed", "recorded start pose"),
+                ("warmup_pose_completed", "Warmup1: recorded start pose"),
             )
 
             # Acceptance here proves Warmup1 left the child in acknowledged
@@ -6151,15 +6251,9 @@ class GrootG1DeploymentTests(unittest.TestCase):
                 heartbeat.value = clock.now
 
         measured_arm = np.zeros(14) if arm is None else np.asarray(arm, dtype=np.float64)
-        measured_arm_dq = (
-            np.zeros(14) if arm_dq is None else np.asarray(arm_dq, dtype=np.float64)
-        )
-        measured_left = (
-            np.zeros(7) if left_hand is None else np.asarray(left_hand, dtype=np.float64)
-        )
-        measured_right = (
-            np.zeros(7) if right_hand is None else np.asarray(right_hand, dtype=np.float64)
-        )
+        measured_arm_dq = np.zeros(14) if arm_dq is None else np.asarray(arm_dq, dtype=np.float64)
+        measured_left = np.zeros(7) if left_hand is None else np.asarray(left_hand, dtype=np.float64)
+        measured_right = np.zeros(7) if right_hand is None else np.asarray(right_hand, dtype=np.float64)
 
         class NonConvergingBackend(FakeBackend):
             def state(self):
@@ -6240,8 +6334,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
         self.assertIn("joint 8 (kRightShoulderRoll)", message)
         self.assertIn(f"signed dq={arm_dq[8]:+.3f} rad/s", message)
         self.assertIn(
-            "INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S="
-            f"{INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S:.3f} rad/s",
+            f"INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S={INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S:.3f} rad/s",
             message,
         )
         self.assertNotIn("INITIALIZATION_ARM_TOLERANCE_RAD", message)

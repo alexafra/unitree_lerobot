@@ -12,10 +12,10 @@ import numpy as np
 
 
 UNQUALIFIED_INSPIRE_DFX_COMMAND_MAX_STEP = 0.2
-# The normalized command domain and teleop-derived per-write backstop are the
-# same for DFX and RH56E2/FTP.  Keep the original public DFX name for callers
-# that imported it before FTP support was added.
-UNQUALIFIED_INSPIRE_COMMAND_MAX_STEP = UNQUALIFIED_INSPIRE_DFX_COMMAND_MAX_STEP
+# User-authorized RH56E2/FTP limits: normal command clamp and independent
+# excessive-step fault threshold. Preserve the DFX/simulation limit above.
+UNQUALIFIED_INSPIRE_COMMAND_CLAMP_STEP = 0.3
+UNQUALIFIED_INSPIRE_COMMAND_MAX_STEP = 0.35
 
 
 @dataclass(frozen=True)
@@ -253,7 +253,7 @@ INSPIRE_FTP_PROFILE = EndEffectorProfile(
     max_step=None,
     conditioned_step=np.full(
         6,
-        UNQUALIFIED_INSPIRE_COMMAND_MAX_STEP,
+        UNQUALIFIED_INSPIRE_COMMAND_CLAMP_STEP,
         dtype=np.float64,
     ),
     initialization_speed=None,

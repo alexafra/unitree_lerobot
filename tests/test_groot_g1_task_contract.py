@@ -4,7 +4,12 @@ from unittest import mock
 
 import pytest
 
-from unitree_lerobot.eval_robot.eval_groot_g1 import build_parser, run
+from unitree_lerobot.eval_robot.eval_groot_g1 import (
+    build_parser,
+    resolve_runtime_goal,
+    run,
+    select_instruction,
+)
 from unitree_lerobot.eval_robot.groot_client import DeploymentError
 from unitree_lerobot.eval_robot.groot_contract import (
     ModelContract,
@@ -26,13 +31,26 @@ def test_left_to_right_cup_pyramid_task_is_exactly_registered():
 @pytest.mark.parametrize(
     ("task", "instruction"),
     [
+        ("build-cup-pyramid-left-to-right", "build a cup pyramid left-to-right."),
+        ("pick-water-bottle", "pick up the empty water bottle."),
+        ("down-water-bottle", "put down the empty water bottle."),
         ("pick-green-cup", "pick up the green cup."),
         ("down-green-cup", "put down the green cup."),
     ],
 )
-def test_green_cup_tasks_are_exactly_registered_and_accepted_by_cli(task, instruction):
+def test_default_goal_shortcuts_are_registered_and_accepted_by_cli_and_menus(task, instruction):
     assert TASKS[task] == instruction
     assert build_parser().parse_args(["--task", task]).task == task
+    assert select_instruction(task) == (task, instruction)
+    assert resolve_runtime_goal(task) == (task, instruction)
+    assert resolve_runtime_goal(instruction) == (task, instruction)
+    menu_number = str(list(TASKS).index(task) + 1)
+    assert resolve_runtime_goal(menu_number) == (task, instruction)
+    with mock.patch(
+        "unitree_lerobot.eval_robot.eval_groot_g1._readline_before_authority",
+        return_value=menu_number,
+    ):
+        assert select_instruction(None) == (task, instruction)
 
 
 def _metadata(instructions=RED_CUP_TASKS):
@@ -92,23 +110,25 @@ def test_unadvertised_or_inexact_instruction_is_rejected(instruction):
         ),
     ],
 )
-def test_malformed_task_contract_fails_closed(mutate, message):
+@pytest.mark.parametrize("allow_custom_instruction", [False, True])
+def test_malformed_task_contract_fails_closed(mutate, message, allow_custom_instruction):
     metadata = _metadata()
     mutate(metadata)
 
     with pytest.raises(DeploymentError, match=message):
-        validate_policy_instruction(metadata, "pick up the red cup.")
+        validate_policy_instruction(
+            metadata, "pick up the red cup.", allow_custom_instruction=allow_custom_instruction,
+        )
 
 
 @pytest.mark.parametrize(
     "goal_args",
     [
         ["--task", "pick-wooden-block"],
-        ["--custom-goal", "pick up the blue cup."],
     ],
 )
 def test_runner_rejects_unadvertised_instruction_before_dds(goal_args):
-    args = build_parser().parse_args(goal_args)
+    args = build_parser().parse_args(["--no-actuate", "--end-effector", "dex3", *goal_args])
     policy = mock.Mock()
     policy.ping.return_value = True
     policy.get_modality_config.return_value = {}

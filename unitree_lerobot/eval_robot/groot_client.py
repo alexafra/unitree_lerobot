@@ -153,11 +153,27 @@ class Gr00tClient:
                 "rtc_overlap_steps": options.get("rtc_overlap_steps"),
                 "rtc_frozen_steps": options.get("rtc_frozen_steps"),
             }
+            rtc_pure = options.get("rtc_pure") is True
+            if rtc_pure:
+                # Never execute a legacy response to an explicitly guided
+                # request, even if an old server silently ignored the option.
+                if info.get("rtc_pure_applied") is not True:
+                    raise DeploymentError(
+                        "GR00T server did not acknowledge --rtc-pure guidance "
+                        "(rtc_pure_applied=true required); refusing legacy fallback"
+                    )
             mismatched = {
                 key: (info.get(key), value)
                 for key, value in expected.items()
                 if info.get(key) != value
             }
+            if rtc_pure:
+                if mismatched:
+                    raise DeploymentError(
+                        "GR00T server did not acknowledge the requested RTC conditioning: "
+                        f"mismatched={mismatched}"
+                    )
+                return action
             try:
                 ramp_rate = float(info["rtc_ramp_rate"])
             except (KeyError, TypeError, ValueError) as exc:

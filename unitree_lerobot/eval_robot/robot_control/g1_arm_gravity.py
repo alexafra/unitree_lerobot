@@ -38,8 +38,10 @@ G1_ARM_GRAVITY_JOINT_NAMES = (
 # [25, 25, 25, 25, 25, 5, 5] Nm per arm.  It covers the XR RNEA torques across
 # the recorded training actions (observed maxima below 7.71 Nm) while making a
 # corrupt model, joint permutation, or implausible result fail before DDS Write.
+# Shoulder yaw alone was raised from 3 to 9 Nm at the operator's request after
+# a -3.0003 Nm guard trip; this is a local limit, not hardware safety validation.
 G1_ARM_GRAVITY_TORQUE_ENVELOPE_NM = np.array(
-    [10.0, 5.0, 3.0, 5.0, 2.0, 2.0, 1.0] * 2,
+    [10.0, 5.0, 9.0, 5.0, 2.0, 2.0, 1.0] * 2,
     dtype=np.float64,
 )
 G1_ARM_GRAVITY_TORQUE_ENVELOPE_NM.setflags(write=False)

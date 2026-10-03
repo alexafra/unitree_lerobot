@@ -223,11 +223,12 @@ class GrootG1CommandConditioningTests(unittest.TestCase):
         self.assertLess(reversed_command.arm[0, 0], first.arm[0, 0])
 
     def test_cli_defaults_to_xr_and_allows_explicit_unconditioned_comparison(self):
-        default_args = build_parser().parse_args(["--task", "pick-red-cup"])
+        shadow_dex3 = ["--no-actuate", "--end-effector", "dex3", "--task", "pick-red-cup"]
+        default_args = build_parser().parse_args(shadow_dex3)
         self.assertEqual(default_args.command_conditioning, "xr")
         validate_args(default_args)
 
-        unconditioned_args = build_parser().parse_args(["--task", "pick-red-cup", "--command-conditioning", "none"])
+        unconditioned_args = build_parser().parse_args([*shadow_dex3, "--command-conditioning", "none"])
         self.assertEqual(unconditioned_args.command_conditioning, "none")
         validate_args(unconditioned_args)
 

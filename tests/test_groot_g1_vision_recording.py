@@ -80,7 +80,13 @@ def test_record_vision_cli_is_strictly_opt_in() -> None:
     parser = build_parser()
 
     assert parser.parse_args([]).record_vision is False
-    assert parser.parse_args(["--record-vision"]).record_vision is True
+    defaults = parser.parse_args(["--record-vision"])
+    assert defaults.record_vision is True
+    assert defaults.vision_recordings_dir == eval_groot_g1.DEFAULT_VISION_RECORDINGS_DIR
+    override = parser.parse_args(
+        ["--record-vision", "--vision-recordings-dir", "/tmp/recordings"]
+    )
+    assert override.vision_recordings_dir == Path("/tmp/recordings")
 
 
 @pytest.mark.parametrize(
@@ -279,7 +285,13 @@ def test_run_constructs_and_passes_only_an_opted_in_recorder(
 ) -> None:
     argv = ["--task", "pick-red-cup", "--max-chunks", "1"]
     if enabled:
-        argv.append("--record-vision")
+        argv.extend(
+            [
+                "--record-vision",
+                "--vision-recordings-dir",
+                str(tmp_path / "Recordings_Data"),
+            ]
+        )
     args = build_parser().parse_args(argv)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -352,7 +364,11 @@ def test_run_constructs_and_passes_only_an_opted_in_recorder(
         "video_keys",
         constructor_call.args[1] if len(constructor_call.args) > 1 else None,
     )
-    assert Path(output_dir) == run_dir / "vision_recording"
+    assert Path(output_dir).parent == (
+        tmp_path / "Recordings_Data" / "unknown-model" / "unknown-checkpoint"
+    )
+    assert len(Path(output_dir).name) == len("2026-09-21_00-43")
+    assert constructor_call.kwargs["metadata"]["client_log_directory"] == str(run_dir)
     assert tuple(video_keys) == COLOUR_VIDEO_KEYS
     assert infer.call_args.kwargs["vision_recorder"] is fake_recorder
     fake_recorder.close.assert_called_once_with()
@@ -364,6 +380,8 @@ def test_actuator_release_precedes_vision_recorder_close(tmp_path: Path) -> None
             "--task",
             "pick-red-cup",
             "--record-vision",
+            "--vision-recordings-dir",
+            str(tmp_path / "Recordings_Data"),
             "--actuate",
             "--sim",
             "--confirm-sim-network-isolated",

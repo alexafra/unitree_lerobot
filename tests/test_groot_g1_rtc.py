@@ -195,6 +195,24 @@ class _RecordingConditioner(XrPolicyOutputConditioner):
         super().set_desired(arm, left, right, now=now)
 
 
+class _FinalIntervalRecordingBackend(_GatedRecordingBackend):
+    """Gate the publisher immediately after a selected policy target is set."""
+
+    instance: _FinalIntervalRecordingBackend | None = None
+
+    def __init__(self, simulation: bool, network_interface: str | None):
+        super().__init__(simulation, network_interface)
+        self.pause_after_next_target = threading.Event()
+        self.gated_target_at: float | None = None
+
+    def set_target(self, arm: np.ndarray, left_hand: np.ndarray, right_hand: np.ndarray) -> None:
+        super().set_target(arm, left_hand, right_hand)
+        if self.pause_after_next_target.is_set():
+            self.pause_after_next_target.clear()
+            self.gated_target_at = time.monotonic()
+            self.pause_next_publish.set()
+
+
 class _ChildHarness:
     def __init__(
         self,
@@ -712,6 +730,7 @@ class GrootG1RtcTests(unittest.TestCase):
     def test_impossible_explicit_frozen_prefix_fails_before_dds_initialization(self):
         args = build_parser().parse_args(
             [
+                "--no-actuate", "--end-effector", "dex3",
                 "--task",
                 "pick-red-cup",
                 "--inference-mode",
@@ -849,6 +868,100 @@ class GrootG1RtcTests(unittest.TestCase):
             np.testing.assert_array_equal(targets[-1][0], plan.arm[2])
             self.assertTrue(child.thread.is_alive())
             self.assertFalse(child.backend.released)
+
+    def _assert_rtc_request_preserves_final_interval(self, request_kind: str, *, budget_complete: bool) -> None:
+        # A 500 ms interval makes this an ordering regression, not a race
+        # against the production 33 ms deadline. Pause after publishing the
+        # final target and enqueue the request before the next child iteration.
+        action_period = 0.5
+        with mock.patch(f"{_SAFE_MODULE}.CONTROL_HZ", 1.0 / action_period):
+            with _ChildHarness(_FinalIntervalRecordingBackend) as child:
+                backend = child.backend
+                backend.pause_after_next_target.set()
+                plan = _plan(4 if budget_complete else 1)
+                plan.arm[:, 0] += 0.02
+                child.commands.put(
+                    _rtc_start_command(1, plan, action_budget=1 if budget_complete else 4),
+                    timeout=0.2,
+                )
+                self.assertEqual(child.assert_status("rtc_started"), 1)
+                self.assertTrue(backend.publish_paused.wait(timeout=0.5))
+                self.assertIsNotNone(backend.gated_target_at)
+                if request_kind == "rtc_snapshot":
+                    command = ("rtc_snapshot", 1)
+                else:
+                    replacement = _plan(4)
+                    replacement.arm[:, 0] += 0.02
+                    command = (
+                        "rtc_replace", 2, time.monotonic(), 1, 0, plan.length,
+                        replacement.arm, replacement.left_hand, replacement.right_hand,
+                        replacement.length,
+                    )
+                child.commands.put(command, timeout=0.2)
+                backend.continue_publish.set()
+
+                # Requests must neither emit an early terminal nor install a
+                # replacement/hold target while the final action is in flight.
+                observation_deadline = time.monotonic() + 0.15
+                while time.monotonic() < observation_deadline:
+                    try:
+                        status = child.statuses.get(
+                            timeout=max(0.001, observation_deadline - time.monotonic())
+                        )
+                    except queue.Empty:
+                        break
+                    self.assertEqual(status[0], "rtc_snapshot", status)
+                self.assertEqual(len(backend.target_snapshot()), 1)
+                np.testing.assert_array_equal(backend.target_snapshot()[0][0], plan.arm[0])
+
+                expected_terminal = "rtc_completed" if budget_complete else "rtc_underrun"
+                detail = child.assert_status(expected_terminal, timeout=0.8)
+                # next_action_at is assigned just before set_target; allow
+                # only a small scheduler/setup margin, not a whole interval.
+                self.assertGreaterEqual(time.monotonic() - backend.gated_target_at, action_period - 0.04)
+                if budget_complete:
+                    self.assertEqual(detail, 1)
+                else:
+                    self.assertEqual(detail["sequence"], 1)
+                self.assertEqual(len(backend.target_snapshot()), 2)  # final action + HOLD
+                self.assertTrue(child.thread.is_alive())
+                self.assertFalse(backend.released)
+
+    def test_rtc_snapshot_after_final_budget_target_waits_for_interval(self):
+        self._assert_rtc_request_preserves_final_interval("rtc_snapshot", budget_complete=True)
+
+    def test_rtc_snapshot_after_exhausted_plan_target_waits_for_interval(self):
+        self._assert_rtc_request_preserves_final_interval("rtc_snapshot", budget_complete=False)
+
+    def test_rtc_replace_after_final_budget_target_waits_for_interval(self):
+        self._assert_rtc_request_preserves_final_interval("rtc_replace", budget_complete=True)
+
+    def test_rtc_replace_after_exhausted_plan_target_waits_for_interval(self):
+        self._assert_rtc_request_preserves_final_interval("rtc_replace", budget_complete=False)
+
+    def test_urgent_stop_preempts_final_rtc_interval_even_with_snapshot_queued(self):
+        with mock.patch(f"{_SAFE_MODULE}.CONTROL_HZ", 2.0):
+            with _ChildHarness(_FinalIntervalRecordingBackend) as child:
+                backend = child.backend
+                backend.pause_after_next_target.set()
+                plan = _plan(1)
+                plan.arm[:, 0] = 0.02
+                child.commands.put(_rtc_start_command(1, plan, action_budget=1), timeout=0.2)
+                self.assertEqual(child.assert_status("rtc_started"), 1)
+                self.assertTrue(backend.publish_paused.wait(timeout=0.5))
+                child.commands.put(("rtc_snapshot", 1), timeout=0.2)
+                child.urgent_hold.set()
+                requested_at = time.monotonic()
+                backend.continue_publish.set()
+                self.assertEqual(child.assert_status("holding", timeout=0.2), 1)
+                self.assertLess(time.monotonic() - requested_at, 0.25)
+                self.assertLess(time.monotonic() - backend.gated_target_at, 0.4)
+                self.assertEqual(len(backend.target_snapshot()), 2)
+                self.assertTrue(child.thread.is_alive())
+                self.assertFalse(backend.released)
+                child.commands.put(("urgent_hold_barrier",), timeout=0.2)
+                self.assertEqual(child.assert_status("urgent_holding"), 1)
+                self.assertFalse(child.urgent_hold.is_set())
 
     def test_rtc_completion_holds_measured_arm_without_relaxing_commanded_grip(self):
         with _ChildHarness(_LaggingRecordingBackend) as child:

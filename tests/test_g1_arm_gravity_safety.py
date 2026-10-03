@@ -193,6 +193,24 @@ class G1ArmGravityDynamicsTests(unittest.TestCase):
         self.assertTrue(second.flags.c_contiguous)
         self.assertGreater(float(np.max(np.abs(second))), 1.0)
 
+    def test_shoulder_yaw_limit_is_nine_nm_with_other_limits_unchanged(self):
+        np.testing.assert_array_equal(
+            self.gravity._torque_envelope_nm,
+            [10.0, 5.0, 9.0, 5.0, 2.0, 2.0, 1.0] * 2,
+        )
+        for joint in (2, 9):
+            for value in (-9.000001, -9.0, -3.0003, 3.0003, 9.0, 9.000001):
+                result = np.zeros(14)
+                result[joint] = value
+                with self.subTest(joint=joint, value=value), mock.patch.object(
+                    self.gravity._pin, "rnea", return_value=result
+                ):
+                    if abs(value) > 9.0:
+                        with self.assertRaisesRegex(DeploymentError, "shoulder_yaw_joint"):
+                            self.gravity.compute(np.zeros(14))
+                    else:
+                        np.testing.assert_array_equal(self.gravity.compute(np.zeros(14)), result)
+
     def test_compute_latency_is_small_relative_to_100_hz_publish_period(self):
         q = np.array([0.2, 0.4, -0.3, 0.6, -0.2, 0.1, -0.5] * 2)
         self.gravity.compute(q)

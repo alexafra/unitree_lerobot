@@ -24,6 +24,7 @@ import cv2
 import numpy as np
 import zmq
 
+from unitree_lerobot.eval_robot.action_debug import ActionDebugSampler
 from unitree_lerobot.utils.camera_calibration import (
     D435I_254322071415_CALIBRATION,
     calibration_identity,
@@ -39,15 +40,12 @@ from unitree_lerobot.eval_robot.groot_contract import (
     ActionChunk,
     ARM_DOF,
     ARM_JOINT_NAMES,
-    ARM_LOWER,
-    ARM_UPPER,
     CONTROL_HZ,
     DepthEncodingContract,
     EXPECTED_DEPTH_VIEW_SHAPE,
     EXPECTED_EGO_VIEW_SHAPE,
     HAND_LIMIT_TOLERANCE_RAD,
     InitializationSpec,
-    JOINT_LIMIT_MARGIN_RAD,
     LEFT_HAND_LOWER,
     LEFT_HAND_JOINT_NAMES,
     LEFT_HAND_UPPER,
@@ -57,6 +55,8 @@ from unitree_lerobot.eval_robot.groot_contract import (
     RIGHT_HAND_JOINT_NAMES,
     RIGHT_HAND_UPPER,
     SurfaceNormalEncodingContract,
+    TRAINING_START_MODE,
+    arm_command_bounds,
     validate_action_chunk,
     validate_action_chunk_limits,
     validate_initialization_spec,
@@ -64,6 +64,7 @@ from unitree_lerobot.eval_robot.groot_contract import (
 )
 from unitree_lerobot.eval_robot.image_server.rgbd_protocol import RGBD_PROTOCOL
 from unitree_lerobot.eval_robot.robot_control.g1_arm_gravity import G1ArmGravityCompensator
+from unitree_lerobot.eval_robot.robot_control.policy_reference import PolicyReferenceSampler
 from unitree_lerobot.eval_robot.run_logging import (
     configure_process_logging,
     diagnostic_json_path,
@@ -107,7 +108,7 @@ ACTUATOR_HAND_STATE_WARNING_AGE_S = ACTUATOR_HAND_STATE_PAUSE_AGE_S
 # Backward-compatible name for tests/internal imports.  It remains the hard
 # arm-state deadline; hand state has its own limits above.
 ACTUATOR_STATE_MAX_AGE_S = ACTUATOR_ARM_STATE_MAX_AGE_S
-HEARTBEAT_TIMEOUT_S = 1.0 #SAFETYCHANGE was 1
+HEARTBEAT_TIMEOUT_S = 1.0  # SAFETYCHANGE was 1
 CHUNK_MAX_AGE_S = 0.25
 # Take arm_sdk authority in one matched-pose, zero-feed-forward write.  The
 # robot may retain an earlier arm_sdk weight after an unconfirmed shutdown, so
@@ -141,7 +142,7 @@ HAND_TRACKING_WARNING_CLEAR_RAD = 0.40
 HAND_TRACKING_WARNING_DWELL_S = 0.20
 HAND_COMMAND_HISTORY_SIZE = 128
 TRACKING_GRACE_S = 0.50
-MAX_ACTION_LATENESS_S = 0.02 #SAFETYCHANGE was 0.02
+MAX_ACTION_LATENESS_S = 0.02  # SAFETYCHANGE was 0.02
 # Missing one complete 30 Hz target-residency window invalidates the remaining
 # time-indexed plan even when the broader local lateness ceiling was relaxed.
 # The child freezes the last command and asks the parent for a fresh observation
@@ -179,10 +180,16 @@ INITIALIZATION_HAND_SPEED_RAD_S = 0.50
 INITIALIZATION_MAX_ARM_STEP_RAD = INITIALIZATION_ARM_SPEED_RAD_S / PUBLISH_HZ
 INITIALIZATION_MAX_HAND_STEP_RAD = INITIALIZATION_HAND_SPEED_RAD_S / PUBLISH_HZ
 INITIALIZATION_MIN_MOVE_S = 0.50
-# Warmup2 deliberately approaches the first inferred policy target more slowly
-# than other guarded pose transitions.  This affects only the discarded
-# first-target warm-start; live policy actions remain scheduled at CONTROL_HZ.
-WARMUP2_SPEED_SCALE = 0.75
+# Warmup1 and Warmup2 are explicit, operator-confirmed guarded transitions.  Run
+# them another 20% faster than the previous 1.4x rates, without changing
+# XR-home/startup settle or live policy scheduling. Warmup2 retains its 0.75x
+# relationship to the ordinary transition rate: 0.75 * 1.4 * 1.2 = 1.26.
+WARMUP1_SPEED_SCALE = 1.68
+WARMUP2_SPEED_SCALE = 1.26
+# Only explicit Return-to-Start command kinds receive this additional fixed
+# scale, relative to the existing rate of their ordinary or Warmup1 stage.
+# Final writer caps, feedback gates, and convergence dwell remain unchanged.
+RETURN_TO_START_SPEED_SCALE = 1.596  # Original 1.33x, then another 20% faster.
 INITIALIZATION_MAX_DURATION_S = 30.0
 INITIALIZATION_START_TIMEOUT_S = 3.0
 # Do not require a second stationary dwell after the operator has explicitly
@@ -198,8 +205,8 @@ MODE5_WAIST_REBASE_DWELL_S = 0.50
 INITIALIZATION_CONVERGENCE_TIMEOUT_S = 10.0
 INITIALIZATION_CONVERGENCE_DWELL_S = 0.50
 INITIALIZATION_MIN_DISTINCT_SAMPLES = 5
-INITIALIZATION_ARM_TOLERANCE_RAD = 0.20 #increased from 0.05 SAFETYCHANGE
-INITIALIZATION_HAND_TOLERANCE_RAD = 0.80 #SAFETYCHANGE increased from 0.4
+INITIALIZATION_ARM_TOLERANCE_RAD = 0.20  # increased from 0.05 SAFETYCHANGE
+INITIALIZATION_HAND_TOLERANCE_RAD = 0.80  # SAFETYCHANGE increased from 0.4
 INITIALIZATION_MAX_FINAL_ARM_DQ_RAD_S = 0.10
 INITIALIZATION_MAX_POSITION_DRIFT_RAD = 0.02
 INITIALIZATION_COMMAND_MAX_AGE_S = 0.25
@@ -389,11 +396,7 @@ class HandStateFreshnessGate:
                 if previous is not None and current != previous:
                     lost_changed.add(side)
                 setattr(self, attribute, current)
-        stale_hands = tuple(
-            name
-            for name, age_s in ages.items()
-            if age_s > self.pause_age_s or name in lost_changed
-        )
+        stale_hands = tuple(name for name, age_s in ages.items() if age_s > self.pause_age_s or name in lost_changed)
         max_age_s = max(ages.values())
         if stale_hands:
             entered = not self._active
@@ -401,12 +404,9 @@ class HandStateFreshnessGate:
                 self._active = True
                 self._started_at = checked_at
             pause_s = checked_at - self._started_at
-            operator_hold_entered = (
-                not self._operator_hold_active
-                and (
-                    max_age_s > ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S
-                    or pause_s >= ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S
-                )
+            operator_hold_entered = not self._operator_hold_active and (
+                max_age_s > ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S
+                or pause_s >= ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S
             )
             if operator_hold_entered:
                 self._operator_hold_active = True
@@ -426,10 +426,7 @@ class HandStateFreshnessGate:
             return HandFreshnessResult(ready=True, max_age_s=max_age_s)
 
         pause_s = checked_at - self._started_at
-        if (
-            not self._operator_hold_active
-            and pause_s >= ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S
-        ):
+        if not self._operator_hold_active and pause_s >= ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S:
             self._operator_hold_active = True
             return HandFreshnessResult(
                 ready=False,
@@ -582,11 +579,7 @@ class DdsHoldTimingAccumulator:
             "left_write_ms": finite_or_none(record["left_write_ms"]),
             "right_write_ms": finite_or_none(record["right_write_ms"]),
         }
-        score = max(
-            value
-            for value in (record["cycle_ms"], record["work_ms"], worst_ms)
-            if np.isfinite(value)
-        )
+        score = max(value for value in (record["cycle_ms"], record["work_ms"], worst_ms) if np.isfinite(value))
         slow_record["score_ms"] = float(score)
         self._slowest.append(slow_record)
         self._slowest.sort(key=lambda item: float(item["score_ms"]), reverse=True)
@@ -660,9 +653,7 @@ class ActiveTimingRing:
     ) -> None:
         self.finish(completed_at=loop_started)
         cycle_ms = (
-            None
-            if self._previous_loop_started is None
-            else (float(loop_started) - self._previous_loop_started) * 1e3
+            None if self._previous_loop_started is None else (float(loop_started) - self._previous_loop_started) * 1e3
         )
         self._previous_loop_started = float(loop_started)
         self._total += 1
@@ -670,9 +661,7 @@ class ActiveTimingRing:
             "sample": self._total,
             "at_s": float(loop_started) - self._started_at,
             "cycle_ms": cycle_ms,
-            "heartbeat_age_ms": (
-                None if heartbeat_age_s is None else max(0.0, float(heartbeat_age_s)) * 1e3
-            ),
+            "heartbeat_age_ms": (None if heartbeat_age_s is None else max(0.0, float(heartbeat_age_s)) * 1e3),
             "heartbeat_lookup_ms": None,
             "sequence": int(sequence),
             "next_action_index": int(action_index),
@@ -1197,8 +1186,7 @@ class XrPolicyOutputConditioner:
         # a hand state admitted by the wider measured-state tolerance move
         # inward without making an out-of-range DDS target.  The subsequent
         # command-step limiter remains authoritative.
-        arm_lower = ARM_LOWER + JOINT_LIMIT_MARGIN_RAD
-        arm_upper = ARM_UPPER - JOINT_LIMIT_MARGIN_RAD
+        arm_lower, arm_upper = arm_command_bounds(self._profile.name)
         left_lower = self._profile.left_lower - self._profile.limit_tolerance
         left_upper = self._profile.left_upper + self._profile.limit_tolerance
         right_lower = self._profile.right_lower - self._profile.limit_tolerance
@@ -1319,6 +1307,8 @@ def _validate_initialization_hand_recovery(
     lower: np.ndarray,
     upper: np.ndarray,
     joint_names: tuple[str, ...],
+    *,
+    max_step_rad: float = INITIALIZATION_MAX_HAND_STEP_RAD,
 ) -> None:
     """Allow only a bounded inward transition from measured-only tolerance.
 
@@ -1347,13 +1337,13 @@ def _validate_initialization_hand_recovery(
             )
 
         delta = target - previous
-        bad_step = np.flatnonzero(np.abs(delta) > INITIALIZATION_MAX_HAND_STEP_RAD + 1e-12)
+        bad_step = np.flatnonzero(np.abs(delta) > max_step_rad + 1e-12)
         if bad_step.size:
             joint = int(bad_step[0])
             raise DeploymentError(
                 f"Initialization {name} recovery step is too large at step {step}, joint {joint} "
                 f"({joint_names[joint]}): {delta[joint]:+.4f} rad; "
-                f"INITIALIZATION_MAX_HAND_STEP_RAD={INITIALIZATION_MAX_HAND_STEP_RAD:.4f} rad"
+                f"allowed initialization hand step={max_step_rad:.4f} rad"
             )
 
         below = target < strict_lower
@@ -1390,6 +1380,8 @@ def _validate_moving_initialization_chunk(
     current_arm: np.ndarray,
     current_left: np.ndarray,
     current_right: np.ndarray,
+    *,
+    max_hand_step_rad: float,
 ) -> None:
     """Validate a moving init without weakening the policy-action contract."""
 
@@ -1414,6 +1406,7 @@ def _validate_moving_initialization_chunk(
         LEFT_HAND_LOWER,
         LEFT_HAND_UPPER,
         LEFT_HAND_JOINT_NAMES,
+        max_step_rad=max_hand_step_rad,
     )
     _validate_initialization_hand_recovery(
         "right hand",
@@ -1422,10 +1415,11 @@ def _validate_moving_initialization_chunk(
         RIGHT_HAND_LOWER,
         RIGHT_HAND_UPPER,
         RIGHT_HAND_JOINT_NAMES,
+        max_step_rad=max_hand_step_rad,
     )
 
 
-def build_initialization_chunk(
+def _build_initialization_chunk(
     state: RobotState,
     spec: InitializationSpec,
     *,
@@ -1433,11 +1427,12 @@ def build_initialization_chunk(
     allow_training_start: bool = False,
     allow_startup_settle: bool = False,
     speed_scale: float = 1.0,
+    max_speed_scale: float,
 ) -> ActionChunk:
-    """Resolve measured targets and create a bounded smooth joint-space path."""
+    """Internal bounded path builder with a caller-specific speed ceiling."""
 
-    if not np.isfinite(speed_scale) or not 0.0 < speed_scale <= 1.0:
-        raise ValueError("speed_scale must be finite and in (0, 1]")
+    if not np.isfinite(speed_scale) or not 0.0 < speed_scale <= max_speed_scale:
+        raise ValueError(f"speed_scale must be finite and in (0, {max_speed_scale:g}]")
     validate_initialization_spec(
         spec,
         allow_policy_warm_start=allow_policy_warm_start,
@@ -1485,8 +1480,8 @@ def build_initialization_chunk(
                 INITIALIZATION_MAX_ARM_STEP_RAD * speed_scale,
                 dtype=np.float64,
             ),
-            profile.conditioned_step * speed_scale,
-            profile.conditioned_step * speed_scale,
+            profile.conditioned_step * min(speed_scale, 1.0),
+            profile.conditioned_step * min(speed_scale, 1.0),
         )
         movement = any(np.any(target != measured) for measured, target in zip(current, targets, strict=True))
         steps = max(
@@ -1588,8 +1583,34 @@ def build_initialization_chunk(
         right_hand=np.ascontiguousarray(paths[2]),
         end_effector=profile.name,
     )
-    _validate_moving_initialization_chunk(chunk, *current)
+    _validate_moving_initialization_chunk(
+        chunk,
+        *current,
+        max_hand_step_rad=INITIALIZATION_MAX_HAND_STEP_RAD * speed_scale,
+    )
     return chunk
+
+
+def build_initialization_chunk(
+    state: RobotState,
+    spec: InitializationSpec,
+    *,
+    allow_policy_warm_start: bool = False,
+    allow_training_start: bool = False,
+    allow_startup_settle: bool = False,
+    speed_scale: float = 1.0,
+) -> ActionChunk:
+    """Create an ordinary guarded path at no more than its established rate."""
+
+    return _build_initialization_chunk(
+        state,
+        spec,
+        allow_policy_warm_start=allow_policy_warm_start,
+        allow_training_start=allow_training_start,
+        allow_startup_settle=allow_startup_settle,
+        speed_scale=speed_scale,
+        max_speed_scale=1.0,
+    )
 
 
 def _build_policy_warm_start_chunk(
@@ -1598,14 +1619,100 @@ def _build_policy_warm_start_chunk(
     *,
     allow_policy_warm_start: bool,
 ) -> ActionChunk:
-    """Build only Warmup2 at its deliberately slower transition rate."""
+    """Build only Warmup2 at its stage-specific accelerated rate."""
 
-    return build_initialization_chunk(
+    return _build_initialization_chunk(
         state,
         spec,
         allow_policy_warm_start=allow_policy_warm_start,
         speed_scale=WARMUP2_SPEED_SCALE,
+        max_speed_scale=WARMUP2_SPEED_SCALE,
     )
+
+
+def _build_warmup1_chunk(
+    state: RobotState,
+    spec: InitializationSpec,
+) -> ActionChunk:
+    """Build only reviewed Warmup1 at its stage-specific accelerated rate."""
+
+    _validate_warmup1_stage_spec(spec)
+    return _build_initialization_chunk(
+        state,
+        spec,
+        allow_training_start=True,
+        speed_scale=WARMUP1_SPEED_SCALE,
+        max_speed_scale=WARMUP1_SPEED_SCALE,
+    )
+
+
+def _validate_warmup1_stage_spec(spec: InitializationSpec) -> None:
+    """Reject accidental acceleration of any non-Warmup1 guarded pose."""
+
+    profile = get_end_effector_profile(spec.end_effector)
+    expected_mode = "pose-file" if profile.name == "dex3" else TRAINING_START_MODE
+    if spec.mode != expected_mode or not spec.label.startswith("Warmup1:"):
+        raise DeploymentError("Accelerated Warmup1 requires the reviewed profile-specific training-start pose")
+
+
+def _validate_return_to_start_stage_spec(spec: InitializationSpec, *, warmup1: bool) -> None:
+    """Restrict return acceleration to a fixed, validated non-policy stage."""
+
+    validate_initialization_spec(
+        spec,
+        allow_training_start=warmup1,
+        allow_startup_settle=True,
+    )
+    if not spec.moves:
+        raise DeploymentError("Return-to-Start requires a fixed moving pose target")
+    if warmup1:
+        _validate_warmup1_stage_spec(spec)
+
+
+def _build_return_to_start_chunk(
+    state: RobotState,
+    spec: InitializationSpec,
+    *,
+    warmup1: bool = False,
+) -> ActionChunk:
+    """Build an explicit return stage at 1.596x its original guarded rate."""
+
+    _validate_return_to_start_stage_spec(spec, warmup1=warmup1)
+    speed_scale = RETURN_TO_START_SPEED_SCALE * (WARMUP1_SPEED_SCALE if warmup1 else 1.0)
+    return _build_initialization_chunk(
+        state,
+        spec,
+        allow_training_start=warmup1,
+        allow_startup_settle=True,
+        speed_scale=speed_scale,
+        max_speed_scale=speed_scale,
+    )
+
+
+def _build_guarded_warmup_pose_chunk(
+    state: RobotState,
+    spec: InitializationSpec,
+    *,
+    command_kind: str,
+) -> ActionChunk:
+    """Dispatch child guarded motion by its explicit, stage-scoped command."""
+
+    if command_kind in {"return_to_start_pose", "return_to_start_warmup1_pose"}:
+        return _build_return_to_start_chunk(
+            state,
+            spec,
+            warmup1=command_kind == "return_to_start_warmup1_pose",
+        )
+    if command_kind == "warmup1_pose":
+        return _build_warmup1_chunk(state, spec)
+    if command_kind == "warmup_pose":
+        return build_initialization_chunk(
+            state,
+            spec,
+            allow_training_start=True,
+            allow_startup_settle=True,
+        )
+    raise DeploymentError("Unsupported guarded warmup-pose command kind")
 
 
 def initialize_dds(simulation: bool, network_interface: str | None) -> None:
@@ -1642,9 +1749,7 @@ class G1Dex3StateReader:
         self._arm_max_age_s = float(max_age_s)
         self._hand_max_age_s = float(max_age_s if hand_max_age_s is None else hand_max_age_s)
         self._arm_max_age_constant = max_age_constant
-        self._hand_max_age_constant = (
-            max_age_constant if hand_max_age_constant is None else hand_max_age_constant
-        )
+        self._hand_max_age_constant = max_age_constant if hand_max_age_constant is None else hand_max_age_constant
         if self._arm_max_age_s <= 0.0 or self._hand_max_age_s <= 0.0:
             raise ValueError("State freshness limits must be positive")
         self._arm_indices = tuple(int(index) for index in G1_29_JointArmIndex)
@@ -1707,16 +1812,13 @@ class G1Dex3StateReader:
         for key, message in messages.items():
             if message is None:
                 detail = f", rejected {rejected_zero[key]} all-zero frames" if key in rejected_zero else ""
-                stale.append(
-                    f"{key} (missing; {limit_names[key]}={limits[key]:.3f}s{detail})"
-                )
+                stale.append(f"{key} (missing; {limit_names[key]}={limits[key]:.3f}s{detail})")
                 continue
             age_s = now - updated_at[key]
             if age_s > limits[key]:
                 detail = f", rejected {rejected_zero[key]} all-zero frames" if key in rejected_zero else ""
                 stale.append(
-                    f"{key} (age {age_s:.3f}s > {limits[key]:.3f}s; "
-                    f"{limit_names[key]}={limits[key]:.3f}s{detail})"
+                    f"{key} (age {age_s:.3f}s > {limits[key]:.3f}s; {limit_names[key]}={limits[key]:.3f}s{detail})"
                 )
         if stale:
             raise TimeoutError(f"Stale Unitree state: {', '.join(stale)}")
@@ -1951,17 +2053,11 @@ def _validate_live_head_config(
         except ValueError as exc:
             raise DeploymentError(f"TeleImager reported invalid depth scale: {exc}") from exc
 
-        expected_calibration = (
-            None
-            if surface_normal_encoding is None
-            else surface_normal_encoding.camera_calibration
-        )
+        expected_calibration = None if surface_normal_encoding is None else surface_normal_encoding.camera_calibration
         if expected_calibration is not None:
             calibration_was_pinned = "calibration" not in head
             calibration_payload = (
-                _pinned_legacy_surface_normal_calibration(head)
-                if calibration_was_pinned
-                else head["calibration"]
+                _pinned_legacy_surface_normal_calibration(head) if calibration_was_pinned else head["calibration"]
             )
             try:
                 live_calibration = validate_realsense_rgbd_calibration(calibration_payload)
@@ -2129,9 +2225,7 @@ class TeleimagerCamera:
             else:
                 try:
                     self._client.enable_head_rgbd_stream()
-                    self._rgbd_subscriber = self._client._subscriber_manager._subscriber_threads[
-                        (host, atomic_port)
-                    ]
+                    self._rgbd_subscriber = self._client._subscriber_manager._subscriber_threads[(host, atomic_port)]
                     if not self._rgbd_subscriber.is_alive():
                         raise DeploymentError("atomic subscriber stopped during startup")
                     self._geometry_transport = "atomic"
@@ -2210,9 +2304,7 @@ class TeleimagerCamera:
                         depth_u16,
                         scale_m_per_unit=self._depth_scale_m_per_unit,
                         intrinsics=surface_normal_encoding.intrinsics,
-                        max_neighbor_depth_delta_m=(
-                            surface_normal_encoding.max_neighbor_depth_delta_m
-                        ),
+                        max_neighbor_depth_delta_m=(surface_normal_encoding.max_neighbor_depth_delta_m),
                         encoding_version=surface_normal_encoding.encoding_version,
                         depth_near_m=(
                             surface_normal_encoding.depth_near_m
@@ -2237,9 +2329,7 @@ class TeleimagerCamera:
         return CameraImages(
             rgb=images.rgb.copy(),
             depth_gray=None if images.depth_gray is None else images.depth_gray.copy(),
-            surface_normals=(
-                None if images.surface_normals is None else images.surface_normals.copy()
-            ),
+            surface_normals=(None if images.surface_normals is None else images.surface_normals.copy()),
             sequence=images.sequence,
         )
 
@@ -2258,44 +2348,32 @@ class TeleimagerCamera:
                 if not np.isfinite(measured_fps):
                     raise TimeoutError("TeleImager atomic RGBD stream FPS is not finite")
                 if measured_fps <= 0.0 and cached_images is None:
-                    raise TimeoutError(
-                        "TeleImager atomic RGBD stream has not established a live rolling FPS"
-                    )
+                    raise TimeoutError("TeleImager atomic RGBD stream has not established a live rolling FPS")
 
                 if frame is not None:
                     if frame.received_monotonic_ns is None:
-                        raise DeploymentError(
-                            "TeleImager atomic RGBD packet has no local receive timestamp"
-                        )
+                        raise DeploymentError("TeleImager atomic RGBD packet has no local receive timestamp")
                     received_ns = int(frame.received_monotonic_ns)
                     previous_sequence = getattr(self, "_last_rgbd_sequence", None)
                     previous_received_ns = getattr(self, "_last_rgbd_received_ns", None)
                     if previous_sequence is not None and frame.sequence < previous_sequence:
                         raise DeploymentError(
-                            "TeleImager atomic RGBD sequence regressed from "
-                            f"{previous_sequence} to {frame.sequence}"
+                            f"TeleImager atomic RGBD sequence regressed from {previous_sequence} to {frame.sequence}"
                         )
                     if previous_received_ns is not None and received_ns < previous_received_ns:
                         raise DeploymentError(
-                            "TeleImager atomic RGBD receive timestamp regressed; "
-                            "restart the policy runner"
+                            "TeleImager atomic RGBD receive timestamp regressed; restart the policy runner"
                         )
                     previous_capture_ns = getattr(self, "_last_rgbd_server_capture_ns", None)
                     if frame.sequence == previous_sequence:
                         if frame.server_capture_monotonic_ns != previous_capture_ns:
                             raise DeploymentError(
-                                "TeleImager atomic RGBD reused a sequence with different "
-                                "capture metadata"
+                                "TeleImager atomic RGBD reused a sequence with different capture metadata"
                             )
                         # Do not refresh the cached age when an identical packet is reread.
                     else:
-                        if (
-                            previous_capture_ns is not None
-                            and frame.server_capture_monotonic_ns <= previous_capture_ns
-                        ):
-                            raise DeploymentError(
-                                "TeleImager atomic RGBD server capture timestamp regressed"
-                            )
+                        if previous_capture_ns is not None and frame.server_capture_monotonic_ns <= previous_capture_ns:
+                            raise DeploymentError("TeleImager atomic RGBD server capture timestamp regressed")
                         rgb = _decode_color_jpeg_rgb(frame.color_jpeg, self.config)
                         depth_u16 = _decode_depth_png_u16(frame.aligned_depth_png)
                         depth_gray, surface_normals = self._encode_geometry(depth_u16)
@@ -2361,22 +2439,16 @@ class TeleimagerCamera:
                         else self._last_depth_received_ns is not None
                     )
                     if measured_fps[name] <= 0.0 and not has_cached_component:
-                        raise TimeoutError(
-                            f"TeleImager {name} stream has not established a live rolling FPS"
-                        )
+                        raise TimeoutError(f"TeleImager {name} stream has not established a live rolling FPS")
                     timestamp = getattr(frame, "received_monotonic_ns", None)
                     if timestamp is None:
                         payload = getattr(frame, "jpg", None)
                         if payload:
-                            raise DeploymentError(
-                                f"TeleImager {name} frame has no local receive timestamp"
-                            )
+                            raise DeploymentError(f"TeleImager {name} frame has no local receive timestamp")
                         continue
                     received_ns = int(timestamp)
                     previous_received_ns = (
-                        self._last_color_received_ns
-                        if name == "RGB"
-                        else self._last_depth_received_ns
+                        self._last_color_received_ns if name == "RGB" else self._last_depth_received_ns
                     )
                     if previous_received_ns is not None and received_ns < previous_received_ns:
                         raise DeploymentError(
@@ -2427,8 +2499,7 @@ class TeleimagerCamera:
                     self._reported_stream_fps = True
                     if not getattr(self, "_geometry_selection_logged", False):
                         LOGGER.info(
-                            "TeleImager geometry transport selected legacy RGB+depth at %.1f/%.1f "
-                            "measured FPS",
+                            "TeleImager geometry transport selected legacy RGB+depth at %.1f/%.1f measured FPS",
                             measured_fps["RGB"],
                             measured_fps["aligned-depth"],
                         )
@@ -2482,11 +2553,7 @@ class _G1Dex3CommandBackend:
 
     def _qualified_real_mode_machine(self) -> int:
         profile = getattr(self, "profile", DEX3_PROFILE)
-        return (
-            INSPIRE_FTP_REAL_MODE_MACHINE
-            if profile.name == "inspire-ftp"
-            else QUALIFIED_REAL_MODE_MACHINE
-        )
+        return INSPIRE_FTP_REAL_MODE_MACHINE if profile.name == "inspire-ftp" else QUALIFIED_REAL_MODE_MACHINE
 
     def _uses_mode5_waist_hold(self) -> bool:
         profile = getattr(self, "profile", DEX3_PROFILE)
@@ -2497,9 +2564,7 @@ class _G1Dex3CommandBackend:
         state: RobotState,
     ) -> tuple[np.ndarray, np.ndarray]:
         if state.waist is None or state.waist_dq is None:
-            raise DeploymentError(
-                "Mode-5 Inspire FTP requires measured waist q/dq for joints 12-14"
-            )
+            raise DeploymentError("Mode-5 Inspire FTP requires measured waist q/dq for joints 12-14")
         waist = np.asarray(state.waist, dtype=np.float64)
         waist_dq = np.asarray(state.waist_dq, dtype=np.float64)
         if waist.shape != (3,) or waist_dq.shape != (3,):
@@ -2664,8 +2729,7 @@ class _G1Dex3CommandBackend:
         )
         if self._waist_indices and self._waist_indices != INSPIRE_FTP_WAIST_INDICES:
             raise DeploymentError(
-                f"Unexpected mode-5 waist indices {self._waist_indices}; "
-                f"expected {INSPIRE_FTP_WAIST_INDICES}"
+                f"Unexpected mode-5 waist indices {self._waist_indices}; expected {INSPIRE_FTP_WAIST_INDICES}"
             )
         arm_topic = "rt/lowcmd" if self.simulation else "rt/arm_sdk"
 
@@ -2776,6 +2840,12 @@ class _G1Dex3CommandBackend:
                 command.kd = 0.2
 
     def _validate_runtime_state(self, state: RobotState) -> RobotState:
+        debug_sampler = getattr(self, "_action_debug_sampler", None)
+        if debug_sampler is not None:
+            # Retain the already-read feedback; diagnostics never request an
+            # extra DDS read or wait on the reader from the publisher tick.
+            with contextlib.suppress(BaseException):
+                debug_sampler.state = state
         qualified_mode = self._qualified_real_mode_machine()
         if not self.simulation and state.mode_machine != qualified_mode:
             raise DeploymentError(
@@ -2828,9 +2898,7 @@ class _G1Dex3CommandBackend:
     def _validate_prearm_takeover_state(self, state: RobotState) -> None:
         """Apply the existing pre-arm limits to a prospective takeover sample."""
 
-        arm_received_at = (
-            state.captured_at if state.arm_received_at is None else state.arm_received_at
-        )
+        arm_received_at = state.captured_at if state.arm_received_at is None else state.arm_received_at
         arm_age = time.monotonic() - arm_received_at
         if not np.isfinite(arm_age) or not 0.0 <= arm_age <= PREARM_STATE_MAX_AGE_S:
             raise DeploymentError(
@@ -2878,16 +2946,11 @@ class _G1Dex3CommandBackend:
             deadline = time.monotonic() + PREARM_STATIONARY_DWELL_S
             while time.monotonic() < deadline:
                 state = self._validate_runtime_state(self.reader.read(timeout_s=0.1))
-                arm_received_at = (
-                    state.captured_at
-                    if state.arm_received_at is None
-                    else state.arm_received_at
-                )
+                arm_received_at = state.captured_at if state.arm_received_at is None else state.arm_received_at
                 arm_age = time.monotonic() - arm_received_at
                 if arm_age > PREARM_STATE_MAX_AGE_S:
                     raise DeploymentError(
-                        f"Arm state age is {arm_age:.3f}s; "
-                        f"PREARM_STATE_MAX_AGE_S={PREARM_STATE_MAX_AGE_S:.3f}s"
+                        f"Arm state age is {arm_age:.3f}s; PREARM_STATE_MAX_AGE_S={PREARM_STATE_MAX_AGE_S:.3f}s"
                     )
                 joint = int(np.argmax(np.abs(state.arm_dq)))
                 velocity = float(state.arm_dq[joint])
@@ -2941,9 +3004,7 @@ class _G1Dex3CommandBackend:
                 INSPIRE_FTP_WAIST_KP,
                 INSPIRE_FTP_WAIST_KD,
             )
-        self._arm_message.mode_machine = (
-            state.mode_machine if self.simulation else self._qualified_real_mode_machine()
-        )
+        self._arm_message.mode_machine = state.mode_machine if self.simulation else self._qualified_real_mode_machine()
         self.set_target(state.arm, state.left_hand, state.right_hand)
         return state
 
@@ -2984,12 +3045,8 @@ class _G1Dex3CommandBackend:
         if writer is None:
             raise DeploymentError("Inspire DFX command writer was not constructed")
         completed_at, written_left, written_right = writer.refresh_last_successful()
-        self._left_hand_publish_history.append(
-            PublishedHandTarget(completed_at, written_left)
-        )
-        self._right_hand_publish_history.append(
-            PublishedHandTarget(completed_at, written_right)
-        )
+        self._left_hand_publish_history.append(PublishedHandTarget(completed_at, written_left))
+        self._right_hand_publish_history.append(PublishedHandTarget(completed_at, written_right))
 
     def _write_arm_message(
         self,
@@ -3031,9 +3088,7 @@ class _G1Dex3CommandBackend:
             if timing_enabled:
                 timing["arm_write"] = (time.monotonic_ns() - started_ns) / 1e6
         if write_ok is not True:
-            raise DeploymentError(
-                f"Arm DDS Write failed; DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
-            )
+            raise DeploymentError(f"Arm DDS Write failed; DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s")
         self._has_published = True
 
     def _publish_arm(
@@ -3056,9 +3111,7 @@ class _G1Dex3CommandBackend:
             or not np.isfinite(float(gravity_scale))
             or not 0.0 <= float(gravity_scale) <= 1.0
         ):
-            raise DeploymentError(
-                f"gravity_scale must be finite and inside [0, 1], got {gravity_scale!r}"
-            )
+            raise DeploymentError(f"gravity_scale must be finite and inside [0, 1], got {gravity_scale!r}")
         gravity_scale = float(gravity_scale)
         candidate_q = self._arm_target.copy()
         if self._arm_gravity is None:
@@ -3083,6 +3136,12 @@ class _G1Dex3CommandBackend:
         # is no longer usable.  The cached pair is exactly what DDS accepted.
         self._last_published_arm_q = candidate_q
         self._last_published_arm_tau = gravity_tau
+        debug_sampler = getattr(self, "_action_debug_sampler", None)
+        if debug_sampler is not None:
+            self._action_debug_arm_completed_at = time.monotonic()
+            if not getattr(self, "_action_debug_full_publish", False):
+                with contextlib.suppress(BaseException):
+                    debug_sampler.sample(self)
 
     def _publish_last_arm_for_release(self) -> None:
         """Write the last successful q/tau while changing only authority weight."""
@@ -3095,6 +3154,11 @@ class _G1Dex3CommandBackend:
             command.tau = float(self._last_published_arm_tau[offset])
         self._apply_waist_hold_target()
         self._write_arm_message(require_qualified_state=False)
+        debug_sampler = getattr(self, "_action_debug_sampler", None)
+        if debug_sampler is not None:
+            self._action_debug_arm_completed_at = time.monotonic()
+            with contextlib.suppress(BaseException):
+                debug_sampler.sample(self)
 
     def _publish_hands(self) -> None:
         # Snapshot canonical-order targets before either Write. History is
@@ -3145,9 +3209,7 @@ class _G1Dex3CommandBackend:
                     # successful-Write history before propagating the right-side
                     # failure into the ordinary fail-closed release path. A
                     # successful DDS Write is not a bridge/device acknowledgement.
-                    self._left_hand_publish_history.append(
-                        PublishedHandTarget(exc.left_completed_at, exc.left)
-                    )
+                    self._left_hand_publish_history.append(PublishedHandTarget(exc.left_completed_at, exc.left))
                     raise
             finally:
                 if timing_enabled:
@@ -3155,12 +3217,8 @@ class _G1Dex3CommandBackend:
                     timing["hands_write"] = elapsed_ms
                     timing["left_write"] = elapsed_ms
                     timing["right_write"] = elapsed_ms
-            self._left_hand_publish_history.append(
-                PublishedHandTarget(result.left_completed_at, result.left)
-            )
-            self._right_hand_publish_history.append(
-                PublishedHandTarget(result.right_completed_at, result.right)
-            )
+            self._left_hand_publish_history.append(PublishedHandTarget(result.left_completed_at, result.left))
+            self._right_hand_publish_history.append(PublishedHandTarget(result.right_completed_at, result.right))
             return
         left_command = left_target
         right_command = right_target
@@ -3180,9 +3238,7 @@ class _G1Dex3CommandBackend:
             if timing_enabled:
                 timing["left_write"] = (time.monotonic_ns() - started_ns) / 1e6
         if left_ok is not True:
-            raise DeploymentError(
-                f"Left Dex3 DDS Write failed; DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
-            )
+            raise DeploymentError(f"Left Dex3 DDS Write failed; DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s")
         self._left_hand_publish_history.append(PublishedHandTarget(completed_at=time.monotonic(), target=left_target))
         started_ns = time.monotonic_ns()
         try:
@@ -3191,9 +3247,7 @@ class _G1Dex3CommandBackend:
             if timing_enabled:
                 timing["right_write"] = (time.monotonic_ns() - started_ns) / 1e6
         if right_ok is not True:
-            raise DeploymentError(
-                f"Right Dex3 DDS Write failed; DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
-            )
+            raise DeploymentError(f"Right Dex3 DDS Write failed; DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s")
         self._right_hand_publish_history.append(PublishedHandTarget(completed_at=time.monotonic(), target=right_target))
 
     def _stop_hands(self, phase_callback: Any | None = None) -> None:
@@ -3221,12 +3275,10 @@ class _G1Dex3CommandBackend:
             if phase_callback is not None:
                 phase_callback("inspire_ftp_publishers_close_begin", {})
             left_dds_write_completed = bool(
-                self._hand_writer is not None
-                and getattr(self._hand_writer, "left_has_written", False)
+                self._hand_writer is not None and getattr(self._hand_writer, "left_has_written", False)
             )
             right_dds_write_completed = bool(
-                self._hand_writer is not None
-                and getattr(self._hand_writer, "right_has_written", False)
+                self._hand_writer is not None and getattr(self._hand_writer, "right_has_written", False)
             )
             started = time.monotonic()
             if self._hand_writer is not None:
@@ -3240,9 +3292,7 @@ class _G1Dex3CommandBackend:
                         "motor_stop_acknowledged": False,
                         "left_dds_write_completed": left_dds_write_completed,
                         "right_dds_write_completed": right_dds_write_completed,
-                        "assume_written_setpoint_may_persist": (
-                            left_dds_write_completed or right_dds_write_completed
-                        ),
+                        "assume_written_setpoint_may_persist": (left_dds_write_completed or right_dds_write_completed),
                     },
                 )
             if left_dds_write_completed or right_dds_write_completed:
@@ -3283,14 +3333,10 @@ class _G1Dex3CommandBackend:
             started = time.monotonic()
             try:
                 if publisher.Write(message, timeout=DDS_WRITE_TIMEOUT_S) is not True:
-                    failures.append(
-                        f"{name} Dex3 stop Write failed; "
-                        f"DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
-                    )
+                    failures.append(f"{name} Dex3 stop Write failed; DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s")
             except Exception as exc:
                 failures.append(
-                    f"{name} Dex3 stop Write raised {exc!r}; "
-                    f"DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
+                    f"{name} Dex3 stop Write raised {exc!r}; DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
                 )
             finally:
                 if phase_callback is not None:
@@ -3303,15 +3349,24 @@ class _G1Dex3CommandBackend:
 
     def publish(self) -> None:
         timing_enabled = getattr(self, "_authority_ramp_timing_enabled", False)
+        debug_sampler = getattr(self, "_action_debug_sampler", None)
+        if debug_sampler is not None:
+            self._action_debug_full_publish = True
         if timing_enabled:
             self._last_publish_timing_ms = {}
         started_ns = time.monotonic_ns()
+        publish_ok = False
         try:
             self._publish_arm()
             self._publish_hands()
+            publish_ok = True
         finally:
             if timing_enabled:
                 self._last_publish_timing_ms["publish_total"] = (time.monotonic_ns() - started_ns) / 1e6
+            if debug_sampler is not None:
+                self._action_debug_full_publish = False
+                with contextlib.suppress(BaseException):
+                    debug_sampler.sample(self, publish_ok=publish_ok)
 
     def set_weight(self, weight: float) -> None:
         self._weight = float(np.clip(weight, 0.0, 1.0))
@@ -3336,9 +3391,7 @@ class _G1Dex3CommandBackend:
         start_weight = self._weight
         period = 1.0 / PUBLISH_HZ
         profile = getattr(self, "profile", DEX3_PROFILE)
-        refresh_hand_lease = (
-            profile.name == "inspire-dfx" and self._inspire_hand_lease_active()
-        )
+        refresh_hand_lease = profile.name == "inspire-dfx" and self._inspire_hand_lease_active()
         # Preserve one constant weight-slope across both normal full-authority
         # shutdowns and faults during acquisition.  A fault after only a tiny
         # amount of authority was acquired must not keep a suspect command
@@ -3353,8 +3406,7 @@ class _G1Dex3CommandBackend:
         last_successful_weight = start_weight
         # Release does not depend on policy, camera, fresh state, or IK.
         LOGGER.info(
-            "Arm authority release started at weight %.4f: scheduled ramp %.3fs "
-            "(full-weight ramp %.3fs)",
+            "Arm authority release started at weight %.4f: scheduled ramp %.3fs (full-weight ramp %.3fs)",
             start_weight,
             duration,
             full_weight_duration,
@@ -3373,17 +3425,20 @@ class _G1Dex3CommandBackend:
             if now < next_write_at:
                 time.sleep(next_write_at - now)
             cycle_started = time.monotonic()
-            progress = 1.0 if start_weight == 0.0 else min(
-                1.0,
-                (cycle_started - ramp_started + period) / duration,
+            progress = (
+                1.0
+                if start_weight == 0.0
+                else min(
+                    1.0,
+                    (cycle_started - ramp_started + period) / duration,
+                )
             )
             self.set_weight(start_weight * (1.0 - progress))
             try:
                 self._publish_last_arm_for_release()
             except Exception as exc:
                 failures.append(
-                    f"arm_sdk authority release failed: {exc}; "
-                    f"DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
+                    f"arm_sdk authority release failed: {exc}; DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
                 )
                 break
             if refresh_hand_lease:
@@ -3418,14 +3473,11 @@ class _G1Dex3CommandBackend:
                     try:
                         self._refresh_last_successful_hands_for_release()
                     except Exception as exc:
-                        failures.append(
-                            f"Inspire DFX final lease refresh during arm release failed: {exc}"
-                        )
+                        failures.append(f"Inspire DFX final lease refresh during arm release failed: {exc}")
                         refresh_hand_lease = False
             except Exception as exc:
                 failures.append(
-                    f"final zero-weight arm_sdk Write failed: {exc}; "
-                    f"DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
+                    f"final zero-weight arm_sdk Write failed: {exc}; DDS_WRITE_TIMEOUT_S={DDS_WRITE_TIMEOUT_S:.3f}s"
                 )
         arm_release_s = time.monotonic() - ramp_started
         LOGGER.info(
@@ -3852,11 +3904,14 @@ def _wait_for_initialization_start(
                     distinct_samples = 0
                     last_capture = float("-inf")
                 assert stationary_reference is not None
-                if _position_drift(
-                    latest,
-                    stationary_reference,
-                    include_hands=require_hand_tracking,
-                ) > INITIALIZATION_MAX_POSITION_DRIFT_RAD:
+                if (
+                    _position_drift(
+                        latest,
+                        stationary_reference,
+                        include_hands=require_hand_tracking,
+                    )
+                    > INITIALIZATION_MAX_POSITION_DRIFT_RAD
+                ):
                     stationary_since = now
                     stationary_reference = latest
                     distinct_samples = 0
@@ -3909,6 +3964,12 @@ def _execute_initialization(
 ) -> bool:
     """Execute and verify one bounded initialization path in the DDS owner."""
 
+    debug_sampler = getattr(backend, "_action_debug_sampler", None)
+    if debug_sampler is not None:
+        with contextlib.suppress(BaseException):
+            debug_sampler.context = {"phase": "guarded_transition", "transition": context}
+            debug_sampler.raw_action = None
+            debug_sampler.desired = None
     period = 1.0 / PUBLISH_HZ
     path_index = 0
     endpoint_deadline: float | None = None
@@ -3993,11 +4054,14 @@ def _execute_initialization(
                     distinct_converged_samples = 0
                     last_converged_capture = float("-inf")
                 assert converged_reference is not None
-                if _position_drift(
-                    state,
-                    converged_reference,
-                    include_hands=require_hand_tracking,
-                ) > INITIALIZATION_MAX_POSITION_DRIFT_RAD:
+                if (
+                    _position_drift(
+                        state,
+                        converged_reference,
+                        include_hands=require_hand_tracking,
+                    )
+                    > INITIALIZATION_MAX_POSITION_DRIFT_RAD
+                ):
                     converged_since = now
                     converged_reference = state
                     distinct_converged_samples = 0
@@ -4220,9 +4284,7 @@ def _ramp_real_arm_authority(
             )
         initial_freshness = hand_freshness_gate.check(takeover_state)
         if not initial_freshness.ready:
-            raise DeploymentError(
-                f"{profile.name} feedback became stale before arm authority acquisition"
-            )
+            raise DeploymentError(f"{profile.name} feedback became stale before arm authority acquisition")
         backend._reseed_inspire_hands_before_first_write(takeover_state)
     if stop_event.is_set():
         LOGGER.info("Arm takeover cancelled after the final state guard")
@@ -4350,9 +4412,7 @@ def _ramp_real_arm_authority(
                 )
         _enforce_arm_tracking(backend, state, context="matched-pose takeover settle")
         now = time.monotonic()
-        arm_received_at = (
-            state.captured_at if state.arm_received_at is None else state.arm_received_at
-        )
+        arm_received_at = state.captured_at if state.arm_received_at is None else state.arm_received_at
         if now - arm_received_at > ACTUATOR_ARM_STATE_MAX_AGE_S:
             raise DeploymentError("Arm state is not fresh enough to verify arm takeover")
         last_arm_error = float(np.max(np.abs(state.arm - backend._arm_target)))
@@ -4371,11 +4431,14 @@ def _ramp_real_arm_authority(
                 distinct_samples = 0
                 last_arm_received_at = float("-inf")
             assert stationary_reference is not None
-            if _position_drift(
-                state,
-                stationary_reference,
-                include_hands=False,
-            ) > INITIALIZATION_MAX_POSITION_DRIFT_RAD:
+            if (
+                _position_drift(
+                    state,
+                    stationary_reference,
+                    include_hands=False,
+                )
+                > INITIALIZATION_MAX_POSITION_DRIFT_RAD
+            ):
                 stationary_since = now
                 stationary_reference = state
                 distinct_samples = 0
@@ -4445,6 +4508,8 @@ def _actuator_main(
     gravity_feedforward: bool = True,
     hand_pause_generation: Any | None = None,
     end_effector: str = "dex3",
+    action_interpolation: str = "legacy",
+    action_debug_sink: Any | None = None,
 ) -> None:
     if run_log_dir is not None:
         configure_process_logging(Path(run_log_dir) / "actuator.log")
@@ -4482,9 +4547,17 @@ def _actuator_main(
         _status(status_queue, "stopped")
         return
 
+    if action_interpolation not in {"legacy", "linear"} or (
+        action_interpolation != "legacy" and command_conditioning != "xr"
+    ):
+        _status(status_queue, "fault", "Action interpolation must be legacy or linear; linear requires XR conditioning")
+        _status(status_queue, "stopped")
+        return
+
     last_sequence = 0
     tracking_checks_after = float("inf")
     conditioner: XrPolicyOutputConditioner | None = None
+    debug_sampler: ActionDebugSampler | None = None
     # The spawned actuator process must never perform terminal/file I/O from
     # its 100 Hz loop. Parent-owned statuses and the active timing ring retain
     # the same diagnostics without blocking command publication.
@@ -4544,12 +4617,15 @@ def _actuator_main(
                 gravity_feedforward=False,
             )
         backend._authority_ramp_timing_enabled = authority_ramp_diagnostics or dds_hold_diagnostics
+        if action_debug_sink is not None:
+            # The writer belongs to the parent. Never spawn/join a diagnostic
+            # process or run JSON/file I/O in this independent actuator.
+            with contextlib.suppress(BaseException):
+                action_debug_sink.detach_at_process_exit()
+                debug_sampler = ActionDebugSampler(action_debug_sink, profile, ARM_JOINT_NAMES)
+                backend._action_debug_sampler = debug_sampler
         if command_conditioning == "xr":
-            conditioner = (
-                XrPolicyOutputConditioner()
-                if profile.name == "dex3"
-                else XrPolicyOutputConditioner(profile)
-            )
+            conditioner = XrPolicyOutputConditioner() if profile.name == "dex3" else XrPolicyOutputConditioner(profile)
         _status(status_queue, "ready")
 
         # Publishers now exist but no message has been written.  Wait for the
@@ -4605,6 +4681,9 @@ def _actuator_main(
         # Initialization is a mandatory state transition.  Until the parent
         # requests it, hold the measured target while keeping every watchdog
         # active.  Policy chunks are structurally rejected in this phase.
+        if debug_sampler is not None:
+            with contextlib.suppress(BaseException):
+                debug_sampler.context = {"phase": "initialization_and_preinitialization_hold"}
         while not stop_event.is_set():
             loop_started = time.monotonic()
             if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
@@ -4734,6 +4813,7 @@ def _actuator_main(
         rtc_mode = False
         rtc_total_actions = 0
         rtc_action_budget = 0
+        reference_sampler = PolicyReferenceSampler() if action_interpolation == "linear" else None
         last_discontinued_sequence: int | None = None
         pending_replan_detail: dict[str, Any] | None = None
         replan_freeze_active = False
@@ -4748,6 +4828,23 @@ def _actuator_main(
         backend._authority_ramp_timing_enabled = True
 
         def publish_active() -> None:
+            if debug_sampler is not None:
+                with contextlib.suppress(BaseException):
+                    debug_sampler.context = {
+                        "phase": "active", "sequence": chunk_sequence,
+                        "next_action_index": chunk_index,
+                        "chunk_length": None if chunk is None else chunk.length,
+                        "rtc": rtc_mode, "rtc_total_actions": rtc_total_actions,
+                        "rtc_action_budget": rtc_action_budget, "holding": holding,
+                        "replan_freeze_active": replan_freeze_active,
+                        "next_action_at": next_action_at,
+                        "action_interpolation": action_interpolation,
+                    }
+                    debug_sampler.desired = None if conditioner is None else {
+                        "arm": conditioner._desired_arm,
+                        "left_hand": conditioner._desired_left,
+                        "right_hand": conditioner._desired_right,
+                    }
             publish_started_ns = time.monotonic_ns()
             try:
                 backend.publish()
@@ -4764,11 +4861,7 @@ def _actuator_main(
 
         while not stop_event.is_set():
             loop_started = time.monotonic()
-            replan_loop_gap_s = (
-                None
-                if replan_last_loop_started is None
-                else loop_started - replan_last_loop_started
-            )
+            replan_loop_gap_s = None if replan_last_loop_started is None else loop_started - replan_last_loop_started
             if pending_replan_detail is not None:
                 replan_last_loop_started = loop_started
             active_timing.begin(
@@ -4810,8 +4903,7 @@ def _actuator_main(
                 state,
                 status_queue,
                 context=(
-                    f"active sequence={chunk_sequence} next_action_index={chunk_index} "
-                    f"rtc={rtc_mode} holding={holding}"
+                    f"active sequence={chunk_sequence} next_action_index={chunk_index} rtc={rtc_mode} holding={holding}"
                 ),
             )
             active_timing.note_freshness(freshness)
@@ -4861,9 +4953,7 @@ def _actuator_main(
                     pending_hand_replan_detail is not None or pending_replan_detail is not None
                 ):
                     terminal_detail = dict(
-                        pending_hand_replan_detail
-                        if pending_hand_replan_detail is not None
-                        else pending_replan_detail
+                        pending_hand_replan_detail if pending_hand_replan_detail is not None else pending_replan_detail
                     )
                     terminal_detail.update(
                         reason="hand_state_operator_hold",
@@ -4946,10 +5036,7 @@ def _actuator_main(
                 continue
 
             if pending_replan_detail is not None:
-                if (
-                    replan_loop_gap_s is not None
-                    and replan_loop_gap_s <= ACTION_REPLAN_RECOVERY_MAX_LOOP_GAP_S
-                ):
+                if replan_loop_gap_s is not None and replan_loop_gap_s <= ACTION_REPLAN_RECOVERY_MAX_LOOP_GAP_S:
                     replan_stable_samples += 1
                 else:
                     replan_stable_samples = 0
@@ -5028,13 +5115,16 @@ def _actuator_main(
                     _status(status_queue, "holding", last_sequence)
                     continue
 
-                if kind == "warmup_pose":
+                if kind in {
+                    "warmup_pose",
+                    "warmup1_pose",
+                    "return_to_start_pose",
+                    "return_to_start_warmup1_pose",
+                }:
                     if not isinstance(command, tuple) or len(command) != 3:
                         raise DeploymentError("Malformed guarded warmup-pose command")
                     if chunk is not None or not holding:
-                        raise DeploymentError(
-                            "Guarded warmup pose requires an acknowledged hold with no active chunk"
-                        )
+                        raise DeploymentError("Guarded warmup pose requires an acknowledged hold with no active chunk")
                     _, created_at, warmup_pose = command
                     if not isinstance(warmup_pose, InitializationSpec):
                         raise DeploymentError("Malformed guarded warmup-pose target")
@@ -5065,11 +5155,10 @@ def _actuator_main(
                         left_hand=backend._left_target.copy(),
                         right_hand=backend._right_target.copy(),
                     )
-                    warmup_pose_chunk = build_initialization_chunk(
+                    warmup_pose_chunk = _build_guarded_warmup_pose_chunk(
                         command_start,
                         warmup_pose,
-                        allow_training_start=True,
-                        allow_startup_settle=True,
+                        command_kind=kind,
                     )
                     _status(
                         status_queue,
@@ -5123,9 +5212,7 @@ def _actuator_main(
                             "warm_start_invalidated",
                             {
                                 "expected_generation": expected_pause_generation,
-                                "current_generation": _hand_pause_generation_value(
-                                    hand_pause_generation
-                                ),
+                                "current_generation": _hand_pause_generation_value(hand_pause_generation),
                             },
                         )
                         continue
@@ -5214,28 +5301,22 @@ def _actuator_main(
                             continue
                         _status(status_queue, "rtc_rejected", "snapshot has no matching active plan")
                         continue
-                    if chunk_index >= chunk.length:
-                        state = backend.state()
-                        _set_powered_hold_target(backend, conditioner, hand_watchdog, state)
-                        tracking_checks_after = time.monotonic()
-                        terminal_kind = "rtc_completed" if rtc_total_actions >= rtc_action_budget else "rtc_underrun"
-                        _status(status_queue, terminal_kind, rtc_total_actions)
-                        chunk = None
-                        chunk_index = 0
-                        rtc_mode = False
-                        holding = True
-                        continue
-                    _status(
-                        status_queue,
-                        "rtc_snapshot",
-                        {
-                            "sequence": chunk_sequence,
-                            "action_index": chunk_index,
-                            "plan_length": chunk.length,
-                            "total_actions": rtc_total_actions,
-                            "action_budget": rtc_action_budget,
-                        },
-                    )
+                    if chunk_index < chunk.length:
+                        _status(
+                            status_queue,
+                            "rtc_snapshot",
+                            {
+                                "sequence": chunk_sequence,
+                                "action_index": chunk_index,
+                                "plan_length": chunk.length,
+                                "total_actions": rtc_total_actions,
+                                "action_budget": rtc_action_budget,
+                            },
+                        )
+                    # An exhausted plan can still be inside its final action
+                    # interval. Let the scheduler below finish that interval;
+                    # its terminal status also satisfies the parent's pending
+                    # snapshot wait. Keep publishing and checking safety meanwhile.
                     # Do not continue: an action that is due in this publisher
                     # iteration must still advance after the snapshot.  The
                     # replacement path accounts for that action in its child-
@@ -5285,9 +5366,7 @@ def _actuator_main(
                                 "rtc_action_budget": int(action_budget),
                                 "plan_installed": False,
                                 "expected_generation": expected_pause_generation,
-                                "current_generation": _hand_pause_generation_value(
-                                    hand_pause_generation
-                                ),
+                                "current_generation": _hand_pause_generation_value(hand_pause_generation),
                             },
                         )
                         continue
@@ -5326,6 +5405,14 @@ def _actuator_main(
                     replan_freeze_active = False
                     _status(status_queue, "rtc_started", sequence)
 
+                elif kind == "rtc_replace" and rtc_mode and rtc_total_actions >= rtc_action_budget:
+                    if not isinstance(command, tuple) or len(command) != 10:
+                        raise DeploymentError("Malformed RTC replacement command")
+                    # The final target has been issued, not necessarily held
+                    # for its full scheduled interval. Consume this response
+                    # without replacing anything; the scheduler emits completion
+                    # at next_action_at. Do not skip the safety/publication path.
+
                 elif kind == "rtc_replace":
                     if not isinstance(command, tuple) or len(command) != 10:
                         raise DeploymentError("Malformed RTC replacement command")
@@ -5350,16 +5437,6 @@ def _actuator_main(
                                 "sequence": expected_sequence,
                             },
                         )
-                        continue
-                    if rtc_mode and rtc_total_actions >= rtc_action_budget:
-                        state = backend.state()
-                        _set_powered_hold_target(backend, conditioner, hand_watchdog, state)
-                        chunk = None
-                        chunk_index = 0
-                        rtc_mode = False
-                        holding = True
-                        tracking_checks_after = time.monotonic()
-                        _status(status_queue, "rtc_completed", rtc_total_actions)
                         continue
                     stale = (
                         not rtc_mode
@@ -5421,7 +5498,12 @@ def _actuator_main(
                         _status(status_queue, "rtc_rejected", f"invalid replacement plan: {exc}")
                         continue
                     elapsed_actions = chunk_index - request_index
-                    if elapsed_actions >= expected_overlap or elapsed_actions >= replacement.length:
+                    if chunk_index >= chunk.length:
+                        # A valid response arrived after the final old target
+                        # was issued. The normal scheduler reports underrun only
+                        # after that target's interval ends, just as for snapshot.
+                        pass
+                    elif elapsed_actions >= expected_overlap or elapsed_actions >= replacement.length:
                         state = backend.state()
                         _set_powered_hold_target(backend, conditioner, hand_watchdog, state)
                         chunk = None
@@ -5440,45 +5522,46 @@ def _actuator_main(
                         )
                         continue
 
-                    suffix = ActionChunk(
-                        arm=np.ascontiguousarray(replacement.arm[elapsed_actions:]),
-                        left_hand=np.ascontiguousarray(replacement.left_hand[elapsed_actions:]),
-                        right_hand=np.ascontiguousarray(replacement.right_hand[elapsed_actions:]),
-                        end_effector=profile.name,
-                    )
-                    try:
-                        _validate_policy_target_input(
-                            suffix,
-                            backend._arm_target,
-                            backend._left_target,
-                            backend._right_target,
-                            conditioner,
-                            context="RTC handoff",
+                    else:
+                        suffix = ActionChunk(
+                            arm=np.ascontiguousarray(replacement.arm[elapsed_actions:]),
+                            left_hand=np.ascontiguousarray(replacement.left_hand[elapsed_actions:]),
+                            right_hand=np.ascontiguousarray(replacement.right_hand[elapsed_actions:]),
+                            end_effector=profile.name,
                         )
-                    except DeploymentError as exc:
-                        state = backend.state()
-                        _set_powered_hold_target(backend, conditioner, hand_watchdog, state)
-                        chunk = None
-                        chunk_index = 0
-                        rtc_mode = False
-                        holding = True
-                        tracking_checks_after = time.monotonic()
-                        _status(status_queue, "rtc_rejected", f"unsafe handoff boundary: {exc}")
-                        continue
-                    chunk = replacement
-                    chunk_sequence = int(sequence)
-                    chunk_index = elapsed_actions
-                    last_sequence = sequence
-                    holding = False
-                    _status(
-                        status_queue,
-                        "rtc_replaced",
-                        {
-                            "sequence": sequence,
-                            "action_index": elapsed_actions,
-                            "previous_sequence": expected_sequence,
-                        },
-                    )
+                        try:
+                            _validate_policy_target_input(
+                                suffix,
+                                backend._arm_target,
+                                backend._left_target,
+                                backend._right_target,
+                                conditioner,
+                                context="RTC handoff",
+                            )
+                        except DeploymentError as exc:
+                            state = backend.state()
+                            _set_powered_hold_target(backend, conditioner, hand_watchdog, state)
+                            chunk = None
+                            chunk_index = 0
+                            rtc_mode = False
+                            holding = True
+                            tracking_checks_after = time.monotonic()
+                            _status(status_queue, "rtc_rejected", f"unsafe handoff boundary: {exc}")
+                            continue
+                        chunk = replacement
+                        chunk_sequence = int(sequence)
+                        chunk_index = elapsed_actions
+                        last_sequence = sequence
+                        holding = False
+                        _status(
+                            status_queue,
+                            "rtc_replaced",
+                            {
+                                "sequence": sequence,
+                                "action_index": elapsed_actions,
+                                "previous_sequence": expected_sequence,
+                            },
+                        )
 
                 elif not isinstance(command, tuple) or len(command) not in {6, 7} or kind != "chunk":
                     raise DeploymentError(f"Unexpected or malformed actuator command {kind!r}")
@@ -5513,9 +5596,7 @@ def _actuator_main(
                                 "rtc": False,
                                 "plan_installed": False,
                                 "expected_generation": expected_pause_generation,
-                                "current_generation": _hand_pause_generation_value(
-                                    hand_pause_generation
-                                ),
+                                "current_generation": _hand_pause_generation_value(hand_pause_generation),
                             },
                         )
                         continue
@@ -5667,6 +5748,15 @@ def _actuator_main(
                     raw_arm = chunk.arm[chunk_index]
                     raw_left = chunk.left_hand[chunk_index]
                     raw_right = chunk.right_hand[chunk_index]
+                    if debug_sampler is not None:
+                        with contextlib.suppress(BaseException):
+                            debug_sampler.scheduled(
+                                raw_arm, raw_left, raw_right, sequence=chunk_sequence,
+                                action_index=chunk_index, scheduled_at=next_action_at,
+                                consumed_at=now, lateness_s=scheduler_lateness_s,
+                                stage="selected_before_conditioning",
+                                rtc=rtc_mode, rtc_total_actions=rtc_total_actions,
+                            )
                     raw_arm_step_rad = float(np.max(np.abs(raw_arm - backend._arm_target)))
                     raw_left_step_rad = float(np.max(np.abs(raw_left - backend._left_target)))
                     raw_right_step_rad = float(np.max(np.abs(raw_right - backend._right_target)))
@@ -5693,6 +5783,25 @@ def _actuator_main(
                             raw_right,
                             now=now,
                         )
+                        if reference_sampler is not None:
+                            # Endpoints are copied for this one scheduled interval.
+                            # RTC replacement cannot change an in-flight segment.
+                            # Do not anticipate an action past the authorized budget.
+                            lookahead = chunk_index + 1
+                            if lookahead >= chunk.length or (
+                                rtc_mode and rtc_action_budget - rtc_total_actions <= 1
+                            ):
+                                lookahead = chunk_index
+                            reference_sampler.start_segment(
+                                np.concatenate((raw_arm, raw_left, raw_right)),
+                                np.concatenate((
+                                    chunk.arm[lookahead],
+                                    chunk.left_hand[lookahead],
+                                    chunk.right_hand[lookahead],
+                                )),
+                                starts_at=next_action_at,
+                                period_s=action_period,
+                            )
                     chunk_index += 1
                     if rtc_mode:
                         rtc_total_actions += 1
@@ -5758,6 +5867,17 @@ def _actuator_main(
                     active_timing.update(tracking_ms=(time.monotonic_ns() - tracking_started) / 1e6)
 
             if conditioner is not None and not holding and not replan_freeze_active:
+                if reference_sampler is not None:
+                    if chunk is not None:
+                        reference = reference_sampler.sample(now)
+                        conditioner.set_desired(
+                            reference[:ARM_DOF],
+                            reference[ARM_DOF:ARM_DOF + profile.hand_dof],
+                            reference[ARM_DOF + profile.hand_dof:],
+                            now=now,
+                        )
+                    else:
+                        reference_sampler.reset()
                 conditioner_started = time.monotonic_ns()
                 previous_arm = backend._arm_target.copy()
                 previous_left = backend._left_target.copy()
@@ -5816,11 +5936,15 @@ def _actuator_main(
             try:
                 _status(status_queue, kind, payload)
             except BaseException as status_exc:
-                cleanup_reporting_errors.append(
-                    f"status {kind!r} failed: {type(status_exc).__name__}: {status_exc}"
-                )
+                cleanup_reporting_errors.append(f"status {kind!r} failed: {type(status_exc).__name__}: {status_exc}")
 
         if backend is not None:
+            if debug_sampler is not None:
+                with contextlib.suppress(BaseException):
+                    debug_sampler.context = {"phase": "authority_release"}
+                    debug_sampler.raw_action = None
+                    debug_sampler.desired = None
+
             def cleanup_phase(event: str, payload: dict[str, Any]) -> None:
                 cleanup_status("cleanup_phase", {"event": event, **payload})
 
@@ -5852,6 +5976,9 @@ def _actuator_main(
 
         # Everything below is post-release diagnostics. No logging or status
         # serialization above is allowed to bypass backend release/close.
+        if debug_sampler is not None:
+            with contextlib.suppress(BaseException):
+                debug_sampler.finish()
         if run_log_dir is not None and local_release_complete and local_close_complete:
             for ring, trigger, error, targets in deferred_timing_dumps:
                 try:
@@ -5883,14 +6010,9 @@ def _actuator_main(
             try:
                 dds_hold_timing_summary = dds_hold_timing.summary(completed_at=dds_hold_completed_at)
             except BaseException as diagnostic_exc:
-                message = (
-                    "Could not summarize DDS HOLD timing: "
-                    f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
-                )
+                message = f"Could not summarize DDS HOLD timing: {type(diagnostic_exc).__name__}: {diagnostic_exc}"
                 active_timing_capture_error = (
-                    message
-                    if active_timing_capture_error is None
-                    else f"{active_timing_capture_error}; {message}"
+                    message if active_timing_capture_error is None else f"{active_timing_capture_error}; {message}"
                 )
         if dds_hold_timing_summary is not None:
             cleanup_status("dds_hold_timing", dds_hold_timing_summary)
@@ -5949,11 +6071,17 @@ class SafeG1Dex3Actuator:
         run_log_dir: str | None = None,
         gravity_feedforward: bool = True,
         end_effector: str = "dex3",
+        action_interpolation: str = "legacy",
+        action_debug_sink: Any | None = None,
     ):
         if command_conditioning not in COMMAND_CONDITIONING_MODES:
             raise DeploymentError(f"Unknown command conditioning mode {command_conditioning!r}")
         if not isinstance(gravity_feedforward, bool):
             raise DeploymentError("gravity_feedforward must be a bool")
+        if action_interpolation not in {"legacy", "linear"}:
+            raise DeploymentError("Action interpolation must be legacy or linear")
+        if action_interpolation != "legacy" and command_conditioning != "xr":
+            raise DeploymentError("Linear action interpolation requires XR command conditioning")
         try:
             self._profile = get_end_effector_profile(end_effector)
         except ValueError as exc:
@@ -5982,12 +6110,7 @@ class SafeG1Dex3Actuator:
             self._urgent_hold_event,
             command_conditioning,
         )
-        if (
-            authority_ramp_diagnostics
-            or dds_hold_diagnostics
-            or run_log_dir is not None
-            or not gravity_feedforward
-        ):
+        if authority_ramp_diagnostics or dds_hold_diagnostics or run_log_dir is not None or not gravity_feedforward:
             process_args += (
                 authority_ramp_diagnostics,
                 dds_hold_diagnostics,
@@ -5995,6 +6118,10 @@ class SafeG1Dex3Actuator:
                 gravity_feedforward,
             )
         process_kwargs = {"hand_pause_generation": self._hand_pause_generation}
+        if action_debug_sink is not None:
+            process_kwargs["action_debug_sink"] = action_debug_sink
+        if action_interpolation != "legacy":
+            process_kwargs["action_interpolation"] = action_interpolation
         if self._profile.name != "dex3":
             process_kwargs["end_effector"] = self._profile.name
         self._process = context.Process(
@@ -6040,8 +6167,7 @@ class SafeG1Dex3Actuator:
         payload_end_effector = getattr(payload, "end_effector", "dex3")
         if payload_end_effector != actuator_end_effector:
             raise DeploymentError(
-                f"Actuator end effector is {actuator_end_effector!r}, but payload is tagged "
-                f"{payload_end_effector!r}"
+                f"Actuator end effector is {actuator_end_effector!r}, but payload is tagged {payload_end_effector!r}"
             )
 
     def heartbeat(self) -> None:
@@ -6158,9 +6284,7 @@ class SafeG1Dex3Actuator:
                         sequence,
                     )
                     return None
-                raise DeploymentError(
-                    f"Unexpected {kind} sequence {sequence}; no RTC plan is active"
-                )
+                raise DeploymentError(f"Unexpected {kind} sequence {sequence}; no RTC plan is active")
             if sequence < target_sequence:
                 LOGGER.info(
                     "Discarded delayed %s for RTC sequence %d; active sequence is %d",
@@ -6171,8 +6295,7 @@ class SafeG1Dex3Actuator:
                 return None
             if sequence > target_sequence:
                 raise DeploymentError(
-                    f"{kind} sequence {sequence} does not match active RTC sequence "
-                    f"{target_sequence}"
+                    f"{kind} sequence {sequence} does not match active RTC sequence {target_sequence}"
                 )
         outcome = "complete" if kind == "rtc_completed" else "hold"
         event = (outcome, value)
@@ -6205,15 +6328,11 @@ class SafeG1Dex3Actuator:
                 # arrive after its replacement started.  Never clear the newer
                 # generation.
                 return None
-            raise DeploymentError(
-                f"Unexpected scheduler replan sequence {sequence}; no plan is pending"
-            )
+            raise DeploymentError(f"Unexpected scheduler replan sequence {sequence}; no plan is pending")
         if sequence != target_sequence:
             if sequence < target_sequence:
                 return None
-            raise DeploymentError(
-                f"Scheduler replan sequence {sequence} does not match pending {target_sequence}"
-            )
+            raise DeploymentError(f"Scheduler replan sequence {sequence} does not match pending {target_sequence}")
         self._last_replan_detail = dict(value)
         self._chunk_in_flight = False
         self._pending_sequence = None
@@ -6443,23 +6562,43 @@ class SafeG1Dex3Actuator:
             raise DeploymentError("Actuator process stopped")
         return terminal_output_emitted
 
-    def warmup_pose(self, spec: InitializationSpec) -> None:
-        """Move to one guarded non-policy pose and remain in powered HOLD."""
+    def _queue_guarded_warmup_pose(
+        self,
+        spec: InitializationSpec,
+        *,
+        command_kind: str,
+    ) -> None:
+        """Queue one explicitly classified guarded pose transition."""
 
         self._require_payload_profile(spec)
         if not self._initialized or not self._holding or self._chunk_in_flight:
-            raise DeploymentError(
-                "Guarded warmup pose requires initialized HOLD with no chunk in flight"
-            )
+            raise DeploymentError("Guarded warmup pose requires initialized HOLD with no chunk in flight")
         validate_initialization_spec(
             spec,
             allow_training_start=True,
             allow_startup_settle=True,
         )
+        if command_kind not in {
+            "warmup_pose",
+            "warmup1_pose",
+            "return_to_start_pose",
+            "return_to_start_warmup1_pose",
+        }:
+            raise DeploymentError("Unsupported guarded warmup-pose command kind")
+        if command_kind == "warmup1_pose":
+            _validate_warmup1_stage_spec(spec)
+        elif command_kind in {"return_to_start_pose", "return_to_start_warmup1_pose"}:
+            _validate_return_to_start_stage_spec(
+                spec,
+                warmup1=command_kind == "return_to_start_warmup1_pose",
+            )
         self._wait_for_hand_feedback()
         self.heartbeat()
         try:
-            self._command_queue.put(("warmup_pose", time.monotonic(), spec), timeout=0.2)
+            self._command_queue.put(
+                (command_kind, time.monotonic(), spec),
+                timeout=0.2,
+            )
         except queue.Full as exc:
             raise DeploymentError("Actuator command queue is full; refusing guarded warmup pose") from exc
         self._wait_status(
@@ -6473,6 +6612,24 @@ class SafeG1Dex3Actuator:
             payload=spec.label,
         )
         self._holding = True
+
+    def warmup_pose(self, spec: InitializationSpec) -> None:
+        """Move to an ordinary guarded non-policy pose and remain in HOLD."""
+
+        self._queue_guarded_warmup_pose(spec, command_kind="warmup_pose")
+
+    def warmup1_pose(self, spec: InitializationSpec) -> None:
+        """Move through the reviewed Warmup1 stage at its accelerated rate."""
+
+        self._queue_guarded_warmup_pose(spec, command_kind="warmup1_pose")
+
+    def return_to_start_pose(self, spec: InitializationSpec, *, warmup1: bool = False) -> None:
+        """Run only an explicit Return-to-Start stage at 1.596x, then HOLD."""
+
+        self._queue_guarded_warmup_pose(
+            spec,
+            command_kind="return_to_start_warmup1_pose" if warmup1 else "return_to_start_pose",
+        )
 
     def warm_start(self, chunk: ActionChunk) -> None:
         """Smoothly reach a first policy target from an acknowledged hold."""
@@ -6498,9 +6655,7 @@ class SafeG1Dex3Actuator:
         )
         self._wait_for_hand_feedback()
         pause_generation = (
-            self.hand_pause_generation
-            if chunk.hand_pause_generation is None
-            else int(chunk.hand_pause_generation)
+            self.hand_pause_generation if chunk.hand_pause_generation is None else int(chunk.hand_pause_generation)
         )
         self.heartbeat()
         try:
@@ -6531,9 +6686,7 @@ class SafeG1Dex3Actuator:
             raise DeploymentError("A policy chunk is already in flight")
         self._wait_for_hand_feedback()
         pause_generation = (
-            self.hand_pause_generation
-            if chunk.hand_pause_generation is None
-            else int(chunk.hand_pause_generation)
+            self.hand_pause_generation if chunk.hand_pause_generation is None else int(chunk.hand_pause_generation)
         )
         with self._control_lock:
             immediate = self.immediate_control_requested()
@@ -6575,9 +6728,7 @@ class SafeG1Dex3Actuator:
             validate_action_chunk(plan, plan.arm[0], plan.left_hand[0], plan.right_hand[0])
         self._wait_for_hand_feedback()
         pause_generation = (
-            self.hand_pause_generation
-            if plan.hand_pause_generation is None
-            else int(plan.hand_pause_generation)
+            self.hand_pause_generation if plan.hand_pause_generation is None else int(plan.hand_pause_generation)
         )
         with self._control_lock:
             immediate = self.immediate_control_requested()
@@ -6995,6 +7146,4 @@ class SafeG1Dex3Actuator:
                 "DDS release completed, but actuator resource cleanup failed: " + "; ".join(close_issues)
             )
         if runtime_faults:
-            raise DeploymentError(
-                "Actuator fault; local DDS release completed: " + "; ".join(runtime_faults)
-            )
+            raise DeploymentError("Actuator fault; local DDS release completed: " + "; ".join(runtime_faults))

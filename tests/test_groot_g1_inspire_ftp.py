@@ -41,6 +41,7 @@ from unitree_lerobot.eval_robot.groot_contract import (
 )
 from unitree_lerobot.eval_robot.robot_control.g1_inspire_ftp import (
     G1InspireFtpStateReader,
+    INSPIRE_FTP_COMMAND_CLAMP_STEP,
     INSPIRE_FTP_COMMAND_MAX_STEP,
     InspireFtpCommandWriter,
     InspireFtpPartialWriteError,
@@ -54,6 +55,7 @@ from unitree_lerobot.eval_robot.robot_control.safe_g1_dex3 import (
     MAX_WAIST_HOLD_ERROR_RAD,
     QUALIFIED_REAL_MODE_MACHINE,
     RobotState,
+    XrPolicyOutputConditioner,
     _G1Dex3CommandBackend,
     _execute_initialization,
     _ramp_real_arm_authority,
@@ -233,7 +235,9 @@ def test_ftp_profile_contract_and_explicit_live_gate():
     assert INSPIRE_FTP_PROFILE.right_state_topic == "rt/inspire_hand/state/r"
     assert INSPIRE_FTP_PROFILE.left_command_topic == "rt/inspire_hand/ctrl/l"
     assert INSPIRE_FTP_PROFILE.right_command_topic == "rt/inspire_hand/ctrl/r"
-    np.testing.assert_array_equal(INSPIRE_FTP_PROFILE.conditioned_step, np.full(6, 0.2))
+    np.testing.assert_array_equal(INSPIRE_FTP_PROFILE.conditioned_step, np.full(6, 0.3))
+    assert INSPIRE_FTP_COMMAND_CLAMP_STEP == 0.3
+    np.testing.assert_array_equal(INSPIRE_DFX_PROFILE.conditioned_step, np.full(6, 0.2))
     np.testing.assert_array_equal(INSPIRE_FTP_PROFILE.home, np.ones(6))
     assert inspire_ftp_dataset_contract()["protocol"] == "ftp"
     assert resolve_runtime_end_effector("inspire-ftp", True) == "inspire-dfx"
@@ -252,11 +256,11 @@ def test_ftp_profile_contract_and_explicit_live_gate():
     for profile in ("inspire-ftp", "inspire-dfx"):
         validate_args(
             parser.parse_args(
-                ["--task", "pick-red-cup", "--end-effector", profile]
+                ["--task", "pick-red-cup", "--end-effector", profile, "--no-actuate"]
             )
         )
     shadow = parser.parse_args(
-        ["--task", "pick-red-cup", "--end-effector", "inspire-ftp", "--no-warmup1"]
+        ["--task", "pick-red-cup", "--end-effector", "inspire-ftp", "--no-warmup1", "--no-actuate"]
     )
     validate_args(shadow)
     live = parser.parse_args(
@@ -267,6 +271,8 @@ def test_ftp_profile_contract_and_explicit_live_gate():
             "inspire-ftp",
             "--no-warmup1",
             "--actuate",
+            "--no-return-to-start",
+            "--no-allow-inspire-ftp-unverified-stop",
             "--network-interface",
             "eth-test",
             "--allow-unqualified-real",
@@ -286,11 +292,12 @@ def test_ftp_profile_contract_and_explicit_live_gate():
             "--sim",
             "--actuate",
             "--confirm-sim-network-isolated",
+            "--no-return-to-start",
         ]
     )
     validate_args(simulation)
     wrong_profile = parser.parse_args(
-        ["--task", "pick-red-cup", "--allow-inspire-ftp-unverified-stop"]
+        ["--task", "pick-red-cup", "--end-effector", "dex3", "--no-actuate", "--allow-inspire-ftp-unverified-stop"]
     )
     with pytest.raises(DeploymentError, match="valid only"):
         validate_args(wrong_profile)
@@ -305,6 +312,7 @@ def test_ftp_sim_validates_ftp_metadata_then_uses_combined_dfx_runtime():
             "inspire-ftp",
             "--no-warmup1",
             "--sim",
+            "--no-actuate",
         ]
     )
     policy = mock.Mock()
@@ -400,7 +408,7 @@ def test_ftp_xr_home_and_return_to_start_are_profile_aware():
 
 def test_missing_ftp_sdk_fails_before_parent_dds_initialization():
     args = build_parser().parse_args(
-        ["--task", "pick-red-cup", "--end-effector", "inspire-ftp", "--no-warmup1"]
+        ["--task", "pick-red-cup", "--end-effector", "inspire-ftp", "--no-warmup1", "--no-actuate"]
     )
 
     class FakePolicy:
@@ -439,7 +447,7 @@ def test_missing_ftp_sdk_fails_before_parent_dds_initialization():
 
 def test_incompatible_ftp_sdk_fails_before_parent_dds_initialization():
     args = build_parser().parse_args(
-        ["--task", "pick-red-cup", "--end-effector", "inspire-ftp", "--no-warmup1"]
+        ["--task", "pick-red-cup", "--end-effector", "inspire-ftp", "--no-warmup1", "--no-actuate"]
     )
 
     class FakePolicy:
@@ -558,7 +566,7 @@ def test_ftp_return_to_start_requires_a_post_motion_visual_gate():
     events: list[str] = []
     actuator = SimpleNamespace(
         wait_for_hand_feedback=lambda: events.append("feedback"),
-        warmup_pose=lambda _spec: events.append("motion"),
+        return_to_start_pose=lambda _spec, *, warmup1=False: events.append("motion"),
     )
 
     def run_motion(_actuator, operation, **_kwargs):
@@ -652,6 +660,100 @@ def test_ftp_writer_matches_teleop_scaling_and_tracks_partial_success():
         assert raised.left_has_written and not raised.right_has_written
         assert len(raised_left.writes) == 1
         raised.close()
+
+
+@pytest.mark.parametrize("side,joint", (("right", 4), ("left", 5)))
+@pytest.mark.parametrize("step", (0.200133, 0.200961, 0.25, -0.25, 0.3, -0.3, 0.300001, -0.300001, 0.300961, -0.300961, 0.35, -0.35, 0.350001, -0.350001))
+def test_ftp_writer_enforces_point_three_clamp_point_three_five_fault(side, joint, step):
+    FakePublisher.instances.clear()
+    seed = np.full(6, 0.5)
+    targets = {"left": seed.copy(), "right": seed.copy()}
+    targets[side][joint] += step
+    with mock.patch.dict(sys.modules, _sdk_modules()):
+        writer = InspireFtpCommandWriter(seed, seed)
+        try:
+            if abs(step) <= 0.35:
+                result = writer.write(targets["left"], targets["right"])
+                assert all(len(p.writes) == 1 for p in FakePublisher.instances)
+                assert np.max(np.abs(result.left - seed)) <= 0.3 + 1e-12
+                assert np.max(np.abs(result.right - seed)) <= 0.3 + 1e-12
+                if abs(step) > 0.3:
+                    assert getattr(result, side)[joint] == 0.5 + np.sign(step) * 0.3
+            else:
+                with pytest.raises(DeploymentError, match="COMMAND_MAX_STEP=0.350"):
+                    writer.write(targets["left"], targets["right"])
+                assert all(not p.writes for p in FakePublisher.instances)
+        finally:
+            writer.close()
+
+
+@pytest.mark.parametrize("initial", (0.0, 0.0009, 0.1239, 0.333, 0.583, 0.9999, 1.0))
+def test_ftp_wire_clamp_respects_fractional_seeds_and_reversals(initial):
+    FakePublisher.instances.clear()
+    previous = np.full(6, initial)
+    with mock.patch.dict(sys.modules, _sdk_modules()):
+        writer = InspireFtpCommandWriter(previous, previous)
+        try:
+            for step in (0.3, -0.3, 0.35, -0.35, 0.300961, -0.300961):
+                target = np.clip(previous + step, 0.0, 1.0)
+                result = writer.write(target, target)
+                for side in ("left", "right"):
+                    written = getattr(result, side)
+                    assert np.max(np.abs(written - previous)) <= 0.3 + 1e-12
+                    assert np.all((written >= 0.0) & (written <= 1.0))
+                    np.testing.assert_array_equal(getattr(writer, f"_last_{side}"), written)
+                previous = result.left
+        finally:
+            writer.close()
+
+
+@pytest.mark.parametrize("invalid", (np.nan, np.inf, -0.001, 1.001))
+def test_ftp_clamp_does_not_hide_invalid_commands(invalid):
+    FakePublisher.instances.clear()
+    seed = np.full(6, 0.5)
+    right = seed.copy()
+    right[5] = invalid
+    with mock.patch.dict(sys.modules, _sdk_modules()):
+        writer = InspireFtpCommandWriter(seed, seed)
+        try:
+            with pytest.raises(DeploymentError):
+                writer.write(seed, right)
+            assert all(not p.writes for p in FakePublisher.instances)
+        finally:
+            writer.close()
+
+
+def test_ftp_partial_write_tracks_clamped_command_only_on_successful_side():
+    FakePublisher.instances.clear()
+    seed = np.full(6, 0.5)
+    with mock.patch.dict(sys.modules, _sdk_modules()):
+        writer = InspireFtpCommandWriter(seed, seed)
+        FakePublisher.instances[1].write_result = False
+        try:
+            with pytest.raises(InspireFtpPartialWriteError) as captured:
+                writer.write(np.full(6, 0.85), np.full(6, 0.15))
+            np.testing.assert_array_equal(captured.value.left, np.full(6, 0.8))
+            np.testing.assert_array_equal(writer._last_left, np.full(6, 0.8))
+            np.testing.assert_array_equal(writer._last_right, seed)
+        finally:
+            writer.close()
+
+
+def test_ftp_conditioner_uses_point_three_clamp_below_writer_fault_threshold():
+    seed = np.full(6, 0.5)
+    arm = np.zeros(14)
+    conditioner = XrPolicyOutputConditioner(INSPIRE_FTP_PROFILE)
+    conditioner.reset(arm, seed, seed)
+    conditioner.set_desired(arm, np.ones(6), np.zeros(6), now=1.0)
+    command = conditioner.next_command(arm, arm, seed, seed, now=1.0)
+    np.testing.assert_allclose(command.left_hand[0], 0.8)
+    np.testing.assert_allclose(command.right_hand[0], 0.2)
+    with mock.patch.dict(sys.modules, _sdk_modules()):
+        writer = InspireFtpCommandWriter(seed, seed)
+        try:
+            writer.write(command.left_hand[0], command.right_hand[0])
+        finally:
+            writer.close()
 
 
 def test_ftp_backend_records_partial_history_and_cleanup_only_closes():
@@ -1283,7 +1385,7 @@ def test_ftp_final_measured_reseed_is_used_before_first_write():
     np.testing.assert_array_equal(backend._left_target, measured.left_hand)
     np.testing.assert_array_equal(backend._right_target, measured.right_hand)
     backend._hand_writer.reseed_before_first_write.assert_called_once()
-    assert INSPIRE_FTP_COMMAND_MAX_STEP == 0.2
+    assert INSPIRE_FTP_COMMAND_MAX_STEP == 0.35
 
 
 @pytest.mark.parametrize("settle_waist_dq", (0.0, 0.2))

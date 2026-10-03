@@ -51,12 +51,12 @@ def held_actuator():
 class GrootVoiceCommandIntegrationTest(unittest.TestCase):
     def test_voice_flags_parse_and_confirm_text_requires_voice(self):
         parser = build_parser()
-        args = parser.parse_args(["--voice", "--confirm-text"])
+        args = parser.parse_args(["--no-actuate", "--voice", "--confirm-text"])
         validate_args(args)
         self.assertTrue(args.voice)
         self.assertTrue(args.confirm_text)
         with self.assertRaisesRegex(DeploymentError, "requires --voice"):
-            validate_args(parser.parse_args(["--confirm-text"]))
+            validate_args(parser.parse_args(["--no-actuate", "--confirm-text"]))
 
     def test_confirmed_voice_stop_or_pause_stays_in_powered_hold(self):
         for goal in ("stop", "STOP", "pause"):

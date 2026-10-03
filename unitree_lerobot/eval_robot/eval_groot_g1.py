@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Run a supported colour or colour+aligned-depth-derived GR00T policy on G1.
 
-The default is read-only shadow mode.  ``--actuate`` creates a separate,
-watchdog-owning DDS actuator process only after model, camera, state, and action
-preflight checks and an interactive confirmation.
+The default is live Inspire FTP with the operator's expert acknowledgements;
+``--no-actuate`` selects read-only shadow mode.  The separate, watchdog-owning
+DDS actuator process is created only after model, camera, state, and action
+preflight checks and an interactive confirmation.  Real runs still require an
+explicit robot NIC, and Inspire Return-to-Start requires explicit XR-home.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from unitree_lerobot.eval_robot.g1_end_effectors import get_end_effector_profile
 from unitree_lerobot.eval_robot.groot_contract import (
     CONTROL_HZ,
     INITIALIZATION_MODES,
+    STARTUP_SETTLE_MODE,
     TASKS,
     ActionChunk,
     DepthEncodingContract,
@@ -68,16 +71,24 @@ from unitree_lerobot.eval_robot.robot_control.g1_inspire_ftp import (
     require_inspire_ftp_sdk,
 )
 from unitree_lerobot.eval_robot.training_start_pose import (
-    training_start_source,
-    training_start_spec,
+    WARMUP1_POSE_NAMES,
+    load_warmup1_pose,
 )
+from unitree_lerobot.eval_robot.action_debug import ActionDebugRecorder
 from unitree_lerobot.eval_robot.voice_command_server import (
     DEFAULT_VOICE_PORT,
     VoiceCommandServer,
     load_voice_session_token,
 )
 from unitree_lerobot.eval_robot.vision_recorder import NonBlockingVisionRecorder
+from unitree_lerobot.eval_robot.vision_recording_paths import recording_output_path
+from unitree_lerobot.eval_robot.demo_stream import ContinuousDemoStream
 from unitree_lerobot.utils.depth_encoding import DEPTH_OUTPUT_KEY
+from unitree_lerobot.utils.depth_colormap import (
+    FIXED_TURBO_DEPTH_COLORMAP,
+    apply_fixed_turbo_depth_colormap_array,
+    fixed_turbo_depth_colormap_contract,
+)
 from unitree_lerobot.utils.surface_normal_encoding import SURFACE_NORMAL_OUTPUT_KEY
 
 
@@ -88,6 +99,7 @@ def _vision_recording_metadata(
     image_host: str,
     inference_mode: str,
     surface_normal_encoding: SurfaceNormalEncodingContract | None,
+    depth_colormap: str | None = None,
 ) -> dict[str, object]:
     """Describe the exact model-visible pixels persisted by the recorder."""
 
@@ -99,6 +111,12 @@ def _vision_recording_metadata(
     }
     if surface_normal_encoding is not None:
         metadata["surface_normals_encoding"] = surface_normal_encoding.to_metadata()
+    if depth_colormap is not None:
+        if depth_colormap != FIXED_TURBO_DEPTH_COLORMAP:
+            raise DeploymentError(
+                f"Unsupported recording depth colormap {depth_colormap!r}"
+            )
+        metadata["depth_colormap"] = fixed_turbo_depth_colormap_contract()
     return metadata
 
 
@@ -112,13 +130,18 @@ ALT_ESCAPE_WINDOW_S = 0.1
 CONFIRMATION_INPUT_QUIET_S = 0.1
 CONFIRMATION_PROMPT_REFRESH_S = 60.0
 GOAL_MODE_TOGGLE = "\t"
+REFRESH_POLICY = "refresh"
+_BLINDED_POLICY = False
 RETURN_TO_START = "\x1b[Z"
 PREVIEW_WINDOWS = (
     "GR00T input: ego_view",
     f"GR00T input: {DEPTH_OUTPUT_KEY}",
     f"GR00T input: {SURFACE_NORMAL_OUTPUT_KEY}",
 )
+DEFAULT_VISION_RECORDINGS_DIR = Path(__file__).resolve().parents[1] / "Recordings_Data"
 _CAMERA_PREVIEW_ACTIVE = False
+_CONTINUOUS_DEMO_STREAM: ContinuousDemoStream | None = None
+_ACTION_DEBUG_RECORDER: ActionDebugRecorder | None = None
 STOP_COMMANDS = {"stop", "s"}
 EXIT_COMMANDS = {"quit", "q"}
 VOICE_STOP_COMMANDS = {"stop", "pause"}
@@ -129,6 +152,34 @@ VOICE_STAY_HOLDING = "\x00voice-stay-holding"
 VOICE_RETURN_TO_START_UNAVAILABLE = "\x00voice-return-to-start-unavailable"
 RTC_MIN_MODEL_HORIZON = 32
 RTC_DELAY_HISTORY = 8
+
+
+def _debug_action_event(kind: str, **fields: object) -> None:
+    """Observability only: a broken recorder must never interrupt control."""
+    recorder = _ACTION_DEBUG_RECORDER
+    if recorder is not None:
+        try:
+            recorder.record(kind, **fields)
+        except Exception:
+            pass
+
+
+def _debug_policy_request(observation: dict, options: dict | None = None) -> str | None:
+    if _ACTION_DEBUG_RECORDER is None:
+        return None
+    request_id = f"{os.getpid()}:{threading.get_ident()}:{time.monotonic_ns()}"
+    _debug_action_event(
+        "policy_request", request_id=request_id,
+        state=observation.get("state"), language=observation.get("language"),
+        options=options or {},
+    )
+    return request_id
+
+
+def _debug_plan(kind: str, plan: ActionChunk, **fields: object) -> None:
+    if _ACTION_DEBUG_RECORDER is not None:
+        _debug_action_event(kind, arm=plan.arm, left_hand=plan.left_hand,
+                            right_hand=plan.right_hand, **fields)
 # Manual/test-only capability gate. Production runs keep every profile and
 # modality on the established legacy TeleImager transport unless this source
 # constant is deliberately changed for a controlled experiment.
@@ -265,9 +316,7 @@ class _OperatorTerminal:
         return stop_sent
 
     def _is_release_key(self, value: bytes) -> bool:
-        return value in {b"q", b"Q", b"\x11"} or (
-            self._stop_action == "release" and value in {b"s", b"S"}
-        )
+        return value in {b"q", b"Q", b"\x11"} or (self._stop_action == "release" and value in {b"s", b"S"})
 
     def poll_control(self) -> str | None:
         result: str | None = None
@@ -549,6 +598,7 @@ class _RtcInferenceWorker:
     def __init__(self, host: str, port: int):
         self._host = host
         self._port = port
+        self._debug_recorder = _ACTION_DEBUG_RECORDER
         self._requests: queue.Queue[_RtcRequest | None] = queue.Queue(maxsize=1)
         self._responses: queue.Queue[_RtcResponse] = queue.Queue()
         self._lock = threading.Lock()
@@ -564,6 +614,7 @@ class _RtcInferenceWorker:
                 request = self._requests.get()
                 if request is None:
                     return
+                debug_id = _debug_policy_request(request.observation, request.options)
                 started = time.monotonic()
                 try:
                     if client is None:
@@ -573,14 +624,26 @@ class _RtcInferenceWorker:
                     response = _RtcResponse(request.generation, None, time.monotonic() - started, exc)
                 else:
                     response = _RtcResponse(request.generation, action, time.monotonic() - started, None)
+                _debug_action_event(
+                    "policy_response", request_id=debug_id, generation=request.generation,
+                    inference_s=response.inference_s, action=response.action,
+                    error=str(response.error) if response.error is not None else None,
+                )
                 self._responses.put(response)
                 with self._lock:
                     self._busy = False
                 if self._closing.is_set():
                     return
         finally:
-            if client is not None:
-                client.close()
+            try:
+                if client is not None:
+                    client.close()
+            finally:
+                if self._debug_recorder is not None:
+                    try:
+                        self._debug_recorder.release_thread_sink()
+                    except Exception:
+                        pass
 
     def submit(self, request: _RtcRequest) -> None:
         with self._lock:
@@ -767,9 +830,7 @@ def _take_initial_voice_command(
     if command is None:
         return None
     if confirm_voice_text:
-        response = _readline_before_authority(
-            f"Voice text: {command.goal!r}. Type YES to accept locally: "
-        )
+        response = _readline_before_authority(f"Voice text: {command.goal!r}. Type YES to accept locally: ")
         if response != "YES":
             voice_server.reject_command(command, "local_confirmation_rejected", "Local text confirmation rejected")
             return VOICE_STAY_HOLDING
@@ -811,15 +872,14 @@ def resolve_runtime_end_effector(end_effector: str, simulation: bool) -> str:
             "right_lower",
             "right_upper",
             "home",
-            "conditioned_step",
         )
         if any(getattr(logical, name) != getattr(runtime, name) for name in scalar_fields) or any(
-            not np.array_equal(getattr(logical, name), getattr(runtime, name))
-            for name in vector_fields
+            not np.array_equal(getattr(logical, name), getattr(runtime, name)) for name in vector_fields
         ):
-            raise DeploymentError(
-                "Inspire FTP and simulator DFX profiles no longer have identical action semantics"
-            )
+            raise DeploymentError("Inspire FTP and simulator DFX profiles no longer have identical action semantics")
+        # DFX simulation may retain a stricter per-write limit than live FTP.
+        if np.any(runtime.conditioned_step > logical.conditioned_step):
+            raise DeploymentError("Simulator DFX hand step limit exceeds the logical FTP limit")
         return runtime.name
     return end_effector
 
@@ -827,11 +887,7 @@ def resolve_runtime_end_effector(end_effector: str, simulation: bool) -> str:
 def _prefer_atomic_rgbd_for_camera(end_effector: str, *, requires_geometry: bool) -> bool:
     """Select atomic pairing only for an explicitly enabled Inspire experiment."""
 
-    return (
-        EXPERIMENTAL_ATOMIC_RGBD_OPT_IN
-        and requires_geometry
-        and end_effector in {"inspire-dfx", "inspire-ftp"}
-    )
+    return EXPERIMENTAL_ATOMIC_RGBD_OPT_IN and requires_geometry and end_effector in {"inspire-dfx", "inspire-ftp"}
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -849,7 +905,8 @@ def validate_args(args: argparse.Namespace) -> None:
         if args.actuate and getattr(args, "command_conditioning", "xr") != "xr":
             raise DeploymentError(
                 f"{end_effector} actuation requires --command-conditioning xr so the authorized "
-                "0.2 normalized per-write hand limit is enforced"
+                f"{get_end_effector_profile(end_effector).conditioned_step[0]:.2f} "
+                "normalized per-write hand limit is enforced"
             )
     if (
         end_effector == "inspire-ftp"
@@ -862,18 +919,15 @@ def validate_args(args: argparse.Namespace) -> None:
             "expiry, motor stop, or stop acknowledgement has been verified for RH56E2/FTP, so "
             "closing this client must be treated as leaving the last hand setpoint active"
         )
-    if (
-        end_effector != "inspire-ftp"
-        and bool(getattr(args, "allow_inspire_ftp_unverified_stop", False))
-    ):
-        raise DeploymentError(
-            "--allow-inspire-ftp-unverified-stop is valid only with "
-            "--end-effector inspire-ftp"
-        )
+    if end_effector != "inspire-ftp" and bool(getattr(args, "allow_inspire_ftp_unverified_stop", False)):
+        raise DeploymentError("--allow-inspire-ftp-unverified-stop is valid only with --end-effector inspire-ftp")
     if args.execution_horizon < 1:
         raise DeploymentError("--execution-horizon must be at least 1")
     if args.max_chunks < 1:
         raise DeploymentError("--max-chunks must be finite and at least 1")
+    demo_fps = getattr(args, "demo_fps", 30.0)
+    if not np.isfinite(demo_fps) or not 0.0 < demo_fps <= 30.0:
+        raise DeploymentError("--demo-fps must be finite and greater than zero, up to 30")
     if args.actuate and not args.sim and not args.network_interface:
         raise DeploymentError("Real actuation requires an explicit --network-interface")
     if args.actuate and args.sim and args.network_interface is not None:
@@ -910,6 +964,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise DeploymentError("--custom-goal cannot use a task-bound --initialization pose-file")
     return_to_start = bool(getattr(args, "return_to_start", False))
     warmup1_enabled = bool(getattr(args, "warmup1", False))
+    if getattr(args, "warmup1_pose_file", None) and not warmup1_enabled:
+        raise DeploymentError("--warmup1-pose-file requires --warmup1 (do not use --no-warmup1)")
+    if getattr(args, "warmup1_pose", None) is not None and not warmup1_enabled:
+        raise DeploymentError("--warmup1-pose requires --warmup1 (do not use --no-warmup1)")
     if return_to_start and not args.actuate:
         raise DeploymentError("--return-to-start requires --actuate")
     if return_to_start and end_effector != "dex3" and initialization != "xr-home":
@@ -928,6 +986,12 @@ def validate_args(args: argparse.Namespace) -> None:
     if rtc_frozen_steps is not None and rtc_frozen_steps < 1:
         raise DeploymentError("--rtc-frozen-steps must be at least 1")
     rtc_ramp_rate = getattr(args, "rtc_ramp_rate", None)
+    if getattr(args, "rtc_pure", False):
+        # This opt-in selects asynchronous execution even when callers supply
+        # the default synchronous mode. The historical sampler stays default.
+        args.inference_mode = inference_mode = "rtc"
+        if rtc_ramp_rate is not None:
+            raise DeploymentError("--rtc-ramp-rate is not applicable with --rtc-pure")
     if rtc_ramp_rate is not None and (not np.isfinite(rtc_ramp_rate) or rtc_ramp_rate <= 0.0):
         raise DeploymentError("--rtc-ramp-rate must be a finite positive number")
     if inference_mode != "rtc" and (rtc_frozen_steps is not None or rtc_ramp_rate is not None):
@@ -935,6 +999,11 @@ def validate_args(args: argparse.Namespace) -> None:
     command_conditioning = getattr(args, "command_conditioning", "xr")
     if command_conditioning not in {"none", "xr"}:
         raise DeploymentError("--command-conditioning must be none or xr")
+    action_interpolation = getattr(args, "action_interpolation", "legacy")
+    if action_interpolation not in {"legacy", "linear"}:
+        raise DeploymentError("--action-interpolation must be legacy or linear")
+    if action_interpolation != "legacy" and command_conditioning != "xr":
+        raise DeploymentError("--action-interpolation linear requires --command-conditioning xr")
     voice_enabled = bool(getattr(args, "voice", False))
     if getattr(args, "confirm_text", False) and not voice_enabled:
         raise DeploymentError("--confirm-text requires --voice")
@@ -982,7 +1051,8 @@ def confirm_actuation(
                 "must be treated as leaving its last hand setpoint active. A successful DDS Write is "
                 "not bridge/device acknowledgement, and fresh DDS callbacks cannot exclude a bridge "
                 "republishing cached angle_act. There is no qualified hand tracking-error threshold, "
-                "so each post-motion hand check is visual. The 0.2 normalized hand slew and existing "
+                "so each post-motion hand check is visual. The 0.30 normalized hand-step clamp, "
+                "0.35 hand-step fault threshold, and existing "
                 "g1_body29_hand14 gravity model are explicitly unqualified lab choices."
             )
         else:
@@ -993,8 +1063,7 @@ def confirm_actuation(
         print(f"Task {task_name!r}: {instruction}")
         required = "ACTUATE"
     response = _confirm_before_authority(
-        f"[WAITING FOR {required}] Press r to create command publishers "
-        "(no Enter); s/q cancels: "
+        f"[WAITING FOR {required}] Press r to create command publishers (no Enter); s/q cancels: "
     )
     if response != "continue":
         raise OperatorRelease
@@ -1008,6 +1077,7 @@ def _readline_while_armed(
     confirmation_mode: bool = False,
     goal_mode_toggle: bool = False,
     return_to_start: bool = False,
+    policy_refresh: bool = False,
     external_pending: Callable[[], bool] | None = None,
 ) -> str:
     """Read a terminal line while continuously servicing the actuator watchdog."""
@@ -1021,6 +1091,7 @@ def _readline_while_armed(
             confirmation_mode=confirmation_mode,
             goal_mode_toggle=goal_mode_toggle,
             return_to_start=return_to_start,
+            policy_refresh=policy_refresh,
             external_pending=external_pending,
         )
     LOGGER.warning("stdin is not a TTY; armed input is line-buffered and immediate keys are unavailable")
@@ -1080,6 +1151,7 @@ def _readline_with_immediate_prompt_controls(
     confirmation_mode: bool = False,
     goal_mode_toggle: bool = False,
     return_to_start: bool = False,
+    policy_refresh: bool = False,
     external_pending: Callable[[], bool] | None = None,
 ) -> str:
     """Read an armed line while keeping the physical Q key fail-safe.
@@ -1160,10 +1232,7 @@ def _readline_with_immediate_prompt_controls(
                 escape_prefix_at = now
                 continue
             if escape_prefix is not None:
-                prefix_is_fresh = (
-                    escape_prefix_at is not None
-                    and now - escape_prefix_at <= ALT_ESCAPE_WINDOW_S
-                )
+                prefix_is_fresh = escape_prefix_at is not None and now - escape_prefix_at <= ALT_ESCAPE_WINDOW_S
                 if prefix_is_fresh and escape_prefix == b"\x1b" and value in {b"q", b"Q"}:
                     escape_prefix = None
                     escape_prefix_at = None
@@ -1173,12 +1242,7 @@ def _readline_with_immediate_prompt_controls(
                 if prefix_is_fresh and return_to_start and escape_prefix == b"\x1b" and value == b"[":
                     escape_prefix = b"\x1b["
                     continue
-                is_return_to_start = (
-                    prefix_is_fresh
-                    and return_to_start
-                    and escape_prefix == b"\x1b["
-                    and value == b"Z"
-                )
+                is_return_to_start = prefix_is_fresh and return_to_start and escape_prefix == b"\x1b[" and value == b"Z"
                 escape_prefix = None
                 escape_prefix_at = None
                 if is_return_to_start:
@@ -1196,6 +1260,9 @@ def _readline_with_immediate_prompt_controls(
                 # immediate mode switch and discard any partially typed line.
                 print()
                 return GOAL_MODE_TOGGLE
+            if policy_refresh and value == b"\x12":
+                print()
+                return REFRESH_POLICY
             if confirmation_mode and value in {b"r", b"R"}:
                 print()
                 return "continue"
@@ -1372,6 +1439,7 @@ def _select_next_goal_while_holding(
 
     print(
         "\nSTOPPED IN A POWERED POSITION HOLD. GR00T requests are stopped.\n"
+        "Press Ctrl+R to refresh the policy after changing servers; stay in HOLD afterward.\n"
         "Press q or Q to release immediately (no Enter); Alt-q types q and "
         "Alt-Shift-q types Q. Press uppercase S to remain stopped. Ctrl-C also releases."
     )
@@ -1414,6 +1482,7 @@ def _select_next_goal_while_holding(
             timeout_s=None,
             goal_mode_toggle=True,
             return_to_start=return_to_start,
+            policy_refresh=True,
             external_pending=(None if voice_server is None else lambda: voice_server.command_pending),
         )
         if response == VOICE_INPUT_AVAILABLE:
@@ -1426,7 +1495,9 @@ def _select_next_goal_while_holding(
                 mode_state["custom_goal_mode"] = custom_goal_mode
             show_mode()
             continue
-        lowered = response.lower()
+        lowered = response.lower().strip()
+        if lowered in {REFRESH_POLICY, "reload"}:
+            return REFRESH_POLICY
         if lowered in EXIT_COMMANDS:
             return None
         if lowered in STOP_COMMANDS or not response:
@@ -1472,7 +1543,7 @@ def confirm_return_to_start(
         "workspace clear and remain on the emergency stop."
     )
     if spec.moves_hands:
-        if spec.end_effector != "dex3" and spec.mode == "xr-home":
+        if spec.end_effector != "dex3" and spec.mode in {"xr-home", STARTUP_SETTLE_MODE}:
             warning += (
                 " This target opens both Inspire hands and can drop held objects; both hands must be empty. "
                 "Visually check them at the next displayed gate because Inspire hand convergence "
@@ -1517,6 +1588,7 @@ def _run_return_to_start_from_hold(
     spec: InitializationSpec,
     *,
     require_final_visual_check: bool = True,
+    warmup1: bool = False,
 ) -> str:
     """Run a confirmed return transition while preserving feedback-triggered HOLD."""
 
@@ -1541,7 +1613,7 @@ def _run_return_to_start_from_hold(
     # exception from that phase must retain the fail-closed release behavior.
     _run_blocking_motion_with_immediate_release(
         actuator,
-        lambda: actuator.warmup_pose(spec),
+        lambda: actuator.return_to_start_pose(spec, warmup1=warmup1),
         stage="RETURN-TO-START",
     )
     if _hand_convergence_is_software_verified(spec.end_effector) or not require_final_visual_check:
@@ -1562,17 +1634,18 @@ def _run_return_to_start_from_hold(
 def _run_return_to_start_sequence_from_hold(
     actuator: SafeG1Dex3Actuator,
     specs: tuple[InitializationSpec, ...],
+    *,
+    warmup1_spec: InitializationSpec | None = None,
 ) -> str:
     """Replay each selected fixed startup pose, preserving one final visual gate."""
 
     if not specs:
         raise DeploymentError("Return-to-Start has no fixed startup pose to replay")
     for index, spec in enumerate(specs):
-        decision = _run_return_to_start_from_hold(
-            actuator,
-            spec,
-            require_final_visual_check=index == len(specs) - 1,
-        )
+        kwargs = {"require_final_visual_check": index == len(specs) - 1}
+        if spec is warmup1_spec:
+            kwargs["warmup1"] = True
+        decision = _run_return_to_start_from_hold(actuator, spec, **kwargs)
         if decision != "continue":
             return decision
     return "continue"
@@ -1601,17 +1674,13 @@ def confirm_initialization(
             )
         else:
             warning += (
-                " XR-home targets all 14 arm joints and both 7-joint Dex3 hands to zero; "
-                "both hands must be empty."
+                " XR-home targets all 14 arm joints and both 7-joint Dex3 hands to zero; both hands must be empty."
             )
     elif stage == "WARMUP1":
         profile = get_end_effector_profile(spec.end_effector)
-        task_description = (
-            "cereal-box-pick" if spec.end_effector == "dex3" else "stack-three-cups"
-        )
         warning += (
             f" Warmup1 commands all 14 arms and both {profile.hand_dof}-channel hands from "
-            f"one recorded {task_description} frame. Both hands must be empty. It does not "
+            "the selected recorded measured pose. Both hands must be empty. It does not "
             "reproduce the recorded legs, waist, pelvis height, world pose, or object layout."
         )
     elif stage == "STARTUP ELBOW SETTLE":
@@ -1720,6 +1789,8 @@ def confirm_policy_continue(
 def _pump_camera_preview_events() -> None:
     """Keep an already-open HighGUI preview responsive during operator waits."""
 
+    if _CONTINUOUS_DEMO_STREAM is not None and _CONTINUOUS_DEMO_STREAM.operator_exit_requested:
+        raise OperatorRelease
     if not _CAMERA_PREVIEW_ACTIVE:
         return
     try:
@@ -1733,8 +1804,9 @@ def show_camera_preview(
     rgb: np.ndarray,
     geometry: np.ndarray | None,
     geometry_key: str = DEPTH_OUTPUT_KEY,
+    depth_colormap: str | None = None,
 ) -> None:
-    """Display exactly the decoded image arrays being placed in the observation."""
+    """Display checkpoint-visible views before spatial transforms/normalization."""
 
     global _CAMERA_PREVIEW_ACTIVE
     try:
@@ -1742,6 +1814,21 @@ def show_camera_preview(
         if geometry is not None:
             if geometry_key not in (DEPTH_OUTPUT_KEY, SURFACE_NORMAL_OUTPUT_KEY):
                 raise DeploymentError(f"Cannot preview unsupported geometry view {geometry_key!r}")
+            if depth_colormap is not None:
+                if geometry_key != DEPTH_OUTPUT_KEY:
+                    raise DeploymentError(
+                        "A depth colormap cannot be applied to a non-depth preview"
+                    )
+                if depth_colormap != FIXED_TURBO_DEPTH_COLORMAP:
+                    raise DeploymentError(
+                        f"Cannot preview unsupported depth colormap {depth_colormap!r}"
+                    )
+                try:
+                    geometry = apply_fixed_turbo_depth_colormap_array(geometry)
+                except ValueError as exc:
+                    raise DeploymentError(
+                        f"Cannot render the checkpoint-bound depth colormap: {exc}"
+                    ) from exc
             cv2.imshow(f"GR00T input: {geometry_key}", cv2.cvtColor(geometry, cv2.COLOR_RGB2BGR))
         _CAMERA_PREVIEW_ACTIVE = True
         _pump_camera_preview_events()
@@ -1757,6 +1844,16 @@ def close_camera_preview() -> None:
         try:
             cv2.destroyWindow(window)
         except cv2.error:
+            pass
+
+
+def _mark_demo_event(event: str, **details: object) -> None:
+    """Best-effort, non-blocking demo markers; never affect motion/control."""
+    stream = _CONTINUOUS_DEMO_STREAM
+    if stream is not None:
+        try:
+            stream.mark_event(event, details)
+        except Exception:
             pass
 
 
@@ -1821,10 +1918,17 @@ def capture_policy_observation(
         actuator.heartbeat()
     depth_gray = getattr(images, "depth_gray", None)
     surface_normals = getattr(images, "surface_normals", None)
-    if show_camera:
-        geometry = depth_gray if depth_gray is not None else surface_normals
+    if show_camera and _CONTINUOUS_DEMO_STREAM is None:
+        geometry = None if _BLINDED_POLICY else (depth_gray if depth_gray is not None else surface_normals)
         geometry_key = DEPTH_OUTPUT_KEY if depth_gray is not None else SURFACE_NORMAL_OUTPUT_KEY
-        show_camera_preview(images.rgb, geometry, geometry_key)
+        show_camera_preview(
+            images.rgb,
+            geometry,
+            geometry_key,
+            depth_colormap=model_contract.depth_colormap,
+        )
+    elif show_camera:
+        _pump_camera_preview_events()
     if actuator is not None:
         _raise_if_immediate_control(actuator)
         actuator.heartbeat()
@@ -1883,13 +1987,18 @@ def infer_chunk(
         if actuator is not None and _hand_pause_generation(actuator) != pause_generation:
             LOGGER.warning("Discarded observation captured across a hand-feedback pause; recapturing")
             continue
+        debug_id = _debug_policy_request(observation)
         started = time.monotonic()
         try:
             action = policy.get_action(observation)
-        except BaseException:
+        except BaseException as exc:
+            _debug_action_event("policy_response", request_id=debug_id,
+                                inference_s=time.monotonic() - started, error=str(exc))
             _raise_if_immediate_control(actuator)
             raise
         inference_s = time.monotonic() - started
+        _debug_action_event("policy_response", request_id=debug_id,
+                            inference_s=inference_s, action=action)
         if actuator is not None:
             _raise_if_immediate_control(actuator)
             _wait_for_hand_feedback(actuator)
@@ -1919,6 +2028,8 @@ def infer_chunk(
                 hand_pause_generation=pause_generation,
                 end_effector=chunk.end_effector,
             )
+        _debug_plan("validated_chunk", chunk, request_id=debug_id,
+                    instruction=instruction, inference_s=inference_s)
         return chunk, inference_s
 
 
@@ -1952,13 +2063,18 @@ def infer_plan(
         if actuator is not None and _hand_pause_generation(actuator) != pause_generation:
             LOGGER.warning("Discarded observation captured across a hand-feedback pause; recapturing")
             continue
+        debug_id = _debug_policy_request(observation)
         started = time.monotonic()
         try:
             action = policy.get_action(observation)
-        except BaseException:
+        except BaseException as exc:
+            _debug_action_event("policy_response", request_id=debug_id,
+                                inference_s=time.monotonic() - started, error=str(exc))
             _raise_if_immediate_control(actuator)
             raise
         inference_s = time.monotonic() - started
+        _debug_action_event("policy_response", request_id=debug_id,
+                            inference_s=inference_s, action=action)
         if actuator is not None:
             _raise_if_immediate_control(actuator)
             _wait_for_hand_feedback(actuator)
@@ -1987,6 +2103,8 @@ def infer_plan(
                 hand_pause_generation=pause_generation,
                 end_effector=plan.end_effector,
             )
+        _debug_plan("validated_plan", plan, request_id=debug_id,
+                    instruction=instruction, inference_s=inference_s)
         return plan, inference_s
 
 
@@ -2055,8 +2173,7 @@ def _prepare_policy_goal(
         return "release"
     except HandFeedbackOperatorHold as exc:
         LOGGER.warning(
-            "Hand feedback crossed %.2f s during goal preparation; "
-            "remaining in powered HOLD: %s",
+            "Hand feedback crossed %.2f s during goal preparation; remaining in powered HOLD: %s",
             ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
             exc.detail,
             extra={"terminal_yellow": True},
@@ -2077,8 +2194,7 @@ def _prepare_policy_goal(
         _wait_for_hand_feedback(actuator)
     except HandFeedbackOperatorHold as exc:
         LOGGER.warning(
-            "Hand feedback crossed %.2f s before Warmup2 motion; "
-            "remaining in powered HOLD: %s",
+            "Hand feedback crossed %.2f s before Warmup2 motion; remaining in powered HOLD: %s",
             ACTUATOR_HAND_STATE_OPERATOR_HOLD_AGE_S,
             exc.detail,
             extra={"terminal_yellow": True},
@@ -2092,8 +2208,7 @@ def _prepare_policy_goal(
         )
     except HandFeedbackReplan as exc:
         LOGGER.warning(
-            "Warmup2 policy target was invalidated by a hand-feedback pause; "
-            "re-observing the same goal: %s",
+            "Warmup2 policy target was invalidated by a hand-feedback pause; re-observing the same goal: %s",
             exc.detail,
             extra={"terminal_yellow": True},
         )
@@ -2298,8 +2413,7 @@ def _run_active_goal_controlled(
             sequence = actuator.submit(chunk)
         except HandFeedbackReplan as exc:
             LOGGER.warning(
-                "Policy chunk was invalidated at installation by a hand-feedback pause; "
-                "re-observing goal %r: %s",
+                "Policy chunk was invalidated at installation by a hand-feedback pause; re-observing goal %r: %s",
                 task_name,
                 exc.detail,
                 extra={"terminal_yellow": True},
@@ -2385,6 +2499,8 @@ def _rtc_options(
     start_index: int,
     frozen_steps: int,
     ramp_rate: float | None,
+    *,
+    rtc_pure: bool = False,
 ) -> dict[str, object]:
     overlap = plan.length - start_index
     options: dict[str, object] = {
@@ -2393,9 +2509,108 @@ def _rtc_options(
         "rtc_overlap_steps": overlap,
         "rtc_frozen_steps": frozen_steps,
     }
-    if ramp_rate is not None:
+    if rtc_pure:
+        if ramp_rate is not None:
+            raise DeploymentError("--rtc-ramp-rate is not applicable with --rtc-pure")
+        options["rtc_pure"] = True
+    elif ramp_rate is not None:
         options["rtc_ramp_rate"] = ramp_rate
     return options
+
+
+def _calibrate_rtc_pure_delay(
+    policy: Gr00tClient,
+    plan: ActionChunk,
+    initial_inference_s: float,
+    state_reader: G1Dex3StateReader,
+    camera: TeleimagerCamera,
+    instruction: str,
+    contract: ModelContract,
+    args: argparse.Namespace,
+    *,
+    actuator: SafeG1Dex3Actuator | None = None,
+    allow_custom_instruction: bool,
+) -> float:
+    """Measure a discarded guided continuation before starting the action clock.
+
+    Ordinary first-chunk inference has no backward pass and is not a suitable
+    seed for guided RTC's latency estimate. The candidate returned here is
+    deliberately never parsed into a command or sent to the actuator.
+    """
+
+    overlap = plan.length - args.execution_horizon
+    configured_frozen = getattr(args, "rtc_frozen_steps", None)
+    frozen_steps = (
+        int(configured_frozen)
+        if configured_frozen is not None
+        else min(overlap, max(1, int(np.ceil(initial_inference_s * CONTROL_HZ)) + 1))
+    )
+    if not 1 <= frozen_steps <= overlap:
+        raise DeploymentError("RTC pure delay calibration has insufficient previous-action overlap")
+    pause_generation = _hand_pause_generation(actuator)
+    observation, _ = capture_policy_observation(
+        state_reader,
+        camera,
+        instruction,
+        contract,
+        actuator,
+        show_camera=getattr(args, "show_camera", False),
+        allow_custom_instruction=allow_custom_instruction,
+        vision_recorder=getattr(args, "_vision_recorder", None),
+    )
+    _raise_if_immediate_control(actuator)
+    options = _rtc_options(plan, args.execution_horizon, frozen_steps, None, rtc_pure=True)
+    started = time.monotonic()
+    try:
+        if actuator is None:
+            policy.get_action(observation, options)
+        else:
+            # A cold input-gradient pass can exceed the 1 s parent-heartbeat
+            # deadline. Use the worker's own ZMQ socket while servicing the
+            # actuator, including the existing immediate stop/release channel.
+            worker = _RtcInferenceWorker(args.policy_host, args.policy_port)
+            try:
+                worker.submit(_RtcRequest(0, observation, options))
+                while True:
+                    actuator.heartbeat()
+                    actuator.assert_healthy()
+                    _raise_if_immediate_control(actuator)
+                    response = worker.poll()
+                    if response is not None:
+                        if response.generation != 0:
+                            raise DeploymentError("RTC pure calibration received a stale response")
+                        if response.error is not None:
+                            raise DeploymentError(f"RTC pure delay calibration failed: {response.error}")
+                        if response.action is None:
+                            raise DeploymentError("RTC pure delay calibration returned no action")
+                        break
+                    time.sleep(0.01)
+            finally:
+                worker.close(wait=False)
+    except BaseException:
+        _raise_if_immediate_control(actuator)
+        raise
+    duration_s = time.monotonic() - started
+    _raise_if_immediate_control(actuator)
+    if actuator is not None:
+        _wait_for_hand_feedback(actuator)
+        if _hand_pause_generation(actuator) != pause_generation:
+            raise DeploymentError(
+                "Hand feedback changed during RTC pure calibration; refusing to execute the initial plan"
+            )
+    measured_delay_steps = max(1, int(np.ceil(duration_s * CONTROL_HZ)) + 1)
+    if measured_delay_steps > overlap:
+        raise DeploymentError(
+            f"RTC pure guided inference needs at least {measured_delay_steps} actions of delay "
+            f"budget, exceeding the first overlap of {overlap}; action execution was not started"
+        )
+    LOGGER.info(
+        "RTC PURE delay calibration: discarded guided continuation took %.3fs "
+        "(ordinary first chunk %.3fs); seeding delay history from guided timing",
+        duration_s,
+        initial_inference_s,
+    )
+    return duration_s
 
 
 def _drain_rtc_worker(
@@ -2541,6 +2756,19 @@ def _run_active_goal_rtc_controlled(
         allow_custom_instruction=allow_custom_instruction,
         vision_recorder=getattr(args, "_vision_recorder", None),
     )
+    if getattr(args, "rtc_pure", False):
+        initial_inference_s = _calibrate_rtc_pure_delay(
+            policy,
+            plan,
+            initial_inference_s,
+            state_reader,
+            camera,
+            instruction,
+            contract,
+            args,
+            actuator=actuator,
+            allow_custom_instruction=allow_custom_instruction,
+        )
     initial_command = _active_command_action(_poll_active_command(terminal))
     if initial_command == "hold":
         _finish_operator_stop(actuator)
@@ -2550,15 +2778,15 @@ def _run_active_goal_rtc_controlled(
         LOGGER.warning("Operator requested immediate orderly authority release during RTC")
         return "release"
     action_budget = (
-        args.execution_horizon * args.max_chunks
-        if action_budget_override is None
-        else int(action_budget_override)
+        args.execution_horizon * args.max_chunks if action_budget_override is None else int(action_budget_override)
     )
     try:
         current_sequence = actuator.start_rtc(plan, action_budget=action_budget)
     except HandFeedbackReplan:
         return "replan"
     current_plan = plan
+    _debug_plan("rtc_start", plan, sequence=current_sequence, task=task_name,
+                instruction=instruction, action_budget=action_budget)
     # Store the post-capture part of recent delays. Each request adds its own
     # measured capture delay exactly once when selecting the frozen prefix.
     response_delay_history: deque[int] = deque(maxlen=RTC_DELAY_HISTORY)
@@ -2650,6 +2878,10 @@ def _run_active_goal_rtc_controlled(
                         validate_target_steps=getattr(args, "command_conditioning", "xr") == "none",
                         end_effector=contract.end_effector,
                     )
+                    _debug_plan("rtc_replacement", replacement,
+                                expected_sequence=int(pending["sequence"]),
+                                request_index=int(pending["request_index"]),
+                                inference_s=response.inference_s)
                     current_sequence, actual_delay = actuator.replace_rtc(
                         replacement,
                         expected_sequence=int(pending["sequence"]),
@@ -2672,6 +2904,11 @@ def _run_active_goal_rtc_controlled(
                     _drain_rtc_worker(worker, actuator)
                     return "hold"
                 current_plan = replacement
+                _debug_action_event("rtc_handoff", sequence=current_sequence,
+                                    previous_sequence=int(pending["sequence"]),
+                                    request_index=int(pending["request_index"]),
+                                    actual_delay_actions=actual_delay,
+                                    inference_s=response.inference_s, task=task_name)
                 capture_actions = int(pending["capture_actions"])
                 response_delay_history.append(max(1, actual_delay - capture_actions))
                 handoff_count += 1
@@ -2752,6 +2989,18 @@ def _run_active_goal_rtc_controlled(
                         _drain_rtc_worker(worker, actuator)
                         return "hold"
                     request_count += 1
+                    if _ACTION_DEBUG_RECORDER is not None:
+                        _debug_action_event(
+                            "rtc_request_alignment", sequence=request_snapshot.sequence,
+                            request_index=request_snapshot.action_index,
+                            post_capture_index=post_capture_snapshot.action_index,
+                            overlap=overlap, frozen_steps=frozen_steps,
+                            reference_arm=reference_state.arm,
+                            reference_left_hand=reference_state.left_hand,
+                            reference_right_hand=reference_state.right_hand,
+                            previous_action=_rtc_previous_action(current_plan, request_snapshot.action_index),
+                            task=task_name, instruction=instruction,
+                        )
                     worker.submit(
                         _RtcRequest(
                             generation=request_snapshot.sequence,
@@ -2761,6 +3010,7 @@ def _run_active_goal_rtc_controlled(
                                 request_snapshot.action_index,
                                 frozen_steps,
                                 getattr(args, "rtc_ramp_rate", None),
+                                rtc_pure=bool(getattr(args, "rtc_pure", False)),
                             ),
                         )
                     )
@@ -2796,6 +3046,7 @@ def _run_shadow_rtc(
     args: argparse.Namespace,
     *,
     allow_custom_instruction: bool,
+    policy: Gr00tClient | None = None,
 ) -> None:
     """Exercise RTC transport/conditioning against a publisher-free virtual clock."""
 
@@ -2803,6 +3054,20 @@ def _run_shadow_rtc(
         "RTC SHADOW uses a virtual 30 Hz action clock and sends no commands. The robot state "
         "does not follow predictions, so this validates timing/protocol—not closed-loop RTC quality."
     )
+    if getattr(args, "rtc_pure", False):
+        if policy is None:
+            raise DeploymentError("RTC pure shadow calibration requires a policy client")
+        initial_inference_s = _calibrate_rtc_pure_delay(
+            policy,
+            initial_plan,
+            initial_inference_s,
+            state_reader,
+            camera,
+            instruction,
+            contract,
+            args,
+            allow_custom_instruction=allow_custom_instruction,
+        )
     action_budget = args.execution_horizon * args.max_chunks
     plan = initial_plan
     plan_index = 0
@@ -2918,6 +3183,7 @@ def _run_shadow_rtc(
                             request_index,
                             frozen_steps,
                             getattr(args, "rtc_ramp_rate", None),
+                            rtc_pure=bool(getattr(args, "rtc_pure", False)),
                         ),
                     )
                 )
@@ -2946,7 +3212,279 @@ def _run_shadow_rtc(
         worker.close(wait=True)
 
 
+def _read_policy_configuration(policy, args, *, end_effector, runtime_end_effector,
+                               instruction, allow_custom_instruction):
+    """Identical physical/vision/RTC checks at startup and after a held refresh."""
+    global _BLINDED_POLICY
+    contract = validate_model_contract(
+        policy.get_modality_config(),
+        end_effector=end_effector,
+    )
+    policy_metadata = policy.get_policy_metadata()
+    candidate_blinded = bool(policy_metadata.get("model_identity", {}).get("blinded", False))
+    _debug_action_event("policy_metadata", metadata=policy_metadata)
+    requires_surface_normals = getattr(
+        contract,
+        "requires_surface_normals",
+        contract.video_keys == ("ego_view", SURFACE_NORMAL_OUTPUT_KEY),
+    )
+    requires_depth_gray = getattr(
+        contract,
+        "requires_depth_gray",
+        contract.video_keys == ("ego_view", DEPTH_OUTPUT_KEY),
+    )
+    visual_encoding = validate_policy_metadata(
+        policy_metadata,
+        end_effector=end_effector,
+        instruction=instruction,
+        allow_custom_instruction=allow_custom_instruction,
+        requires_depth=requires_depth_gray,
+        requires_surface_normals=requires_surface_normals,
+        vision_input_contract=getattr(contract, "vision_input_contract", None),  # earlyfusion
+    )
+    if runtime_end_effector != end_effector:
+        LOGGER.warning(
+            "SIMULATION TRANSPORT ADAPTER: checkpoint metadata remains %s, while IsaacLab "
+            "state/commands use the compatible combined %s DDS profile",
+            end_effector,
+            runtime_end_effector,
+        )
+        contract = replace(contract, end_effector=runtime_end_effector)
+    if args.execution_horizon > contract.action_horizon:
+        raise DeploymentError(
+            f"Checkpoint action horizon is only {contract.action_horizon}, but "
+            f"{args.execution_horizon} steps were requested"
+        )
+    inference_mode = getattr(args, "inference_mode", "synchronous")
+    if inference_mode == "rtc" and contract.action_horizon < RTC_MIN_MODEL_HORIZON:
+        raise DeploymentError(
+            f"RTC requires a checkpoint trained for at least {RTC_MIN_MODEL_HORIZON} actions "
+            f"(RTC_MIN_MODEL_HORIZON={RTC_MIN_MODEL_HORIZON}); "
+            f"this checkpoint exposes {contract.action_horizon}. Use synchronous mode."
+        )
+    rtc_frozen_steps = getattr(args, "rtc_frozen_steps", None)
+    first_overlap = contract.action_horizon - args.execution_horizon
+    if inference_mode == "rtc" and rtc_frozen_steps is not None and rtc_frozen_steps > first_overlap:
+        raise DeploymentError(
+            f"--rtc-frozen-steps={rtc_frozen_steps} cannot fit the first RTC overlap of "
+            f"{first_overlap} actions (model horizon {contract.action_horizon} minus "
+            f"execution horizon {args.execution_horizon})"
+        )
+    if inference_mode == "rtc":
+        rtc_capability = policy_metadata.get("rtc")
+        expected_rtc = {
+            "protocol_version": 1,
+            "physical_action_tail": True,
+            "backend": "pytorch",
+        }
+        if not isinstance(rtc_capability, dict) or any(
+            rtc_capability.get(key) != value for key, value in expected_rtc.items()
+        ):
+            raise DeploymentError(
+                "GR00T server does not advertise the required RTC physical-tail protocol "
+                "and PyTorch backend; restart it with the RTC-capable server code"
+            )
+        if getattr(args, "rtc_pure", False):
+            if rtc_capability.get("pure_inference_guidance") is not True:
+                raise DeploymentError(
+                    "--rtc-pure requires a GR00T PyTorch server advertising "
+                    "rtc.pure_inference_guidance=true; restart the server with the updated code. "
+                    "The requested policy configuration has not been accepted."
+                )
+            LOGGER.warning(
+                "RTC PURE: opt-in gradient-guided action inpainting (input gradients only; "
+                "no weight updates). Expect additional inference latency; existing delay, "
+                "handoff and actuator limits remain active."
+            )
+    LOGGER.info(
+        "GR00T contract verified: video=%s + four G1/%s state/action keys, horizon %d",
+        "[hidden]" if candidate_blinded else ",".join(contract.video_keys),
+        end_effector,
+        contract.action_horizon,
+    )
+    _BLINDED_POLICY = candidate_blinded
+    return contract, policy_metadata, visual_encoding, requires_surface_normals, requires_depth_gray
+
+
+def _open_policy_vision(args, contract, policy_metadata, visual_encoding, *, end_effector,
+                        image_host, task_name, instruction, warmup1_metadata):
+    global _CONTINUOUS_DEMO_STREAM
+    camera = vision_recorder = demo_stream = None
+    inference_mode = getattr(args, "inference_mode", "synchronous")
+    try:
+        depth_encoding = visual_encoding if isinstance(visual_encoding, DepthEncodingContract) else None
+        surface_normal_encoding = (
+            visual_encoding if isinstance(visual_encoding, SurfaceNormalEncodingContract) else None
+        )
+        prefer_atomic_rgbd = _prefer_atomic_rgbd_for_camera(
+            end_effector,
+            requires_geometry=(depth_encoding is not None or surface_normal_encoding is not None),
+        )
+        camera = TeleimagerCamera(
+            image_host,
+            depth_encoding=depth_encoding,
+            surface_normal_encoding=surface_normal_encoding,
+            prefer_atomic_rgbd=prefer_atomic_rgbd,
+        )
+        head = camera.config["head_camera"]
+        LOGGER.info(
+            "TeleImager config: host=%s type=%s shape=%s binocular=%s fps=%s",
+            image_host,
+            head.get("type"),
+            head.get("image_shape"),
+            head.get("binocular"),
+            head.get("fps"),
+        )
+        record_vision = bool(getattr(args, "record_vision", False))
+        record_full = bool(getattr(args, "record_full", False))
+        show_demo = bool(getattr(args, "show_camera", False))
+        recording_metadata = _vision_recording_metadata(
+            end_effector=end_effector,
+            execution_horizon=args.execution_horizon,
+            image_host=image_host,
+            inference_mode=inference_mode,
+            surface_normal_encoding=surface_normal_encoding,
+            depth_colormap=getattr(contract, "depth_colormap", None),
+        )
+        model_identity = policy_metadata.get("model_identity")
+        recording_metadata["model_identity"] = (
+            dict(model_identity) if isinstance(model_identity, dict) else {}
+        )
+        recording_metadata["server_instance_id"] = policy_metadata.get("server_instance_id")
+        recording_metadata["client_log_directory"] = str(getattr(args, "_run_log_dir", ""))
+        recording_metadata["warmup1"] = warmup1_metadata
+        recording_metadata["debug_actions"] = bool(getattr(args, "debug_actions", False))
+        if getattr(args, "rtc_pure", False):
+            recording_metadata["rtc_pure"] = True
+        vision_recording_dir: Path | None = None
+        if record_vision or record_full:
+            run_log_dir = getattr(args, "_run_log_dir", None)
+            if run_log_dir is None:
+                raise DeploymentError("Vision recording requires the CLI per-run log directory")
+            recordings_dir = Path(args.vision_recordings_dir).expanduser().resolve()
+            try:
+                recordings_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            except OSError as exc:
+                raise DeploymentError(
+                    f"Could not create policy-vision recordings directory {recordings_dir}: {exc}"
+                ) from exc
+            if not isinstance(model_identity, dict) or not model_identity.get("model_name"):
+                LOGGER.warning(
+                    "Policy server did not supply its model identity; recording will use "
+                    "unknown-model/unknown-checkpoint. Restart the updated policy server "
+                    "to include the model name and checkpoint in new recording folders."
+                )
+            vision_recording_dir = recording_output_path(recordings_dir, model_identity)
+            if not record_vision:
+                # Reserve the named run before the full-mode worker creates its child.
+                vision_recording_dir.mkdir(mode=0o700, exist_ok=False)
+        if record_vision:
+            assert vision_recording_dir is not None
+            try:
+                vision_recorder = NonBlockingVisionRecorder(
+                    vision_recording_dir,
+                    contract.video_keys,
+                    metadata=recording_metadata,
+                    depth_colormap=contract.depth_colormap,
+                )
+            except Exception as exc:
+                raise DeploymentError(f"Could not start policy-vision recording: {exc}") from exc
+            args._vision_recorder = vision_recorder
+            LOGGER.info(
+                "Policy-vision recording enabled at %s (lossless PNG, capacity-one "
+                "drop-new worker; policy-request cadence, no extra camera subscription)",
+                vision_recording_dir,
+            )
+
+        if record_full or show_demo:
+            full_output = vision_recording_dir / "full_demo" if record_full else None
+            try:
+                demo_stream = ContinuousDemoStream(
+                    image_host=image_host,
+                    video_keys=tuple(dict.fromkeys(("ego_view", *contract.video_keys))),
+                    output_dir=full_output,
+                    metadata=recording_metadata,
+                    depth_encoding=depth_encoding,
+                    surface_normal_encoding=surface_normal_encoding,
+                    depth_colormap=contract.depth_colormap,
+                    show_camera=show_demo,
+                    target_fps=getattr(args, "demo_fps", 30.0),
+                    prefer_atomic_rgbd=prefer_atomic_rgbd,
+                )
+            except Exception as exc:
+                raise DeploymentError(f"Could not start continuous demo camera: {exc}") from exc
+            _CONTINUOUS_DEMO_STREAM = demo_stream
+            _mark_demo_event("session_start", task=task_name, instruction=instruction)
+            LOGGER.info(
+                "Continuous demo camera: target %.1f FPS independent of inference; recording=%s",
+                getattr(args, "demo_fps", 30.0), full_output,
+            )
+
+        return camera, vision_recorder, demo_stream
+    except BaseException:
+        _close_policy_vision(args, camera, vision_recorder, demo_stream)
+        raise
+
+
+def _close_policy_vision(args, camera, vision_recorder, demo_stream):
+    global _CONTINUOUS_DEMO_STREAM
+    _CONTINUOUS_DEMO_STREAM = None
+    args._vision_recorder = None
+    errors = []
+    for resource in (demo_stream, camera, vision_recorder):
+        if resource is not None:
+            try:
+                resource.close()
+            except Exception as exc:
+                errors.append(exc)
+    if errors:
+        raise DeploymentError("Could not close the previous camera/recording session") from errors[0]
+
+
+def _run_held_policy_io(actuator, operation):
+    """Bounded HOLD-only I/O; keep the watchdog serviced, never command a pose.
+
+    The heartbeat helper has a hard 45 s lifetime: a hung refresh cannot keep
+    authority alive indefinitely. Normal calls have their own shorter timeouts.
+    Only the main thread consumes actuator acknowledgements or uses ZMQ sockets.
+    """
+    if getattr(actuator, "_holding", True) is not True:
+        raise DeploymentError("Policy refresh requires an acknowledged powered HOLD")
+    checker = getattr(actuator, "assert_healthy", None)
+    if callable(checker):
+        checker()
+    stopped = threading.Event()
+    expired = threading.Event()
+
+    def heartbeat():
+        deadline = time.monotonic() + 45.0
+        while not stopped.is_set():
+            if time.monotonic() >= deadline:
+                expired.set()
+                actuator.request_immediate_release()
+                return
+            beat = getattr(actuator, "heartbeat", None)
+            if callable(beat):
+                beat()
+            stopped.wait(0.05)
+
+    worker = threading.Thread(target=heartbeat, name="held-refresh-watchdog", daemon=True)
+    worker.start()
+    try:
+        result = _run_with_immediate_operator_keys(actuator, operation)
+        _raise_if_immediate_control(actuator)
+        if callable(checker):
+            checker()
+        if expired.is_set():
+            raise OperatorRelease
+        return result
+    finally:
+        stopped.set()
+        worker.join(timeout=0.2)
+
+
 def run(args: argparse.Namespace) -> None:
+    global _CONTINUOUS_DEMO_STREAM, _ACTION_DEBUG_RECORDER
     validate_args(args)
     repository_root = Path(__file__).resolve().parents[2]
     os.chdir(repository_root)
@@ -2979,21 +3517,44 @@ def run(args: argparse.Namespace) -> None:
         end_effector=runtime_end_effector,
     )
     warmup1_enabled = bool(getattr(args, "warmup1", False))
-    warmup1 = training_start_spec(runtime_end_effector) if warmup1_enabled else None
-    warmup1_source = training_start_source(runtime_end_effector) if warmup1_enabled else None
+    warmup1, warmup1_source = (
+        load_warmup1_pose(runtime_end_effector, getattr(args, "warmup1_pose_file", None),
+                         pose_name=getattr(args, "warmup1_pose", None))
+        if warmup1_enabled else (None, None)
+    )
+    warmup1_metadata = None if warmup1 is None else {
+        "label": warmup1.label,
+        "end_effector": warmup1.end_effector,
+        "arm_unit": "rad",
+        "hand_unit": get_end_effector_profile(runtime_end_effector).value_unit,
+        "arm": warmup1.arm.tolist(),
+        "left_hand": warmup1.left_hand.tolist(),
+        "right_hand": warmup1.right_hand.tolist(),
+        "source": warmup1_source,
+    }
+    run_log_dir = getattr(args, "_run_log_dir", None)
+    if run_log_dir is not None:
+        write_json(Path(run_log_dir) / "warmup1_pose.json", warmup1_metadata)
     startup_elbow_settle = (
         inspire_startup_elbow_settle_spec(runtime_end_effector)
         if configured_initialization.mode == "xr-home" and runtime_end_effector != "dex3"
         else None
     )
     return_to_start_enabled = bool(getattr(args, "return_to_start", False))
-    # The -0.05 elbow settle is deliberately initial-start only. Return-to-Start
-    # continues to replay the canonical -0.15 XR-home and optional Warmup1.
-    return_to_start_specs = tuple(
-        spec
-        for spec in (configured_initialization, warmup1)
-        if spec is not None and spec.moves
+    # The -0.15 XR-home is only the initial walking/staging pose.
+    # With Warmup1 enabled, return directly to that reviewed pose. Otherwise
+    # Inspire returns use the -0.05 desk pose. Warmup2 never sets a reset target.
+    # Reuse the exact validated settle mode; xr-home itself must stay -0.15.
+    return_initialization = (
+        replace(
+            startup_elbow_settle,
+            label=startup_elbow_settle.label.replace("startup elbow settle", "Return-to-Start"),
+        )
+        if startup_elbow_settle is not None
+        else configured_initialization
     )
+    return_target = warmup1 if warmup1 is not None else return_initialization
+    return_to_start_specs = (return_target,) if return_target.moves else ()
     image_host = args.image_host or ("127.0.0.1" if args.sim else "192.168.123.164")
 
     policy: Gr00tClient | None = None
@@ -3002,88 +3563,40 @@ def run(args: argparse.Namespace) -> None:
     actuator: SafeG1Dex3Actuator | None = None
     voice_server: VoiceCommandServer | None = None
     vision_recorder: NonBlockingVisionRecorder | None = None
+    demo_stream: ContinuousDemoStream | None = None
+    action_debug: ActionDebugRecorder | None = None
     args._vision_recorder = None
     cleanup_error: Exception | None = None
     try:
+        if getattr(args, "debug_actions", False):
+            if run_log_dir is None:
+                raise DeploymentError("--debug-actions requires a per-run log directory")
+            action_debug = ActionDebugRecorder(Path(run_log_dir) / "action_debug", metadata={
+                "end_effector": runtime_end_effector,
+                "arm_unit": "rad",
+                "hand_unit": get_end_effector_profile(runtime_end_effector).value_unit,
+                "execution_horizon": args.execution_horizon,
+                "inference_mode": getattr(args, "inference_mode", "synchronous"),
+                "rtc_pure": bool(getattr(args, "rtc_pure", False)),
+                "warmup1": warmup1_metadata,
+            })
+            _ACTION_DEBUG_RECORDER = action_debug
+            LOGGER.info("ACTION_DEBUG_DIR=%s (bounded non-blocking recording; check drop summary)",
+                        Path(run_log_dir) / "action_debug")
         policy = Gr00tClient(args.policy_host, args.policy_port)
         if not policy.ping():
             raise DeploymentError(f"GR00T server at {args.policy_host}:{args.policy_port} did not answer ping")
-        contract = validate_model_contract(
-            policy.get_modality_config(),
-            end_effector=end_effector,
+        contract, policy_metadata, visual_encoding, requires_surface_normals, requires_depth_gray = _read_policy_configuration(
+            policy, args, end_effector=end_effector, runtime_end_effector=runtime_end_effector,
+            instruction=instruction, allow_custom_instruction=allow_custom_instruction,
         )
-        policy_metadata = policy.get_policy_metadata()
-        requires_surface_normals = getattr(
-            contract,
-            "requires_surface_normals",
-            contract.video_keys == ("ego_view", SURFACE_NORMAL_OUTPUT_KEY),
-        )
-        requires_depth_gray = getattr(
-            contract,
-            "requires_depth_gray",
-            contract.video_keys == ("ego_view", DEPTH_OUTPUT_KEY),
-        )
-        visual_encoding = validate_policy_metadata(
-            policy_metadata,
-            end_effector=end_effector,
-            instruction=instruction,
-            requires_depth=requires_depth_gray,
-            requires_surface_normals=requires_surface_normals,
-            vision_input_contract=getattr(contract, "vision_input_contract", None),  # earlyfusion
-        )
-        if runtime_end_effector != end_effector:
-            LOGGER.warning(
-                "SIMULATION TRANSPORT ADAPTER: checkpoint metadata remains %s, while IsaacLab "
-                "state/commands use the compatible combined %s DDS profile",
-                end_effector,
-                runtime_end_effector,
-            )
-            contract = replace(contract, end_effector=runtime_end_effector)
-        if args.execution_horizon > contract.action_horizon:
-            raise DeploymentError(
-                f"Checkpoint action horizon is only {contract.action_horizon}, but "
-                f"{args.execution_horizon} steps were requested"
-            )
         inference_mode = getattr(args, "inference_mode", "synchronous")
-        if inference_mode == "rtc" and contract.action_horizon < RTC_MIN_MODEL_HORIZON:
-            raise DeploymentError(
-                f"RTC requires a checkpoint trained for at least {RTC_MIN_MODEL_HORIZON} actions "
-                f"(RTC_MIN_MODEL_HORIZON={RTC_MIN_MODEL_HORIZON}); "
-                f"this checkpoint exposes {contract.action_horizon}. Use synchronous mode."
-            )
-        rtc_frozen_steps = getattr(args, "rtc_frozen_steps", None)
-        first_overlap = contract.action_horizon - args.execution_horizon
-        if inference_mode == "rtc" and rtc_frozen_steps is not None and rtc_frozen_steps > first_overlap:
-            raise DeploymentError(
-                f"--rtc-frozen-steps={rtc_frozen_steps} cannot fit the first RTC overlap of "
-                f"{first_overlap} actions (model horizon {contract.action_horizon} minus "
-                f"execution horizon {args.execution_horizon})"
-            )
-        if inference_mode == "rtc":
-            rtc_capability = policy_metadata.get("rtc")
-            expected_rtc = {
-                "protocol_version": 1,
-                "physical_action_tail": True,
-                "backend": "pytorch",
-            }
-            if not isinstance(rtc_capability, dict) or any(
-                rtc_capability.get(key) != value for key, value in expected_rtc.items()
-            ):
-                raise DeploymentError(
-                    "GR00T server does not advertise the required RTC physical-tail protocol "
-                    "and PyTorch backend; restart it with the RTC-capable server code"
-                )
-        LOGGER.info(
-            "GR00T contract verified: video=%s + four G1/%s state/action keys, horizon %d",
-            ",".join(contract.video_keys),
-            end_effector,
-            contract.action_horizon,
-        )
         if end_effector != "dex3":
             LOGGER.info(
                 "Inspire %s contract enabled: native normalized 6-DoF hand values; "
-                "XR conditioning limits each final hand write to 0.2 normalized units",
+                "XR conditioning limits each final hand write to %.2f normalized units",
                 end_effector.removeprefix("inspire-").upper(),
+                get_end_effector_profile(runtime_end_effector).conditioned_step[0],
             )
         elif getattr(args, "command_conditioning", "xr") == "xr":
             LOGGER.info(
@@ -3105,65 +3618,17 @@ def run(args: argparse.Namespace) -> None:
             "inspire-ftp": G1InspireFtpStateReader,
         }
         state_reader = state_readers[runtime_end_effector](simulation=args.sim)
-        depth_encoding = visual_encoding if isinstance(visual_encoding, DepthEncodingContract) else None
-        surface_normal_encoding = (
-            visual_encoding if isinstance(visual_encoding, SurfaceNormalEncodingContract) else None
+        camera, vision_recorder, demo_stream = _open_policy_vision(
+            args, contract, policy_metadata, visual_encoding, end_effector=end_effector,
+            image_host=image_host, task_name=task_name, instruction=instruction,
+            warmup1_metadata=warmup1_metadata,
         )
-        prefer_atomic_rgbd = _prefer_atomic_rgbd_for_camera(
-            end_effector,
-            requires_geometry=(
-                depth_encoding is not None or surface_normal_encoding is not None
-            ),
-        )
-        camera = TeleimagerCamera(
-            image_host,
-            depth_encoding=depth_encoding,
-            surface_normal_encoding=surface_normal_encoding,
-            prefer_atomic_rgbd=prefer_atomic_rgbd,
-        )
-        head = camera.config["head_camera"]
-        LOGGER.info(
-            "TeleImager config: host=%s type=%s shape=%s binocular=%s fps=%s",
-            image_host,
-            head.get("type"),
-            head.get("image_shape"),
-            head.get("binocular"),
-            head.get("fps"),
-        )
-        if bool(getattr(args, "record_vision", False)):
-            run_log_dir = getattr(args, "_run_log_dir", None)
-            if run_log_dir is None:
-                raise DeploymentError("--record-vision requires the CLI per-run log directory")
-            vision_recording_dir = Path(run_log_dir) / "vision_recording"
-            recording_metadata = _vision_recording_metadata(
-                end_effector=end_effector,
-                execution_horizon=args.execution_horizon,
-                image_host=image_host,
-                inference_mode=inference_mode,
-                surface_normal_encoding=surface_normal_encoding,
-            )
-            try:
-                vision_recorder = NonBlockingVisionRecorder(
-                    vision_recording_dir,
-                    contract.video_keys,
-                    metadata=recording_metadata,
-                )
-            except Exception as exc:
-                raise DeploymentError(f"Could not start policy-vision recording: {exc}") from exc
-            args._vision_recorder = vision_recorder
-            LOGGER.info(
-                "Policy-vision recording enabled at %s (lossless PNG, capacity-one "
-                "drop-new worker; policy-request cadence, no extra camera subscription)",
-                vision_recording_dir,
-            )
 
         # Complete one observation -> server -> validated action pass while no
         # command publisher exists.  This output is deliberately discarded.
         policy.reset()
         preflight_validation = args.actuate and not (
-            configured_initialization.moves
-            or warmup1 is not None
-            or getattr(args, "policy_warm_start", True)
+            configured_initialization.moves or warmup1 is not None or getattr(args, "policy_warm_start", True)
         )
         if inference_mode == "rtc":
             preflight, inference_s = infer_plan(
@@ -3222,6 +3687,7 @@ def run(args: argparse.Namespace) -> None:
                     contract,
                     args,
                     allow_custom_instruction=allow_custom_instruction,
+                    policy=policy,
                 )
                 return
             LOGGER.info(
@@ -3278,6 +3744,10 @@ def run(args: argparse.Namespace) -> None:
         # callers with older hand-built Namespaces retain the actuator's
         # default-on behavior without changing their constructor call shape.
         actuator_kwargs = {}
+        if action_debug is not None:
+            actuator_kwargs["action_debug_sink"] = action_debug.make_sink("actuator")
+        if getattr(args, "action_interpolation", "legacy") != "legacy":
+            actuator_kwargs["action_interpolation"] = args.action_interpolation
         if hasattr(args, "gravity_feedforward"):
             actuator_kwargs["gravity_feedforward"] = args.gravity_feedforward
         if runtime_end_effector != "dex3":
@@ -3305,11 +3775,13 @@ def run(args: argparse.Namespace) -> None:
         LOGGER.warning("%s COMMAND MODE ARMED", "SIMULATION" if args.sim else "REAL ROBOT")
 
         confirm_initialization(actuator, configured_initialization)
+        _mark_demo_event("initialization_start", label=configured_initialization.label)
         _run_blocking_motion_with_immediate_release(
             actuator,
             lambda: actuator.initialize(configured_initialization),
             stage="INITIALIZATION",
         )
+        _mark_demo_event("initialization_complete", label=configured_initialization.label)
         if _hand_convergence_is_software_verified(configured_initialization.end_effector):
             LOGGER.warning("Initialization completed: %s", configured_initialization.label)
         else:
@@ -3337,11 +3809,13 @@ def run(args: argparse.Namespace) -> None:
             assert warmup1 is not None
             assert warmup1_source is not None
             confirm_initialization(actuator, warmup1, stage="WARMUP1")
+            _mark_demo_event("warmup1_start")
             _run_blocking_motion_with_immediate_release(
                 actuator,
-                lambda: actuator.warmup_pose(warmup1),
+                lambda: actuator.warmup1_pose(warmup1),
                 stage="WARMUP1",
             )
+            _mark_demo_event("warmup1_complete")
             LOGGER.warning(
                 "Warmup1 completed: %s (converted episode=%s source episode=%s frame=%s)",
                 warmup1.label,
@@ -3368,13 +3842,61 @@ def run(args: argparse.Namespace) -> None:
         # Warmup2 is governed by --warmup2 for the first goal and for the next
         # goal after an explicit Return-to-Start reset. Direct replacement goals
         # use the independent --future-goal-warmup2 setting. Return-to-Start
-        # replays the selected fixed initialization and Warmup1 poses while the
-        # actuator remains armed; direct replacement goals replay neither.
+        # moves directly to Warmup1 when selected, otherwise the fixed reset
+        # target (Inspire: -0.05 desk pose). Direct goals replay neither.
         if sys.stdin.isatty():
             print(
                 "\nACTIVE GOAL CONTROLS (NO ENTER): press s to STOP in a powered position hold; "
                 "press q to release authority and exit. Ctrl-C also releases from any state."
             )
+
+        policy_refresh_required = False
+
+        def refresh_policy_in_hold():
+            nonlocal policy, contract, policy_metadata, visual_encoding
+            nonlocal requires_surface_normals, requires_depth_gray
+            nonlocal camera, vision_recorder, demo_stream
+            candidate = Gr00tClient(args.policy_host, args.policy_port)
+            try:
+                if not candidate.ping():
+                    raise DeploymentError("Policy server did not answer ping")
+                candidate_config = _read_policy_configuration(
+                    candidate, args, end_effector=end_effector, runtime_end_effector=runtime_end_effector,
+                    instruction=instruction, allow_custom_instruction=allow_custom_instruction,
+                )
+                _raise_if_immediate_control(actuator)
+                _mark_demo_event("model_refresh_begin")
+                previous = camera, vision_recorder, demo_stream
+                camera = vision_recorder = demo_stream = None
+                _close_policy_vision(args, *previous)
+                policy.close()
+                policy = candidate
+                contract, policy_metadata, visual_encoding, requires_surface_normals, requires_depth_gray = candidate_config
+                camera, vision_recorder, demo_stream = _open_policy_vision(
+                    args, contract, policy_metadata, visual_encoding, end_effector=end_effector,
+                    image_host=image_host, task_name=task_name, instruction=instruction,
+                    warmup1_metadata=warmup1_metadata,
+                )
+                _raise_if_immediate_control(actuator)
+                policy.reset()
+                # Validate a fresh observation/action without publishing it. No warmup,
+                # startup pose, old RTC prefix, or returned action is sent to the robot.
+                preflight_args = (policy, state_reader, camera, instruction, contract)
+                preflight_fn = infer_plan if inference_mode == "rtc" else infer_chunk
+                if inference_mode != "rtc":
+                    preflight_args += (args.execution_horizon,)
+                preflight_fn(*preflight_args, actuator=actuator, camera_timeout_s=3.0,
+                             validate_initial_step=False,
+                             command_conditioning=getattr(args, "command_conditioning", "xr"),
+                             allow_custom_instruction=allow_custom_instruction,
+                             vision_recorder=vision_recorder)
+                if policy.get_policy_metadata() != policy_metadata:
+                    raise DeploymentError("Server changed during refresh; retry refresh")
+                policy.reset()
+                _mark_demo_event("model_refresh_complete")
+            finally:
+                if candidate is not policy:
+                    candidate.close()
 
         first_goal = True
         warmup2_after_return_to_start = False
@@ -3385,6 +3907,7 @@ def run(args: argparse.Namespace) -> None:
                 if first_goal or warmup2_after_return_to_start
                 else bool(getattr(args, "future_goal_warmup2", True))
             )
+            _mark_demo_event("goal_preparation", task=task_name, warmup2=warmup2_enabled)
             preparation = _prepare_policy_goal(
                 policy,
                 state_reader,
@@ -3403,6 +3926,7 @@ def run(args: argparse.Namespace) -> None:
                 outcome = "hold"
             else:
                 warmup2_after_return_to_start = False
+                _mark_demo_event("goal_start", task=task_name, instruction=instruction)
                 runner = _run_active_goal_rtc if inference_mode == "rtc" else _run_active_goal
                 outcome = runner(
                     policy,
@@ -3415,6 +3939,7 @@ def run(args: argparse.Namespace) -> None:
                     args,
                     allow_custom_instruction=allow_custom_instruction,
                 )
+            _mark_demo_event("goal_end", task=task_name, outcome=outcome)
             if outcome == "release":
                 break
             if outcome == "complete":
@@ -3449,25 +3974,73 @@ def run(args: argparse.Namespace) -> None:
                     selector_kwargs["confirm_voice_text"] = bool(getattr(args, "confirm_text", False))
                 next_goal = _select_next_goal_while_holding(actuator, **selector_kwargs)
                 custom_goal_mode = mode_state["custom_goal_mode"]
+                if next_goal == REFRESH_POLICY:
+                    policy_refresh_required = True
+                    try:
+                        _run_held_policy_io(actuator, refresh_policy_in_hold)
+                    except OperatorRelease:
+                        next_goal = None
+                        break
+                    except OperatorStop:
+                        LOGGER.warning("Refresh interrupted; staying in HOLD. Type refresh to retry.")
+                    except Exception as exc:
+                        _raise_if_immediate_control(actuator)
+                        checker = getattr(actuator, "assert_healthy", None)
+                        if callable(checker):
+                            checker()
+                        LOGGER.warning("Refresh failed; staying in HOLD; retry refresh before choosing a goal: %s",
+                                       type(exc).__name__ if _BLINDED_POLICY else exc)
+                    else:
+                        policy_refresh_required = False
+                        LOGGER.warning("Policy refreshed. Still in powered HOLD; choose a goal explicitly to resume.")
+                    continue
                 if isinstance(next_goal, tuple):
-                    validate_policy_metadata(
-                        policy_metadata,
-                        end_effector=end_effector,
-                        instruction=next_goal[1],
-                        requires_depth=requires_depth_gray,
-                        requires_surface_normals=requires_surface_normals,
-                        vision_input_contract=getattr(contract, "vision_input_contract", None),
-                    )
+                    if policy_refresh_required:
+                        LOGGER.warning("Policy refresh required; staying in HOLD. Type refresh, or q to release.")
+                        continue
+                    try:
+                        if policy_metadata.get("server_instance_id"):
+                            current_metadata = _run_held_policy_io(actuator, policy.get_policy_metadata)
+                            if current_metadata != policy_metadata:
+                                policy_refresh_required = True
+                                LOGGER.warning("Policy server changed. Staying in HOLD; press Ctrl+R before choosing a goal.")
+                                continue
+                        validate_policy_metadata(
+                            policy_metadata,
+                            end_effector=end_effector,
+                            instruction=next_goal[1],
+                            allow_custom_instruction=next_goal[0] == "custom-goal",
+                            requires_depth=requires_depth_gray,
+                            requires_surface_normals=requires_surface_normals,
+                            vision_input_contract=getattr(contract, "vision_input_contract", None),
+                        )
+                    except OperatorRelease:
+                        next_goal = None
+                        break
+                    except OperatorStop:
+                        continue
+                    except Exception as exc:
+                        _raise_if_immediate_control(actuator)
+                        checker = getattr(actuator, "assert_healthy", None)
+                        if callable(checker):
+                            checker()
+                        policy_refresh_required = True
+                        LOGGER.warning("Could not verify policy; staying in HOLD. Type refresh: %s",
+                                       type(exc).__name__ if _BLINDED_POLICY else exc)
+                        continue
                 if next_goal is not None:
                     acknowledge = getattr(actuator, "acknowledge_hand_operator_hold", None)
                     if callable(acknowledge):
                         acknowledge()
                 if next_goal != RETURN_TO_START:
                     break
+                _mark_demo_event("return_to_start_begin")
                 decision = _run_return_to_start_sequence_from_hold(
                     actuator,
                     return_to_start_specs,
+                    warmup1_spec=warmup1,
                 )
+                _mark_demo_event("return_to_start_end", outcome=decision)
                 if decision == "release":
                     next_goal = None
                     break
@@ -3484,6 +4057,7 @@ def run(args: argparse.Namespace) -> None:
     finally:
         active_exception = sys.exc_info()[1]
         active_error = active_exception is not None
+        _mark_demo_event("client_exit_begin", error=active_error)
         if voice_server is not None:
             voice_server.close()
         if actuator is not None:
@@ -3492,6 +4066,21 @@ def run(args: argparse.Namespace) -> None:
             except Exception as exc:
                 LOGGER.exception("Actuator cleanup failed")
                 cleanup_error = exc
+        _ACTION_DEBUG_RECORDER = None
+        if action_debug is not None:
+            try:
+                LOGGER.info("Action debug recording summary: %s", action_debug.close())
+            except Exception:
+                LOGGER.exception("Action debug cleanup failed after robot release")
+        if demo_stream is not None:
+            try:
+                _mark_demo_event("actuator_cleanup_complete", cleanup_error=cleanup_error is not None)
+                demo_stream.close()
+                LOGGER.info("Continuous demo camera summary: %s", demo_stream.stats)
+            except Exception:
+                LOGGER.exception("Demo camera cleanup failed after robot release")
+            finally:
+                _CONTINUOUS_DEMO_STREAM = None
         if camera is not None:
             try:
                 camera.close()
@@ -3520,13 +4109,30 @@ def run(args: argparse.Namespace) -> None:
             raise DeploymentError(f"Actuator cleanup failed: {cleanup_error}") from cleanup_error
 
 
+class _DeploymentArgumentParser(argparse.ArgumentParser):
+    """Resolve profile-dependent defaults without overriding explicit opt-outs."""
+
+    def parse_known_args(self, args=None, namespace=None):
+        parsed, remaining = super().parse_known_args(args, namespace)
+        inspire_ftp = parsed.end_effector == "inspire-ftp"
+        if parsed.allow_unqualified_real is None:
+            parsed.allow_unqualified_real = inspire_ftp
+        if parsed.allow_inspire_ftp_unverified_stop is None:
+            parsed.allow_inspire_ftp_unverified_stop = inspire_ftp
+        if parsed.return_to_start is None:
+            parsed.return_to_start = parsed.actuate
+        if parsed.rtc_pure:
+            parsed.inference_mode = "rtc"
+        return parsed, remaining
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Colour/RGBD GR00T runner for Unitree G1-29")
+    parser = _DeploymentArgumentParser(description="Colour/RGBD GR00T runner for Unitree G1-29")
     parser.add_argument(
         "--end-effector",
         choices=("dex3", "inspire-dfx", "inspire-ftp"),
-        default="dex3",
-        help="Hand data/transport contract (default: dex3); Inspire real use requires explicit expert overrides",
+        default="inspire-ftp",
+        help="Hand data/transport contract (default: inspire-ftp, with its expert acknowledgements enabled)",
     )
     goal_group = parser.add_mutually_exclusive_group()
     goal_group.add_argument("--task", choices=tuple(TASKS), help="Trained task ID; omit for a menu")
@@ -3565,10 +4171,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--voice-session-token-file",
         type=Path,
         metavar="PATH",
-        help=(
-            "File containing the voice session token; otherwise read "
-            "GROOT_VOICE_SESSION_TOKEN from the environment"
-        ),
+        help=("File containing the voice session token; otherwise read GROOT_VOICE_SESSION_TOKEN from the environment"),
     )
     parser.add_argument("--policy-host", default="127.0.0.1")
     parser.add_argument("--policy-port", type=int, default=5555)
@@ -3579,14 +4182,43 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--show-camera",
         action="store_true",
-        help="Show each decoded RGB/depth frame actually placed in the GR00T observation",
+        help=(
+            "Show a continuous demo RGB/geometry feed independent of inference; "
+            "fixed-Turbo depth is rendered automatically when required by the checkpoint"
+        ),
+    )
+    parser.add_argument(
+        "--record-full", "--record_full",
+        action="store_true",
+        help=(
+            "Continuously record demo RGB/geometry before initialization through client exit, "
+            "including warmups and holds; timestamped lossless PNGs under full_demo. "
+            "Independent of --record-vision and policy inference cadence"
+        ),
+    )
+    parser.add_argument(
+        "--demo-fps",
+        type=float,
+        default=30.0,
+        help="Target continuous preview/full-recording rate (default: 30; capped by source rate)",
     )
     parser.add_argument(
         "--record-vision",
         action="store_true",
         help=(
             "Losslessly record each policy-sampled vision observation in an isolated, "
-            "drop-on-overload worker below the per-run log directory"
+            "drop-on-overload worker below --vision-recordings-dir; checkpoint-bound "
+            "fixed-Turbo depth is saved in its model-visible colour scheme"
+        ),
+    )
+    parser.add_argument(
+        "--vision-recordings-dir",
+        type=Path,
+        default=DEFAULT_VISION_RECORDINGS_DIR,
+        metavar="DIR",
+        help=(
+            "Root for model/checkpoint/minute-named --record-vision and --record-full runs "
+            f"(default: {DEFAULT_VISION_RECORDINGS_DIR})"
         ),
     )
     parser.add_argument(
@@ -3602,6 +4234,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Blocking chunk execution (default) or experimental asynchronous Real-Time Chunking",
     )
     parser.add_argument(
+        "--rtc-pure",
+        action="store_true",
+        help=(
+            "Opt into gradient-guided RTC action inpainting on the policy server; selects "
+            "--inference-mode rtc even if synchronous was supplied. No finetune changes. "
+            "Requires an updated PyTorch server, adds inference latency, and cannot be "
+            "combined with --rtc-ramp-rate. Without this flag the existing sampler is unchanged"
+        ),
+    )
+    parser.add_argument(
         "--command-conditioning",
         choices=("xr", "none"),
         default="xr",
@@ -3610,6 +4252,17 @@ def build_parser() -> argparse.ArgumentParser:
             "measured-relative arm command-lead limiter and final arm/hand slew limits. Dex3 policy "
             "targets are not low-pass filtered a second time. Raw shape/finite/joint-limit "
             "validation remains mandatory; use none only for comparison"
+        ),
+    )
+    parser.add_argument(
+        "--action-interpolation",
+        choices=("legacy", "linear"),
+        default="legacy",
+        help=(
+            "Policy reference timing (default: legacy): retain held 30 Hz targets, or opt into "
+            "experimental linear sampling between scheduled targets at the 100 Hz publisher. "
+            "Linear requires XR conditioning and retains every existing safety guard; it is "
+            "not velocity/acceleration/jerk-limited trajectory planning. Warmups are unchanged"
         ),
     )
     parser.add_argument(
@@ -3658,6 +4311,17 @@ def build_parser() -> argparse.ArgumentParser:
             "the selected hand profile before policy inference (default: enabled)"
         ),
     )
+    warmup1_selection = parser.add_mutually_exclusive_group()
+    warmup1_selection.add_argument(
+        "--warmup1-pose", choices=WARMUP1_POSE_NAMES,
+        help=("Named Warmup1/reset pose: default keeps the current pose; "
+              "pyramid1 and pyramid2 select the two saved Inspire pyramid poses. No file needed."),
+    )
+    warmup1_selection.add_argument(
+        "--warmup1-pose-file", type=Path, metavar="JSON",
+        help=("Select a full measured Warmup1 pose JSON; omission preserves the current default. "
+              "Return-to-Start uses this same pose when Warmup1 is enabled. Warmup2 is independent."),
+    )
     parser.add_argument(
         "--warmup2",
         "--policy-warm-start",
@@ -3678,18 +4342,22 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "For each direct replacement goal that does not follow Return-to-Start, perform "
             "the guarded Warmup2 first-target transition before live execution (default: "
-            "enabled). Explicit Return-to-Start resets follow --warmup2 instead; initialization "
-            "and Warmup1 are repeated only by explicit Return-to-Start"
+            "enabled). Explicit Return-to-Start resets follow --warmup2 instead; the fixed "
+            "Warmup1 or initialization target is revisited only by explicit Return-to-Start"
         ),
     )
     parser.add_argument(
         "--return-to-start",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help=(
-            "Offer Shift+Tab in powered HOLD to replay the fixed initialization target and then "
-            "Warmup1 when enabled (default: disabled); the next selected goal follows Warmup2. "
-            "The initial-only Inspire elbow settle is not replayed. It is invalid with "
+            "Offer Shift+Tab in powered HOLD to return directly to Warmup1 when enabled, "
+            "otherwise the fixed initialization target (default: enabled with actuation, "
+            "disabled in shadow mode). Warmup2 never sets the return target; the next selected "
+            "goal follows --warmup2. Without Warmup1, Inspire returns to the -0.05 elbow desk "
+            "pose, never the initial -0.15 XR-home walking pose. Return motion runs at 1.596x "
+            "its ordinary stage speed. "
+            "It is invalid with "
             "--no-warmup1 --initialization measured. Inspire requires xr-home"
         ),
     )
@@ -3700,29 +4368,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--actuate",
-        action="store_true",
-        help="Create command publishers after preflight and the single-key r confirmation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Create command publishers after preflight and the single-key r confirmation "
+            "(default: enabled); --no-actuate selects read-only shadow mode"
+        ),
     )
     parser.add_argument(
         "--allow-unqualified-real",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
             "Expert override for unqualified real hand failover and Inspire's authorized 0.2 "
-            "normalized slew and teleop-parity gravity model"
+            "normalized slew and teleop-parity gravity model (default: enabled for Inspire FTP "
+            "only; not a safety guarantee)"
         ),
     )
     parser.add_argument(
         "--allow-inspire-ftp-unverified-stop",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
             "Additional RH56E2/FTP actuation acknowledgement: closing its command publishers "
-            "is not a verified stop and must be treated as leaving the last hand setpoint active"
+            "is not a verified stop and must be treated as leaving the last hand setpoint active "
+            "(default: enabled for Inspire FTP only)"
         ),
     )
     parser.add_argument(
         "--confirm-sim-network-isolated",
         action="store_true",
         help="Assert that no physical robot network is reachable during IsaacLab actuation",
+    )
+    parser.add_argument(
+        "--debug-actions", action="store_true",
+        help=("Record full-session policy chunks, RTC handovers, and sampled joint targets/feedback "
+              "under the run log's action_debug directory (default: off; bounded queue reports drops)"),
     )
     parser.add_argument(
         "--log-dir",

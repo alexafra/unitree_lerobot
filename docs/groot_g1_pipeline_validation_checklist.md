@@ -23,6 +23,12 @@ The Unitree runner must be the only arm/Dex3 command owner. Do not run
 `teleop_hand_and_arm.py`, Unitree `eval_g1.py`, replay tools, or another arm/hand DDS
 publisher at the same time. The TeleImager camera server should remain running.
 
+The runner now defaults to Inspire FTP with actuation enabled. This Dex3 ladder
+explicitly uses `--end-effector dex3` throughout and `--no-actuate` for every
+publisher-free test. Return-to-Start defaults to enabled for actuated runs;
+the bounded qualification commands below use `--no-return-to-start` so completion
+still releases authority. Initialization remains `measured` by default.
+
 ## Status legend
 
 - `[ ]` Not yet demonstrated.
@@ -359,6 +365,8 @@ conda activate unitree_lerobot
 python -m pip install -e .
 
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --end-effector dex3 \
+    --no-actuate \
     --task pick-red-cup \
     --policy-host 127.0.0.1 \
     --image-host 192.168.123.164 \
@@ -388,6 +396,8 @@ intended topology and final checkpoint:
 
 ```bash
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --end-effector dex3 \
+    --no-actuate \
     --task pick-red-cup \
     --policy-host 127.0.0.1 \
     --image-host 192.168.123.164 \
@@ -457,8 +467,12 @@ cd "$HOME/Development/unitree_lerobot"
 conda activate unitree_lerobot
 
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --end-effector dex3 \
     --sim \
     --actuate \
+    --no-return-to-start \
+    --no-warmup1 \
+    --no-warmup2 \
     --task pick-red-cup \
     --policy-host 127.0.0.1 \
     --image-host 127.0.0.1 \
@@ -503,6 +517,8 @@ it does not test closed-loop behavior because no predicted action moves the robo
 
 ```bash
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --end-effector dex3 \
+    --no-actuate \
     --task pick-red-cup \
     --policy-host 127.0.0.1 \
     --image-host 127.0.0.1 \
@@ -511,8 +527,9 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
     --max-chunks 100
 ```
 
-Then repeat in isolated IsaacLab with `--sim --actuate
---confirm-sim-network-isolated`. Keep automatic frozen-delay estimation initially.
+Then repeat in isolated IsaacLab, replacing `--no-actuate` with
+`--sim --actuate --no-return-to-start --confirm-sim-network-isolated`.
+Keep automatic frozen-delay estimation initially.
 
 - [ ] Server metadata advertises RTC protocol v1, physical action tails and direct
   PyTorch backend; an old/replay/wrapped server fails before DDS initialization.
@@ -590,8 +607,9 @@ Do not improvise network-unplug, process-kill or power-loss experiments on an un
 standing robot. Create the failure-injection plan with Unitree guidance and appropriate
 physical restraint first.
 
-`STOP`: `--allow-unqualified-real` is only an explicit research override. It does not
-satisfy this gate or make a workstation watchdog a robot-side safety system.
+`STOP`: `--allow-unqualified-real` is only a research override (explicitly required
+for Dex3/DFX; enabled by default for Inspire FTP). It does not satisfy this gate or
+make a workstation watchdog a robot-side safety system.
 
 ---
 
@@ -613,11 +631,15 @@ cd "$HOME/Development/unitree_lerobot"
 conda activate unitree_lerobot
 
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --end-effector dex3 \
     --task pick-toothpaste \
     --policy-host 127.0.0.1 \
     --image-host 192.168.123.164 \
     --network-interface "$ROBOT_NIC" \
     --initialization measured \
+    --no-warmup1 \
+    --no-warmup2 \
+    --no-return-to-start \
     --execution-horizon 1 \
     --max-chunks 1 \
     --actuate \
@@ -685,6 +707,11 @@ Before the first policy action, establish a task-valid start by one of these rou
 
 For a pose file:
 
+- [ ] Logged Warmup1/Warmup2 steps and duration match the stage-specific
+  accelerated rates, while XR-home/startup settle retain their ordinary rates.
+- [ ] Tracking, freshness, convergence dwell, and final hand-writer limits remain
+  satisfied throughout both accelerated warmups.
+
 - [ ] It uses the strict schema documented in `docs/groot_g1_dex3.md`.
 - [ ] Task ID and exact instruction match the selected task.
 - [ ] It names all 28 joints in exact training order.
@@ -707,12 +734,16 @@ cd "$HOME/Development/unitree_lerobot"
 conda activate unitree_lerobot
 
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --end-effector dex3 \
     --task pick-red-cup \
     --policy-host 127.0.0.1 \
     --image-host 192.168.123.164 \
     --network-interface "$ROBOT_NIC" \
     --initialization pose-file \
     --initial-pose-file "$INITIAL_POSE_FILE" \
+    --no-warmup1 \
+    --no-warmup2 \
+    --no-return-to-start \
     --execution-horizon 1 \
     --max-chunks 1 \
     --actuate \
@@ -734,8 +765,11 @@ measured`, omit the pose-file flag, and there will be no INITIALIZE gate.
 
 ## 15. Qualify normal ending before object contact
 
-Reaching `max-chunks`, pressing Ctrl-C, or detecting a fault enters cleanup: arm authority
-is ramped down and Dex3 `stopMotors` is attempted. This is not a task-level hold state. The
+With the examples' explicit `--no-return-to-start`, reaching `max-chunks` enters
+cleanup, as do Ctrl-C and faults: arm authority is ramped down and Dex3 `stopMotors`
+is attempted. With the actuated default Return-to-Start enabled, finite completion
+instead enters powered HOLD and offers the next-goal menu; return motion still
+requires an explicit request and confirmation. Cleanup is not a task-level hold state. The
 subsequent physical behavior depends on Unitree's controller and hand firmware, and could
 allow an object to move or fall.
 
@@ -789,8 +823,8 @@ Only after these stages pass should `max-chunks` approach a demonstration's task
 Current GR00T N1.7 inference does not return a task-complete token. The runner stops only
 when:
 
-- `--max-chunks` is reached;
-- the operator presses Ctrl-C;
+- `--max-chunks` is reached (powered HOLD by default, cleanup with `--no-return-to-start`);
+- the operator presses `s` for powered HOLD, or `q`/Ctrl-C for release;
 - a validation/watchdog fault occurs; or
 - an exception occurs.
 

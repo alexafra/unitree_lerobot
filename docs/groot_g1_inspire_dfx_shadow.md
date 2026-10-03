@@ -1,8 +1,9 @@
 # G1 Inspire DFX policy deployment
 
 The guarded GR00T client supports Inspire DFX in publisher-free shadow mode and
-in explicitly authorized, supervised real actuation. Dex3 remains the default
-and uses its existing 28-dimensional contract. Inspire checkpoints use a native
+in explicitly authorized, supervised real actuation. Inspire FTP is the default;
+select DFX explicitly and use `--no-actuate` for publisher-free shadow mode.
+Dex3 uses its existing 28-dimensional contract. Inspire checkpoints use a native
 26-dimensional contract and cannot be mixed with Dex3 data or models.
 
 ## Exact contract
@@ -28,6 +29,7 @@ publisher:
 cd /home/alex/Development/unitree_lerobot
 /home/alex/miniconda3/envs/unitree_lerobot/bin/python \
   -m unitree_lerobot.eval_robot.eval_groot_g1 \
+  --no-actuate \
   --end-effector inspire-dfx \
   --task stack-three-cups \
   --policy-host 127.0.0.1 \
@@ -112,6 +114,11 @@ laboratory choices, not manufacturer-qualified limits or safety certification.
    0, task `stack the three red cups.`). It is the whole-frame medoid of the 115
    stack-task training episode starts. It does not recreate legs, waist, pelvis
    height, object placement, or world pose.
+   Warmup1 runs at `1.68x` the ordinary interpolation rate; Warmup2 runs at
+   `1.26x`. Both are another 20% faster than their previous `1.40x` / `1.05x`
+   rates, about 16.7% less rate-limited motion time. XR-home and the initial-only elbow settle
+   retain their original rates, and the `0.2` normalized hand-writer cap is
+   unchanged.
 9. At INITIALIZE, STARTUP ELBOW SETTLE, WARMUP1, RUN, and WARMUP2, `r`
    advances after inspection.
    Because no qualified Inspire hand tracking-error threshold exists, endpoint
@@ -174,11 +181,17 @@ and DDS write success. Arm tracking remains hard-gated by the existing client.
 - During active motion or HOLD, `q` starts orderly release and exit. `Ctrl-C`
   uses the same cleanup path.
 
-Return-to-Start replays the established fixed reset chain and omits the
-initial-only elbow settle. With the command above, Shift+Tab from powered HOLD
-separately confirms and replays XR-home and then the reviewed Inspire Warmup1
-target. One post-chain visual hand gate
-follows the final stage. The replay does not reacquire authority or reuse policy
+Return-to-Start goes directly to the reviewed Warmup1 target when enabled,
+without a desk/home detour. Otherwise it goes to the desk pose (both elbows
+**-0.05 rad**, other arm joints zero, hands fully open). Warmup2 never determines
+this reset target. The **-0.15 rad** XR-home walking/staging pose is
+initial-start only and is not replayed. With `--no-warmup1`, reset ends at the
+-0.05 desk pose. Shift+Tab from powered HOLD confirms this single return motion.
+A visual hand gate follows the motion.
+Return keeps its additional **1.596x** stage multiplier:
+Warmup1 returns use `1.596 * 1.68 = 2.68128x` the ordinary rate, while desk
+returns remain `1.596x`, subject to existing hard limits. The return-only
+multiplier does not apply to startup or policy execution. The reset does not reacquire authority or reuse policy
 output. The next goal follows the ordinary Warmup2 gate when that stage is
 enabled. Inspire Return-to-Start deliberately requires the fixed `xr-home`
 initialization even when Warmup1 is enabled; measured initialization is not

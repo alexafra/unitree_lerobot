@@ -17,6 +17,7 @@ dds_state_profile_20s.log
 dds_state_profile_300s.log
 /logs/
 /unitree_lerobot/logs/
+/unitree_lerobot/Recordings_Data/
 run gr00t commands
 
 # Local hardware qualification and timing captures

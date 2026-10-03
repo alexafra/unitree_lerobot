@@ -127,9 +127,9 @@ def _inspire_metadata() -> dict:
     }
 
 
-def _profiles_are_exact_immutable_and_dex3_remains_default() -> None:
+def _profiles_are_exact_immutable_and_dex3_remains_selectable() -> None:
     parser = build_parser()
-    args = parser.parse_args(["--task", "pick-red-cup"])
+    args = parser.parse_args(["--task", "pick-red-cup", "--end-effector", "dex3"])
     assert args.end_effector == "dex3"
     assert get_end_effector_profile(args.end_effector) is DEX3_PROFILE
     assert INSPIRE_DFX_PROFILE.robot_type == "Unitree_G1_Inspire_HeadOnly"
@@ -158,6 +158,7 @@ def _inspire_live_cli_requires_the_exact_authorized_gates() -> None:
             "--end-effector",
             "inspire-dfx",
             "--no-warmup1",
+            "--no-actuate",
         ]
     )
     validate_args(shadow)
@@ -170,6 +171,7 @@ def _inspire_live_cli_requires_the_exact_authorized_gates() -> None:
             "inspire-dfx",
             "--no-warmup1",
             "--actuate",
+            "--no-return-to-start",
             "--network-interface",
             "eth-test",
             "--allow-unqualified-real",
@@ -185,6 +187,7 @@ def _inspire_live_cli_requires_the_exact_authorized_gates() -> None:
             "inspire-dfx",
             "--no-warmup1",
             "--actuate",
+            "--no-return-to-start",
             "--network-interface",
             "eth-test",
         ]
@@ -200,6 +203,7 @@ def _inspire_live_cli_requires_the_exact_authorized_gates() -> None:
             "inspire-dfx",
             "--no-warmup1",
             "--actuate",
+            "--no-return-to-start",
             "--network-interface",
             "eth-test",
             "--allow-unqualified-real",
@@ -218,6 +222,7 @@ def _inspire_live_cli_requires_the_exact_authorized_gates() -> None:
             "inspire-dfx",
             "--no-warmup1",
             "--sim",
+            "--no-actuate",
         ]
     )
     with _CASE.assertRaisesRegex(DeploymentError, "simulation is not qualified"):
@@ -320,7 +325,7 @@ def _xr_home_is_profile_aware_and_inspire_opens_both_hands_with_a_bounded_path()
         right_hand=np.ones(6),
         end_effector="inspire-dfx",
     )
-    with _CASE.assertRaisesRegex(DeploymentError, "symmetric elbow-lift pose"):
+    with _CASE.assertRaisesRegex(DeploymentError, "symmetric elbow pose"):
         validate_initialization_spec(wrong_arm)
 
 
@@ -407,6 +412,7 @@ def _inspire_checkpoint_mismatch_stops_before_dds_initialization() -> None:
             "inspire-dfx",
             "--no-warmup1",
             "--no-gravity-feedforward",
+            "--no-actuate",
         ]
     )
     metadata = _inspire_metadata()
@@ -1152,7 +1158,7 @@ def _actuator_profile_identity_is_passed_to_child_and_mismatch_fails_before_queu
 
 
 class InspireDfxShadowTests(unittest.TestCase):
-    test_profiles = staticmethod(_profiles_are_exact_immutable_and_dex3_remains_default)
+    test_profiles = staticmethod(_profiles_are_exact_immutable_and_dex3_remains_selectable)
     test_cli_gates = staticmethod(_inspire_live_cli_requires_the_exact_authorized_gates)
     test_profile_aware_xr_home = staticmethod(
         _xr_home_is_profile_aware_and_inspire_opens_both_hands_with_a_bounded_path

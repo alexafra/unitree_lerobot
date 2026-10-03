@@ -10,6 +10,14 @@ The runner can be on the GPU PC if that PC is connected to the robot network. Ot
 
 Task text is selected in the Unitree runner and included in every GR00T observation. The model server needs no text-input terminal.
 
+The runner now defaults to `--end-effector inspire-ftp` with actuation enabled.
+Every runnable Dex3 example below explicitly selects `--end-effector dex3`;
+publisher-free examples also require `--no-actuate`. Return-to-Start defaults
+to enabled for actuated runs and disabled with `--no-actuate`. The bounded
+actuation examples use `--no-return-to-start` to preserve release-on-completion.
+Initialization still defaults to `measured`; live Inspire runs with
+Return-to-Start require an explicit `--initialization xr-home`.
+
 ## 1. Keep TeleImager running on PC2
 
 Use the same TeleImager server and `cam_config_server.yaml` used while recording:
@@ -157,6 +165,8 @@ cd "$HOME/Development/unitree_lerobot"
 python -m pip install -e .
 
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --end-effector dex3 \
+    --no-actuate \
     --task pick-red-cup \
     --policy-host 127.0.0.1 \
     --image-host 192.168.123.164 \
@@ -168,26 +178,38 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
 Omit `--task` for a menu. The allowlisted IDs preserve the exact training strings:
 
 ```text
-pick-toothpaste  -> pick up the cylinder toothpaste.
-put-toothpaste   -> put down the cylinder toothpaste.
-pick-red-cup     -> pick up the red cup.
-put-red-cup      -> put down the red cup.
+pick-toothpaste                  -> pick up the cylinder toothpaste.
+down-toothpaste                  -> put down the cylinder toothpaste.
+pick-red-cup                     -> pick up the red cup.
+down-red-cup                     -> put down the red cup.
+pick-green-cup                   -> pick up the green cup.
+down-green-cup                   -> put down the green cup.
+build-cup-pyramid-left-to-right   -> build a cup pyramid left-to-right.
+pick-water-bottle                -> pick up the empty water bottle.
+down-water-bottle                -> put down the empty water bottle.
 ```
 
 Shadow mode constructs state/camera subscribers only; it does not construct DDS command publishers.
 
 Add `--show-camera` to any shadow, simulation, or real command to display each decoded
 `ego_view` frame actually placed in the GR00T observation. RGBD checkpoints also display
-`depth_gray_view`. Pressing `q` in a preview window stops the runner through normal cleanup.
+`depth_gray_view`. A checkpoint declaring `fixed_turbo_v1` automatically displays the exact
+pinned Turbo representation seen by the model. The policy wire frame remains replicated
+grayscale and the server applies the same transform exactly once. Pressing `q` in a preview
+window stops the runner through normal cleanup.
 
 Add `--record-vision` to save the exact vision arrays constructed for policy-request
 attempts, including publisher-free preflight, Warmup2, and any capture later discarded by
-a safety recapture. The files are written below the per-run log directory in
-`vision_recording/`: each selected video key has lossless PNG frames, `frames.jsonl`
+a safety recapture. By default the files are written to
+`unitree_lerobot/Recordings_Data/<unique-run-name>/`; use `--vision-recordings-dir` to move
+that root. Each selected video key has lossless PNG frames, `frames.jsonl`
 records the written samples and timestamps, `manifest.json` describes the contract, and
 `summary.json` reports submitted, written, and dropped counts plus writer status. The PNGs
-contain the client's uint8 RGB preprocessor inputs with the leading batch/time axes removed.
-They are not the server's post-crop, resized, or normalized model tensor.
+contain checkpoint-visible uint8 RGB inputs with the leading batch/time axes removed. For a
+`fixed_turbo_v1` checkpoint, the saved depth PNG and preview use the exact checkpoint-bound
+Turbo LUT while submission to the policy remains grayscale. Other depth and surface-normal
+checkpoints are unchanged. These are pre-crop, pre-resize, and pre-normalization pixels, not
+the final model tensor.
 
 This is policy-request-cadence evidence, **not** a continuous 30 fps camera recording. The
 recorder reuses the observation already built for inference, opens no extra TeleImager
@@ -195,7 +217,7 @@ subscription or network stream, and never recomputes depth or surface normals. E
 disk I/O run in a low-priority spawned process behind a capacity-one, drop-new queue, so a
 slow disk drops recording samples instead of backpressuring robot processing. This design
 minimizes interference but cannot promise literally zero shared CPU, memory-bandwidth, or
-storage impact; point `--log-dir` at a dedicated disk when that contention matters.
+storage impact; point `--vision-recordings-dir` at a dedicated disk when that contention matters.
 `--show-camera` is a separate synchronous GUI path, not part of this isolation guarantee;
 avoid it during latency-sensitive actuation. For an uninterrupted live 30 fps stream, use a
 separately qualified external or camera-server-side recorder rather than the robot-control
@@ -209,9 +231,10 @@ claim of zero interference on shared hardware.
 
 Use `--custom-goal "your instruction"` instead of `--task` to send arbitrary language text
 to GR00T. The two flags are mutually exclusive. Custom text may be outside the fine-tuning
-distribution, so a non-matching instruction requires typing exact uppercase `YES` before
-it is sent to the model. The runner retains the normal warm-start, joint-limit, step-size
-and tracking checks. Task-bound pose files are unavailable with a custom goal;
+distribution. Custom mode bypasses only exact checkpoint-advertised instruction
+membership, not text validation, deployment contracts, warm-start, joint-limit, step-size,
+tracking checks, or motion gates. Enter submits text at the custom prompt without
+an additional `YES` prompt. Task-bound pose files are unavailable with a custom goal;
 use measured or XR-home initialization.
 
 ## 4. Initialization and exclusive command ownership
@@ -226,6 +249,13 @@ Warmup1 slowly commands the 28 measured arm/hand joint values from training epis
 legs, waist, pelvis height, or world pose, because those values are absent from the
 model contract. Both hands must be empty. The preceding initialization mode remains
 independently selectable:
+
+Warmup1 runs at `1.68x` the ordinary guarded interpolation rate and Warmup2 at
+`1.26x`: another 20% faster than the previous `1.40x` / `1.05x` rates. This is
+about 16.7% less rate-limited interpolation time, not a guarantee about total
+wall time; convergence dwell and feedback pauses are unchanged. Initialization
+and XR-home keep their original rates. Return-to-Start retains its additional
+`1.596x` stage multiplier, including when returning directly to Warmup1.
 
 - `--initialization measured` is the default. It acquires arm authority while preserving freshly measured arm and hand positions.
 - `--initialization xr-home` slowly targets the same joint-zero staging pose used by XR: arms and both hands all zero. Both hands must be empty. This is a staging target, not a demonstrated task-start pose.
@@ -249,26 +279,27 @@ instead. Initialization and Warmup1 are not repeated for a direct replacement
 goal; they are replayed only by an explicit Return-to-Start request as described
 below.
 
-`--return-to-start` adds a manual startup-pose-chain option to the powered-HOLD menu.
+`--return-to-start` adds a manual fixed-pose reset to the powered-HOLD menu.
 After a finite task completes, the actuator first enters powered HOLD
-instead of immediately releasing. Press `Shift+Tab` to replay the enabled fixed
-startup stages in their original order: the explicit `xr-home` or pose-file
-initialization target, followed by Warmup1 when enabled. Measured initialization
-has no fixed movement and is omitted from the replay. Each included movement has
-its own confirmation. The chain returns to the menu in HOLD; it does not reacquire
+instead of immediately releasing. Press `Shift+Tab` to go directly to Warmup1
+when enabled; otherwise return to the explicit `xr-home` or pose-file target.
+There is no intermediate home-pose detour. Warmup2 never changes this target.
+The motion retains its confirmation and returns to the menu in HOLD; it does not reacquire
 authority or reuse policy inference. The combination
 `--return-to-start --no-warmup1 --initialization measured` is rejected because
 measured initialization deliberately has no fixed target to revisit. This option is
-disabled by default.
+enabled by default for actuated runs and disabled by default with `--no-actuate`.
+Use `--no-return-to-start` for release on finite task completion or measured-only
+hold tests with `--no-warmup1`.
 
 These transitions are available in both IsaacLab and the explicitly unqualified real path. Warmup1 runs at startup and is replayed only as part of an explicit Return-to-Start chain. Warmup2 follows `--warmup2` at startup and after Return-to-Start, and follows `--future-goal-warmup2` for a direct replacement goal. They are joint-space transitions, not collision-aware planning. INITIALIZE, WARMUP1, WARMUP2, and CONTINUE remain separate visual-inspection gates; each advances only when `r` is pressed.
 
 During either synchronous or RTC actuation, the terminal has immediate single-key
 operator controls; Enter is not required:
 
-- At each standard authority or motion gate, `r` or `R` performs the displayed action. It does not resume an old goal from the STOP next-goal prompt, where `r` remains ordinary goal text until Enter. Arbitrary custom goals still require exact `YES` plus Enter.
+- At each standard authority or motion gate, `r` or `R` performs the displayed action. It does not resume an old goal from the STOP next-goal prompt, where `r` remains ordinary goal text until Enter. In custom mode, Enter submits text without an additional `YES` prompt; normal motion gates still apply.
 - `s` or `S` immediately captures measured arm positions while preserving the exact last published Dex3 targets, then keeps publishing that powered HOLD at 100 Hz. Preserving the hand targets avoids relaxing a loaded grasp merely because measured finger positions trail their commanded targets. A finger may therefore continue moving toward its last target after STOP; no new policy target is consumed. The client stops making GR00T requests and displays a next-goal prompt. This is a powered position STOP, not a passive brake or collision-safe freeze; it can continue exerting force and requires the client/watchdog to remain alive.
-- At the STOP prompt, trained-task mode is the default and shows the numbered allowlist; unknown text remains in HOLD and is not silently treated as a custom goal. Press `Tab` (no Enter) to toggle custom-goal mode on or back to trained-task mode. A run launched with `--custom-goal` returns to the prompt in custom mode, while a trained start returns in trained mode. With `--return-to-start`, `Shift+Tab` offers the separately confirmed startup pose-chain replay without changing trained/custom mode. Custom text still requires exact `YES`. Either `q` or `Q` is the no-Enter release key; `Alt+q` inserts a literal `q`, `Alt+Shift+q` inserts `Q`, and uppercase `S` remains stopped. By default the new goal repeats GR00T reset, fresh inference, `WARMUP2`, discarded chunk, `CONTINUE`, reset, and fresh strict inference. `--no-future-goal-warmup2` skips that transition only for direct replacement goals; the next goal after Return-to-Start still follows `--warmup2`. Initialization and Warmup1 are replayed only when Return-to-Start is explicitly requested.
+- At the STOP prompt, trained-task mode is the default and shows the numbered allowlist; unknown text remains in HOLD and is not silently treated as a custom goal. Press `Tab` (no Enter) to toggle custom-goal mode on or back to trained-task mode. A run launched with `--custom-goal` returns to the prompt in custom mode, while a trained start returns in trained mode. With `--return-to-start`, `Shift+Tab` offers the separately confirmed startup pose-chain replay without changing trained/custom mode. Enter submits custom text without an additional `YES` prompt. Either `q` or `Q` is the no-Enter release key; `Alt+q` inserts a literal `q`, `Alt+Shift+q` inserts `Q`, and uppercase `S` remains stopped. By default the new goal repeats GR00T reset, fresh inference, `WARMUP2`, discarded chunk, `CONTINUE`, reset, and fresh strict inference. `--no-future-goal-warmup2` skips that transition only for direct replacement goals; the next goal after Return-to-Start still follows `--warmup2`. Initialization and Warmup1 are replayed only when Return-to-Start is explicitly requested.
 - `q` or `Q` during active motion or at an armed line prompt requests orderly release immediately. `Ctrl-C` remains the independent release path. On real hardware, cleanup retains the final arm target while ramping `arm_sdk` authority to zero at a three-second full-authority rate (the duration scales down when a startup fault occurs before full authority), then sends Dex3 `stopMotors`; final pose and grasp after Unitree retakes authority are not guaranteed.
 
 A key pressed while a synchronous inference request is already running cannot cancel the network request itself. The actuator nevertheless responds immediately: `s` enters powered STOP and `q` starts release; any later server result is discarded. RTC uses the same keys, cancels its active plan, and discards any in-flight reply before accepting a new goal. The next-goal menu is entered from powered STOP/HOLD. Reaching finite `--max-chunks` without a STOP command exits through normal release unless `--return-to-start` is enabled; with that flag it enters powered HOLD and offers the menu instead.
@@ -331,8 +362,10 @@ Then run the same policy loop:
 cd "$HOME/Development/unitree_lerobot"
 
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --end-effector dex3 \
     --sim \
     --actuate \
+    --no-return-to-start \
     --task pick-red-cup \
     --policy-host 127.0.0.1 \
     --image-host 127.0.0.1 \
@@ -346,8 +379,10 @@ same isolated simulator with:
 
 ```bash
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --end-effector dex3 \
     --sim \
     --actuate \
+    --no-return-to-start \
     --task pick-red-cup \
     --policy-host 127.0.0.1 \
     --image-host 127.0.0.1 \
@@ -368,7 +403,11 @@ independent chunks.
 
 The current client-side code cannot prove a bounded safe release if DDS itself wedges or the robot loses the publisher. The local Unitree SDK's `Write(timeout=...)` bounds discovery of a matched reader but not the underlying DDS write. The client sends Unitree's documented Dex3 `stopMotors` command during orderly cleanup, but there is no acknowledgment or demonstrated hard deadline. No workstation-only design can send a guaranteed release command over a failed network.
 
-For that reason, real `--actuate` is rejected by default. Before any real test, qualify all of the following on supported hardware with Unitree's normal safety equipment and an operator on the physical emergency stop:
+For explicitly selected Dex3, real actuation still requires `--allow-unqualified-real`;
+its default is false for Dex3 and Inspire DFX. Only Inspire FTP defaults both this
+override and `--allow-inspire-ftp-unverified-stop` to true. These defaults do not
+constitute hardware qualification. Before any real test, qualify all of the following
+on supported hardware with Unitree's normal safety equipment and an operator on the physical emergency stop:
 
 - G1 behavior when the `rt/arm_sdk` publisher disappears or its writes stop;
 - Dex3 behavior when both hand command publishers disappear or writes stop;
@@ -388,6 +427,7 @@ After those qualifications, the syntax for an explicitly unqualified research te
 cd "$HOME/Development/unitree_lerobot"
 
 python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --end-effector dex3 \
     --task pick-red-cup \
     --policy-host 127.0.0.1 \
     --image-host 192.168.123.164 \
@@ -395,6 +435,7 @@ python -m unitree_lerobot.eval_robot.eval_groot_g1 \
     --execution-horizon 8 \
     --max-chunks 1 \
     --actuate \
+    --no-return-to-start \
     --allow-unqualified-real
 ```
 
@@ -434,8 +475,9 @@ is stated explicitly.
 | Flag(s) | Default | One-line meaning |
 |---|---:|---|
 | `-h`, `--help` | — | Print the parser-generated help text and exit. |
+| `--end-effector {dex3,inspire-dfx,inspire-ftp}` | `inspire-ftp` | Select the hand data/transport contract; Dex3 runs must select `dex3` explicitly. |
 | `--task TASK_ID` | unset | Select one exact trained task ID; omit both goal flags to use the interactive task menu. |
-| `--custom-goal TEXT` | unset | Send arbitrary goal text after explicit confirmation; mutually exclusive with `--task`. |
+| `--custom-goal TEXT` | unset | Send custom text, bypassing only exact advertised instruction membership; all contracts and motion gates remain enforced; mutually exclusive with `--task`. |
 | `--voice`, `--no-voice` | disabled | Enable or disable the authenticated GrootVoiceCommander TCP listener while retaining terminal controls. |
 | `--confirm-text`, `--no-confirm-text` | disabled | With `--voice`, require an additional local terminal confirmation before accepting phone text. |
 | `--voice-listen-host HOST` | `0.0.0.0` | Bind the local voice TCP listener to this address. |
@@ -444,8 +486,9 @@ is stated explicitly.
 | `--policy-host HOST` | `127.0.0.1` | Connect to the GR00T policy server at this host; actuation requires a loopback host. |
 | `--policy-port PORT` | `5555` | Connect to the GR00T policy server at this TCP port. |
 | `--image-host HOST` | automatic | Connect to TeleImager here; when omitted, use `192.168.123.164` for the robot or `127.0.0.1` with `--sim`. |
-| `--show-camera` | off | Display every decoded RGB and derived depth/normal frame actually sent to GR00T. |
-| `--record-vision` | off | Losslessly record exact policy-request-cadence preprocessor vision arrays below the run's `vision_recording/` directory in an isolated drop-on-overload writer; this is not 30 fps video. |
+| `--show-camera` | off | Display checkpoint-visible RGB and derived depth/normal frames; fixed-Turbo depth is rendered automatically when declared by the checkpoint. |
+| `--record-vision` | off | Losslessly record checkpoint-visible policy-request-cadence arrays in an isolated drop-on-overload writer; fixed-Turbo depth is saved automatically and this is not 30 fps video. |
+| `--vision-recordings-dir DIR` | `unitree_lerobot/Recordings_Data` | Place each uniquely named `--record-vision` run below this root. |
 | `--network-interface INTERFACE` | unset | Select the CycloneDDS NIC; mandatory for real actuation and forbidden for stock IsaacLab actuation. |
 | `--execution-horizon N` | `8` | Execute or account for `N` 30 Hz actions per chunk/replan interval; `N` must be at least one and no larger than the model horizon. |
 | `--max-chunks N` | `1` | Bound the run to `N` chunks, giving an RTC action budget of `execution_horizon × N`; `N` must be at least one. |
@@ -460,16 +503,19 @@ is stated explicitly.
 | `--warmup2`, `--no-warmup2` | enabled | Enable or skip the guarded move to target zero of a fresh inferred chunk at startup and after an explicit Return-to-Start reset. |
 | `--policy-warm-start`, `--no-policy-warm-start` | enabled | Compatibility aliases for `--warmup2` and `--no-warmup2`; they control the same setting. |
 | `--future-goal-warmup2`, `--no-future-goal-warmup2` | enabled | Enable or skip Warmup2 for direct replacement goals not preceded by Return-to-Start; fixed startup stages are replayed only by Return-to-Start. |
-| `--return-to-start`, `--no-return-to-start` | disabled | Offer a separately confirmed `Shift+Tab` replay of the enabled fixed initialization and Warmup1 stages before the next goal's optional Warmup2. |
+| `--return-to-start`, `--no-return-to-start` | matches actuation | Offer a separately confirmed `Shift+Tab` reset directly to Warmup1 when enabled, otherwise the fixed initialization target; enabled for actuation and disabled with `--no-actuate` unless explicitly overridden. |
 | `--sim` | off | Use the IsaacLab DDS domain/topic path instead of real `rt/arm_sdk`. |
-| `--actuate` | off | Create command publishers after preflight and confirmation; when omitted, run publisher-free shadow evaluation. |
-| `--allow-unqualified-real` | off | Acknowledge the explicitly unqualified real-hardware path; required for real `--actuate` and ineffective with `--sim`. |
+| `--actuate`, `--no-actuate` | enabled | Create command publishers after preflight and confirmation; explicitly use `--no-actuate` for publisher-free shadow evaluation. |
+| `--allow-unqualified-real`, `--no-allow-unqualified-real` | enabled only for Inspire FTP | Acknowledge the unqualified real-hardware path; required explicitly for real Dex3/DFX actuation and ineffective with `--sim`. |
+| `--allow-inspire-ftp-unverified-stop`, `--no-allow-inspire-ftp-unverified-stop` | enabled only for Inspire FTP | Acknowledge that closing FTP publishers is not a verified hand stop and may leave the last setpoint active; valid only for Inspire FTP. |
 | `--confirm-sim-network-isolated` | off | Assert that the IsaacLab host cannot reach any physical robot network; required for simulated actuation. |
-| `--log-dir DIR` | `./logs` | Place the new per-run log directory, timing diagnostics, and optional `vision_recording/` under this directory. |
+| `--log-dir DIR` | `./logs` | Place the new per-run logs and timing diagnostics under this directory; vision recordings use `--vision-recordings-dir`. |
 
 The accepted `--task` values are `pick-toothpaste`, `down-toothpaste`,
-`pick-red-cup`, `down-red-cup`, `pick-wooden-block`, `down-wooden-block`,
-`pick-cerealbox`, and `down-cerealbox`. The task IDs map to the exact training
+`pick-red-cup`, `down-red-cup`, `pick-green-cup`, `down-green-cup`,
+`pick-wooden-block`, `down-wooden-block`, `pick-cerealbox`, `down-cerealbox`,
+`stack-three-cups`, `build-cup-pyramid-left-to-right`, `pick-water-bottle`,
+and `down-water-bottle`. The task IDs map to the exact training
 instructions defined in `groot_contract.py`; argparse rejects any other value.
 
 ### Standalone zero-state-test CLI
