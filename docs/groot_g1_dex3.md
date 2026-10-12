@@ -450,7 +450,8 @@ phone either in a mode-0600 file passed with `--voice-session-token-file`, or in
 the `GROOT_VOICE_SESSION_TOKEN` environment variable. The token itself is never
 accepted as a command-line argument or written to the run manifest.
 
-The app's proposal and separate confirmation tap remain mandatory. Proposing a
+For goals and Return to Start, the app's proposal and separate confirmation tap
+remain mandatory. Proposing a
 goal while a policy is active requests powered HOLD; no proposed goal is sent to
 GR00T. After the confirmed message arrives, exact normalized `stop` or `pause`
 text remains in powered HOLD, and exact `quit` text releases authority and exits.
@@ -460,6 +461,28 @@ maintained. Every other confirmed phrase follows the normal trained/custom goal
 path with a fresh observation and inference. These words are convenience
 commands, not an emergency-stop channel; physical safety equipment and terminal
 `s`/`q` remain authoritative.
+
+GrootVoiceCommander 1.1 (build 2) also exposes a persistent **Hold / Stop**
+button. Its authenticated protocol-v1 `request_hold` message uses a fresh
+`request_id` and the same `session_token`, without a goal preview or confirmation.
+The bridge cancels queued/pending goal acceptance and requests the actuator's
+urgent powered HOLD, including during guarded post-startup Warmup2 and return
+motion. Hold also interrupts terminal confirmation and feedback waits without
+turning the interruption into an authority release. A new explicit selection
+is required to resume; buffered confirmation input cannot resume it.
+
+The `hold_requested` response acknowledges receipt by the PC, **not measured
+standstill**. This network control needs the matching bridge, runner and actuator
+update; it is not an independent emergency stop. The actuator preserves the
+outgoing hand grip while holding the measured arm pose. Initial authority
+acquisition and hardware faults retain their existing release behavior.
+Previews now report `robot_state: "HOLD_REQUESTED"`; the paired app accepts that
+value as well as legacy `"HOLD"`.
+
+The phone's **Return to Start** button sends the exact existing `Return to start`
+shortcut through the normal preview/confirmation flow. It retains the PC's
+configured Warmup1 or initialization target and motion/visual gates; it does not
+define a new policy-derived Warmup2 return pose.
 
 Add `--confirm-text` to require a second local terminal confirmation after the
 phone confirmation. The terminal task menu, custom text, `s`, `q`, Tab and

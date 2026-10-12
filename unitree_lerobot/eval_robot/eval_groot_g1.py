@@ -205,9 +205,9 @@ class _OperatorTerminal:
 
     ``stop_action="hold"`` is the normal active-loop behavior: ``s`` requests
     a child-acknowledged powered HOLD. ``stop_action="release"`` is reserved
-    for blocking state transitions whose child cannot consume that HOLD
-    barrier until the transition returns; there ``s`` cancels through the
-    same orderly authority-release path as ``q``.
+    for startup and initialization stages, which retain their release-only
+    operator protocol; there ``s`` cancels through the same orderly
+    authority-release path as ``q``.
     """
 
     def __init__(
@@ -482,6 +482,23 @@ def _confirm_before_authority(prompt: str) -> str:
     return _readline_before_authority(prompt, confirmation_mode=True)
 
 
+def _pending_prompt_control(actuator: SafeG1Dex3Actuator) -> str | None:
+    """Translate asynchronous controls without consuming their acknowledgements."""
+
+    checker = getattr(actuator, "immediate_control_requested", None)
+    requested = checker() if callable(checker) else None
+    return {"hold": "stop", "release": "q"}.get(requested)
+
+
+def _service_armed_prompt(actuator: SafeG1Dex3Actuator) -> tuple[bool, str | None]:
+    actuator.heartbeat()
+    try:
+        status_output = actuator.assert_healthy() is True
+    except ImmediateControlEvent as exc:
+        return False, "q" if exc.action == "release" else "stop"
+    return status_output, _pending_prompt_control(actuator)
+
+
 def _wait_for_confirmation_input_boundary(
     fd: int,
     actuator: SafeG1Dex3Actuator | None = None,
@@ -497,8 +514,9 @@ def _wait_for_confirmation_input_boundary(
     discarded_affirmative = 0
     while True:
         if actuator is not None:
-            actuator.heartbeat()
-            actuator.assert_healthy()
+            _, control = _service_armed_prompt(actuator)
+            if control is not None:
+                return control
         _pump_camera_preview_events()
         remaining = quiet_deadline - time.monotonic()
         if remaining <= 0.0:
@@ -549,11 +567,10 @@ def _run_blocking_motion_with_immediate_release(
 ) -> None:
     """Keep s/q live while a child state transition blocks the main thread.
 
-    The normal powered-HOLD request uses a command-queue barrier serviced by
-    the child's active loop. Initialization, Warmup2, and Return-to-Start run
-    synchronously inside that same child, so they cannot acknowledge the
-    barrier until their motion has already finished. During these transitions
-    ``s`` therefore means cancel and orderly release, exactly like ``q``.
+    Startup and initial authority acquisition cannot acknowledge powered HOLD
+    before initialization completes. Their ``s`` key therefore cancels and
+    releases, exactly like ``q``. Post-initialization Warmup2 and Return-to-Start
+    use the separate HOLD-aware wrapper and child cancellation path.
     """
 
     with _OperatorTerminal(actuator, stop_action="release") as terminal:
@@ -1079,6 +1096,7 @@ def _readline_while_armed(
     return_to_start: bool = False,
     policy_refresh: bool = False,
     external_pending: Callable[[], bool] | None = None,
+    discard_buffered_input: bool = False,
 ) -> str:
     """Read a terminal line while continuously servicing the actuator watchdog."""
 
@@ -1093,13 +1111,26 @@ def _readline_while_armed(
             return_to_start=return_to_start,
             policy_refresh=policy_refresh,
             external_pending=external_pending,
+            discard_buffered_input=discard_buffered_input,
         )
+    if discard_buffered_input:
+        try:
+            input_fd = sys.stdin.fileno()
+        except (AttributeError, OSError, TypeError, ValueError):
+            # Preserve the legacy line-input interface for in-memory callers.
+            # Live actuation requires a real interactive terminal at startup.
+            input_fd = None
+        if input_fd is not None:
+            control = _wait_for_confirmation_input_boundary(input_fd, actuator)
+            if control is not None:
+                return control
     LOGGER.warning("stdin is not a TTY; armed input is line-buffered and immediate keys are unavailable")
     print(prompt, end="", flush=True)
     next_prompt_refresh_at = time.monotonic() + CONFIRMATION_PROMPT_REFRESH_S
     while True:
-        actuator.heartbeat()
-        status_output = actuator.assert_healthy() is True
+        status_output, control = _service_armed_prompt(actuator)
+        if control is not None:
+            return control
         _pump_camera_preview_events()
         if confirmation_mode and status_output:
             print(f"\n{prompt}", end="", flush=True)
@@ -1124,6 +1155,9 @@ def _readline_while_armed(
                 next_prompt_refresh_at = now + CONFIRMATION_PROMPT_REFRESH_S
             continue
         raw_response = sys.stdin.readline()
+        control = _pending_prompt_control(actuator)
+        if control is not None:
+            return "q" if raw_response.strip().lower() == "q" else control
         if raw_response == "":
             raise DeploymentError("stdin closed while command authority was active")
         if goal_mode_toggle and raw_response.rstrip("\r\n") == GOAL_MODE_TOGGLE:
@@ -1153,6 +1187,7 @@ def _readline_with_immediate_prompt_controls(
     return_to_start: bool = False,
     policy_refresh: bool = False,
     external_pending: Callable[[], bool] | None = None,
+    discard_buffered_input: bool = False,
 ) -> str:
     """Read an armed line while keeping the physical Q key fail-safe.
 
@@ -1180,7 +1215,7 @@ def _readline_with_immediate_prompt_controls(
     escape_prefix: bytes | None = None
     escape_prefix_at: float | None = None
     try:
-        if confirmation_mode:
+        if confirmation_mode or discard_buffered_input:
             buffered_control = _wait_for_confirmation_input_boundary(fd, actuator)
             if buffered_control is not None:
                 return buffered_control
@@ -1190,8 +1225,9 @@ def _readline_with_immediate_prompt_controls(
         print(prompt, end="", flush=True)
         next_prompt_refresh_at = time.monotonic() + CONFIRMATION_PROMPT_REFRESH_S
         while True:
-            actuator.heartbeat()
-            status_output = actuator.assert_healthy() is True
+            status_output, control = _service_armed_prompt(actuator)
+            if control is not None:
+                return control
             _pump_camera_preview_events()
             if confirmation_mode and status_output:
                 # Auxiliary actuator status was just rendered on the shared
@@ -1221,6 +1257,12 @@ def _readline_with_immediate_prompt_controls(
                     next_prompt_refresh_at = now + CONFIRMATION_PROMPT_REFRESH_S
                 continue
             value = os.read(fd, 1)
+            control = _pending_prompt_control(actuator)
+            if control is not None:
+                if value in {b"q", b"Q", b"\x11"}:
+                    actuator.request_immediate_release()
+                    return "q"
+                return control
             if value == b"":
                 raise DeploymentError("stdin closed while command authority was active")
             now = time.monotonic()
@@ -1380,6 +1422,11 @@ def _take_held_voice_command(
     confirm_voice_text: bool,
     return_to_start: bool = False,
 ) -> tuple[str, str] | str:
+    control = _pending_prompt_control(actuator)
+    if control == "q":
+        return "release"
+    if control == "stop":
+        _finish_operator_stop(actuator)
     command = voice_server.poll_command()
     if command is None:
         return VOICE_INPUT_AVAILABLE
@@ -1410,10 +1457,18 @@ def _take_held_voice_command(
         )
         LOGGER.warning("Voice RETURN TO START rejected because --return-to-start is disabled")
         return VOICE_STAY_HOLDING
-    if not voice_server.accept_command(
-        command,
-        service_callback=lambda: (actuator.heartbeat(), actuator.assert_healthy()),
-    ):
+    try:
+        accepted = voice_server.accept_command(
+            command,
+            service_callback=lambda: (actuator.heartbeat(), actuator.assert_healthy()),
+        )
+    except ImmediateControlEvent as exc:
+        voice_server.reject_command(command, "operator_control", "Operator control cancelled command acceptance")
+        if exc.action == "release":
+            return "release"
+        _finish_operator_stop(actuator)
+        return VOICE_STAY_HOLDING
+    if not accepted:
         LOGGER.warning("Voice connection closed before the confirmed command could be accepted")
         return VOICE_STAY_HOLDING
     if resolved == VOICE_STAY_HOLDING:
@@ -1459,6 +1514,9 @@ def _select_next_goal_while_holding(
             print(f"  {index}. {task_name:16s}  {instruction}")
 
     show_mode()
+    # A cancelled confirmation may leave an old r or partial custom line in
+    # stdin. Require a fresh menu boundary even when HOLD happened elsewhere.
+    discard_buffered_input = True
     while True:
         if voice_server is not None and voice_server.command_pending:
             voice_result = _take_held_voice_command(
@@ -1468,6 +1526,7 @@ def _select_next_goal_while_holding(
                 return_to_start=return_to_start,
             )
             if voice_result in {VOICE_INPUT_AVAILABLE, VOICE_STAY_HOLDING}:
+                discard_buffered_input = voice_result == VOICE_STAY_HOLDING
                 continue
             if voice_result == "release":
                 return None
@@ -1476,6 +1535,7 @@ def _select_next_goal_while_holding(
             assert isinstance(voice_result, tuple)
             return voice_result
         prompt = "Custom goal> " if custom_goal_mode else "Trained task> "
+        input_options = {"discard_buffered_input": True} if discard_buffered_input else {}
         response = _readline_while_armed(
             actuator,
             prompt,
@@ -1484,7 +1544,10 @@ def _select_next_goal_while_holding(
             return_to_start=return_to_start,
             policy_refresh=True,
             external_pending=(None if voice_server is None else lambda: voice_server.command_pending),
+            **input_options,
         )
+        discard_buffered_input = False
+        response = _pending_prompt_control(actuator) or response
         if response == VOICE_INPUT_AVAILABLE:
             continue
         if response == RETURN_TO_START:
@@ -1503,6 +1566,7 @@ def _select_next_goal_while_holding(
         if lowered in STOP_COMMANDS or not response:
             if lowered in STOP_COMMANDS:
                 _finish_operator_stop(actuator)
+                discard_buffered_input = True
             LOGGER.info("Already stopped; no GR00T request was sent")
             continue
 
@@ -1598,7 +1662,11 @@ def _run_return_to_start_from_hold(
             return decision
         # Recheck after confirmation but before enqueueing any motion. A
         # feedback-HOLD may have arrived while the prompt was open.
-        _wait_for_hand_feedback(actuator)
+        _run_with_immediate_operator_keys(actuator, lambda: _wait_for_hand_feedback(actuator))
+    except OperatorStop:
+        return "hold"
+    except OperatorRelease:
+        return "release"
     except HandFeedbackOperatorHold as exc:
         LOGGER.warning(
             "Hand feedback crossed %.2f s during Return-to-Start; transition cancelled "
@@ -1608,14 +1676,17 @@ def _run_return_to_start_from_hold(
             extra={"terminal_yellow": True},
         )
         return "hold"
-    # Do not catch feedback-HOLD after the child has accepted this operation:
-    # initialization motion may be paused internally and later resume. An
-    # exception from that phase must retain the fail-closed release behavior.
-    _run_blocking_motion_with_immediate_release(
-        actuator,
-        lambda: actuator.return_to_start_pose(spec, warmup1=warmup1),
-        stage="RETURN-TO-START",
-    )
+    # Explicit operator HOLD now cancels the child transition and fences queued
+    # motion before returning to the menu. Feedback faults still fail closed.
+    try:
+        _run_with_immediate_operator_keys(
+            actuator,
+            lambda: actuator.return_to_start_pose(spec, warmup1=warmup1),
+        )
+    except OperatorStop:
+        return "hold"
+    except OperatorRelease:
+        return "release"
     if _hand_convergence_is_software_verified(spec.end_effector) or not require_final_visual_check:
         LOGGER.warning(
             "Completed Return-to-Start stage %r; remaining in powered HOLD",
@@ -1741,6 +1812,7 @@ def _confirm_goal_transition(
                 f"OPERATOR_CONFIRMATION_TIMEOUT_S={OPERATOR_CONFIRMATION_TIMEOUT_S}"
             ) from exc
         raise
+    response = _pending_prompt_control(actuator) or response
     if response == "continue":
         return "continue"
     lowered = response.lower()
@@ -2139,7 +2211,7 @@ def _prepare_policy_goal(
         # A goal selected from the 1.25 s operator-HOLD terminal is explicit
         # consent to try again, but no policy-server command may be sent until
         # three distinct paired Dex3 readings have re-established feedback.
-        _wait_for_hand_feedback(actuator)
+        _run_with_immediate_operator_keys(actuator, lambda: _wait_for_hand_feedback(actuator))
         _run_with_immediate_operator_keys(actuator, policy.reset)
         if warmup2_enabled is None:
             warmup2_enabled = bool(getattr(args, "policy_warm_start", True))
@@ -2191,7 +2263,11 @@ def _prepare_policy_goal(
         # Catch an already-pending operator HOLD before any Warmup2 motion is
         # queued. A failure after enqueue must still propagate so the child
         # cannot resume a paused transition while the parent is back at a menu.
-        _wait_for_hand_feedback(actuator)
+        _run_with_immediate_operator_keys(actuator, lambda: _wait_for_hand_feedback(actuator))
+    except OperatorStop:
+        return "hold"
+    except OperatorRelease:
+        return "release"
     except HandFeedbackOperatorHold as exc:
         LOGGER.warning(
             "Hand feedback crossed %.2f s before Warmup2 motion; remaining in powered HOLD: %s",
@@ -2201,11 +2277,14 @@ def _prepare_policy_goal(
         )
         return "hold"
     try:
-        _run_blocking_motion_with_immediate_release(
+        _run_with_immediate_operator_keys(
             actuator,
             lambda: actuator.warm_start(warm_start_chunk),
-            stage="WARMUP2",
         )
+    except OperatorStop:
+        return "hold"
+    except OperatorRelease:
+        return "release"
     except HandFeedbackReplan as exc:
         LOGGER.warning(
             "Warmup2 policy target was invalidated by a hand-feedback pause; re-observing the same goal: %s",
@@ -3452,7 +3531,7 @@ def _run_held_policy_io(actuator, operation):
         raise DeploymentError("Policy refresh requires an acknowledged powered HOLD")
     checker = getattr(actuator, "assert_healthy", None)
     if callable(checker):
-        checker()
+        _run_with_immediate_operator_keys(actuator, checker)
     stopped = threading.Event()
     expired = threading.Event()
 
@@ -3472,9 +3551,8 @@ def _run_held_policy_io(actuator, operation):
     worker.start()
     try:
         result = _run_with_immediate_operator_keys(actuator, operation)
-        _raise_if_immediate_control(actuator)
         if callable(checker):
-            checker()
+            _run_with_immediate_operator_keys(actuator, checker)
         if expired.is_set():
             raise OperatorRelease
         return result
@@ -3945,11 +4023,12 @@ def run(args: argparse.Namespace) -> None:
             if outcome == "complete":
                 if not return_to_start_enabled:
                     break
-                _run_blocking_motion_with_immediate_release(
-                    actuator,
-                    actuator.hold,
-                    stage="POST-GOAL HOLD TRANSITION",
-                )
+                try:
+                    _run_with_immediate_operator_keys(actuator, actuator.hold)
+                except OperatorStop:
+                    pass  # The interruptible wrapper already acknowledged HOLD.
+                except OperatorRelease:
+                    break
                 LOGGER.warning(
                     "Goal %r completed; entered powered HOLD with Return-to-Start available",
                     task_name,
@@ -3984,10 +4063,16 @@ def run(args: argparse.Namespace) -> None:
                     except OperatorStop:
                         LOGGER.warning("Refresh interrupted; staying in HOLD. Type refresh to retry.")
                     except Exception as exc:
-                        _raise_if_immediate_control(actuator)
                         checker = getattr(actuator, "assert_healthy", None)
-                        if callable(checker):
-                            checker()
+                        try:
+                            _run_with_immediate_operator_keys(
+                                actuator, lambda: checker() if callable(checker) else None,
+                            )
+                        except OperatorStop:
+                            continue
+                        except OperatorRelease:
+                            next_goal = None
+                            break
                         LOGGER.warning("Refresh failed; staying in HOLD; retry refresh before choosing a goal: %s",
                                        type(exc).__name__ if _BLINDED_POLICY else exc)
                     else:
@@ -4020,10 +4105,16 @@ def run(args: argparse.Namespace) -> None:
                     except OperatorStop:
                         continue
                     except Exception as exc:
-                        _raise_if_immediate_control(actuator)
                         checker = getattr(actuator, "assert_healthy", None)
-                        if callable(checker):
-                            checker()
+                        try:
+                            _run_with_immediate_operator_keys(
+                                actuator, lambda: checker() if callable(checker) else None,
+                            )
+                        except OperatorStop:
+                            continue
+                        except OperatorRelease:
+                            next_goal = None
+                            break
                         policy_refresh_required = True
                         LOGGER.warning("Could not verify policy; staying in HOLD. Type refresh: %s",
                                        type(exc).__name__ if _BLINDED_POLICY else exc)

@@ -2853,7 +2853,7 @@ class GrootG1DeploymentTests(unittest.TestCase):
             with (
                 self.subTest(failure_point=failure_point),
                 mock.patch(f"{module}.confirm_return_to_start") as confirm,
-                mock.patch(f"{module}._run_blocking_motion_with_immediate_release") as motion,
+                mock.patch(f"{module}._OperatorTerminal"),
                 self.assertLogs("eval_groot_g1", level="WARNING") as captured,
             ):
                 if failure_point == "confirmation":
@@ -2864,16 +2864,14 @@ class GrootG1DeploymentTests(unittest.TestCase):
 
                 self.assertEqual(_run_return_to_start_from_hold(actuator, spec), "hold")
                 self.assertTrue(any("remains in powered HOLD" in line for line in captured.output))
-                motion.assert_not_called()
+                actuator.return_to_start_pose.assert_not_called()
                 if failure_point != "confirmation":
                     actuator.wait_for_hand_feedback.side_effect = None
 
         with (
             mock.patch(f"{module}.confirm_return_to_start", return_value="continue"),
-            mock.patch(
-                f"{module}._run_blocking_motion_with_immediate_release",
-                side_effect=HandFeedbackOperatorHold(detail),
-            ),
+            mock.patch(f"{module}._OperatorTerminal"),
+            mock.patch.object(actuator, "return_to_start_pose", side_effect=HandFeedbackOperatorHold(detail)),
             self.assertRaises(HandFeedbackOperatorHold),
         ):
             _run_return_to_start_from_hold(actuator, spec)

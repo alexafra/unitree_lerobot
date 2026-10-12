@@ -3799,6 +3799,13 @@ def _position_drift(
     return float(max(values))
 
 
+def _check_guarded_motion_hold(stop_event: Any, urgent_hold_event: Any | None) -> None:
+    """Cancel a post-initialization transition without consuming its HOLD latch."""
+
+    if urgent_hold_event is not None and urgent_hold_event.is_set() and not stop_event.is_set():
+        raise ImmediateControlEvent("hold")
+
+
 def _wait_for_initialization_start(
     backend: _G1Dex3CommandBackend,
     stop_event: Any,
@@ -3806,6 +3813,8 @@ def _wait_for_initialization_start(
     hand_watchdog: HandTrackingWatchdog | None = None,
     hand_freshness_gate: HandStateFreshnessGate | None = None,
     status_queue: MpQueue | None = None,
+    *,
+    urgent_hold_event: Any | None = None,
 ) -> RobotState | None:
     """Hold the current command until fresh measured state is stationary again."""
 
@@ -3825,10 +3834,12 @@ def _wait_for_initialization_start(
         MODE5_WAIST_REBASE_DWELL_S if rebase_mode5_waist else 0.0,
     )
     while not stop_event.is_set() and time.monotonic() < deadline:
+        _check_guarded_motion_hold(stop_event, urgent_hold_event)
         loop_started = time.monotonic()
         if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
             raise DeploymentError("Parent heartbeat expired before initialization movement")
         latest = backend.state()
+        _check_guarded_motion_hold(stop_event, urgent_hold_event)
         now = time.monotonic()
         if hand_freshness_gate is not None and status_queue is not None:
             freshness = _observe_hand_freshness(
@@ -3930,6 +3941,7 @@ def _wait_for_initialization_start(
             last_capture = float("-inf")
 
         if qualified:
+            _check_guarded_motion_hold(stop_event, urgent_hold_event)
             return latest
 
         backend.publish()
@@ -3961,6 +3973,7 @@ def _execute_initialization(
     status_queue: MpQueue | None = None,
     *,
     context: str = "initialization",
+    urgent_hold_event: Any | None = None,
 ) -> bool:
     """Execute and verify one bounded initialization path in the DDS owner."""
 
@@ -3981,11 +3994,13 @@ def _execute_initialization(
     require_hand_tracking = profile.tracking_hard is not None
 
     while not stop_event.is_set():
+        _check_guarded_motion_hold(stop_event, urgent_hold_event)
         loop_started = time.monotonic()
         if _heartbeat_age(heartbeat) > HEARTBEAT_TIMEOUT_S:
             raise DeploymentError("Parent heartbeat expired during initialization")
 
         state = backend.state()
+        _check_guarded_motion_hold(stop_event, urgent_hold_event)
         now = time.monotonic()
         if hand_freshness_gate is not None and status_queue is not None:
             freshness = _observe_hand_freshness(
@@ -4022,6 +4037,7 @@ def _execute_initialization(
                 elapsed = time.monotonic() - loop_started
                 stop_event.wait(max(0.0, period - elapsed))
                 continue
+        _check_guarded_motion_hold(stop_event, urgent_hold_event)
         if path_index < chunk.length:
             # Advance exactly once per publisher iteration.  A late loop slows
             # initialization; it never skips or bursts targets to catch up.
@@ -4073,6 +4089,7 @@ def _execute_initialization(
                     now - converged_since >= INITIALIZATION_CONVERGENCE_DWELL_S
                     and distinct_converged_samples >= INITIALIZATION_MIN_DISTINCT_SAMPLES
                 ):
+                    _check_guarded_motion_hold(stop_event, urgent_hold_event)
                     return True
             else:
                 converged_since = None
@@ -4859,6 +4876,27 @@ def _actuator_main(
             elapsed = time.monotonic() - loop_started
             active_timing.wait(stop_event, requested_s=max(0.0, period - elapsed))
 
+        def cancel_guarded_motion(status: str, label: str | None = None) -> None:
+            nonlocal chunk, chunk_index, rtc_mode, holding, tracking_checks_after
+            nonlocal pending_replan_detail, pending_hand_replan_detail, replan_freeze_active
+            nonlocal replan_last_loop_started, replan_stable_samples, urgent_hold_active
+            # Cancel the transition itself, not merely its parent's wait. The
+            # urgent latch stays set until the queue barrier fences every old
+            # submission. Never restore an old target after feedback recovery.
+            _set_powered_hold_target(backend, conditioner, hand_watchdog, backend.state())
+            chunk = None
+            chunk_index = 0
+            rtc_mode = False
+            holding = True
+            tracking_checks_after = time.monotonic()
+            pending_replan_detail = None
+            pending_hand_replan_detail = None
+            replan_freeze_active = False
+            replan_last_loop_started = None
+            replan_stable_samples = 0
+            urgent_hold_active = False
+            _status(status_queue, status, label)
+
         while not stop_event.is_set():
             loop_started = time.monotonic()
             replan_loop_gap_s = None if replan_last_loop_started is None else loop_started - replan_last_loop_started
@@ -5121,162 +5159,184 @@ def _actuator_main(
                     "return_to_start_pose",
                     "return_to_start_warmup1_pose",
                 }:
-                    if not isinstance(command, tuple) or len(command) != 3:
-                        raise DeploymentError("Malformed guarded warmup-pose command")
-                    if chunk is not None or not holding:
-                        raise DeploymentError("Guarded warmup pose requires an acknowledged hold with no active chunk")
-                    _, created_at, warmup_pose = command
-                    if not isinstance(warmup_pose, InitializationSpec):
-                        raise DeploymentError("Malformed guarded warmup-pose target")
                     try:
-                        command_age = time.monotonic() - float(created_at)
-                    except (TypeError, ValueError) as exc:
-                        raise DeploymentError("Guarded warmup-pose timestamp is invalid") from exc
-                    if not np.isfinite(command_age) or not 0.0 <= command_age <= INITIALIZATION_COMMAND_MAX_AGE_S:
-                        raise DeploymentError("Guarded warmup-pose command expired before execution")
+                        _check_guarded_motion_hold(stop_event, urgent_hold_event)
+                        if not isinstance(command, tuple) or len(command) != 3:
+                            raise DeploymentError("Malformed guarded warmup-pose command")
+                        if chunk is not None or not holding:
+                            raise DeploymentError("Guarded warmup pose requires an acknowledged hold with no active chunk")
+                        _, created_at, warmup_pose = command
+                        if not isinstance(warmup_pose, InitializationSpec):
+                            raise DeploymentError("Malformed guarded warmup-pose target")
+                        try:
+                            command_age = time.monotonic() - float(created_at)
+                        except (TypeError, ValueError) as exc:
+                            raise DeploymentError("Guarded warmup-pose timestamp is invalid") from exc
+                        if not np.isfinite(command_age) or not 0.0 <= command_age <= INITIALIZATION_COMMAND_MAX_AGE_S:
+                            raise DeploymentError("Guarded warmup-pose command expired before execution")
 
-                    hand_watchdog.reset(backend)
-                    state = _wait_for_initialization_start(
-                        backend,
-                        stop_event,
-                        heartbeat,
-                        hand_watchdog,
-                        hand_freshness_gate,
-                        status_queue,
-                    )
-                    if state is None:
-                        _status(status_queue, "warmup_pose_cancelled", warmup_pose.label)
-                        return
-                    command_start = RobotState(
-                        captured_at=state.captured_at,
-                        mode_machine=state.mode_machine,
-                        arm=backend._arm_target.copy(),
-                        arm_dq=state.arm_dq.copy(),
-                        left_hand=backend._left_target.copy(),
-                        right_hand=backend._right_target.copy(),
-                    )
-                    warmup_pose_chunk = _build_guarded_warmup_pose_chunk(
-                        command_start,
-                        warmup_pose,
-                        command_kind=kind,
-                    )
-                    _status(
-                        status_queue,
-                        "warmup_pose_started",
-                        {
-                            "label": warmup_pose.label,
-                            "steps": warmup_pose_chunk.length,
-                            "duration_s": warmup_pose_chunk.length / PUBLISH_HZ,
-                        },
-                    )
-                    completed = _execute_initialization(
-                        backend,
-                        warmup_pose_chunk,
-                        stop_event,
-                        heartbeat,
-                        tracking_checks_after,
-                        hand_watchdog,
-                        hand_freshness_gate,
-                        status_queue,
-                        context=f"guarded warmup pose={warmup_pose.label}",
-                    )
-                    if not completed:
-                        _status(status_queue, "warmup_pose_cancelled", warmup_pose.label)
-                        return
-                    if conditioner is not None:
-                        conditioner.reset(backend._arm_target, backend._left_target, backend._right_target)
-                    hand_watchdog.reset(backend)
-                    tracking_checks_after = time.monotonic()
-                    holding = True
-                    _status(status_queue, "warmup_pose_completed", warmup_pose.label)
-                    continue
-
-                if kind == "warm_start":
-                    if not isinstance(command, tuple) or len(command) not in {3, 4}:
-                        raise DeploymentError("Malformed policy warm-start command")
-                    if chunk is not None or not holding:
-                        raise DeploymentError("Policy warm-start requires an acknowledged hold with no active chunk")
-                    if len(command) == 4:
-                        _, created_at, expected_pause_generation, warm_start = command
-                    else:
-                        _, created_at, warm_start = command
-                        expected_pause_generation = None
-                    if not isinstance(warm_start, InitializationSpec):
-                        raise DeploymentError("Malformed policy warm-start target")
-                    if not _policy_generation_matches(
-                        expected_pause_generation,
-                        hand_pause_generation,
-                    ):
+                        hand_watchdog.reset(backend)
+                        state = _wait_for_initialization_start(
+                            backend,
+                            stop_event,
+                            heartbeat,
+                            hand_watchdog,
+                            hand_freshness_gate,
+                            status_queue,
+                            urgent_hold_event=urgent_hold_event,
+                        )
+                        if state is None:
+                            _status(status_queue, "warmup_pose_cancelled", warmup_pose.label)
+                            return
+                        command_start = RobotState(
+                            captured_at=state.captured_at,
+                            mode_machine=state.mode_machine,
+                            arm=backend._arm_target.copy(),
+                            arm_dq=state.arm_dq.copy(),
+                            left_hand=backend._left_target.copy(),
+                            right_hand=backend._right_target.copy(),
+                        )
+                        warmup_pose_chunk = _build_guarded_warmup_pose_chunk(
+                            command_start,
+                            warmup_pose,
+                            command_kind=kind,
+                        )
                         _status(
                             status_queue,
-                            "warm_start_invalidated",
+                            "warmup_pose_started",
                             {
-                                "expected_generation": expected_pause_generation,
-                                "current_generation": _hand_pause_generation_value(hand_pause_generation),
+                                "label": warmup_pose.label,
+                                "steps": warmup_pose_chunk.length,
+                                "duration_s": warmup_pose_chunk.length / PUBLISH_HZ,
                             },
                         )
+                        completed = _execute_initialization(
+                            backend,
+                            warmup_pose_chunk,
+                            stop_event,
+                            heartbeat,
+                            tracking_checks_after,
+                            hand_watchdog,
+                            hand_freshness_gate,
+                            status_queue,
+                            urgent_hold_event=urgent_hold_event,
+                            context=f"guarded warmup pose={warmup_pose.label}",
+                        )
+                        if not completed:
+                            _status(status_queue, "warmup_pose_cancelled", warmup_pose.label)
+                            return
+                        _check_guarded_motion_hold(stop_event, urgent_hold_event)
+                        if conditioner is not None:
+                            conditioner.reset(backend._arm_target, backend._left_target, backend._right_target)
+                        hand_watchdog.reset(backend)
+                        tracking_checks_after = time.monotonic()
+                        holding = True
+                        _status(status_queue, "warmup_pose_completed", warmup_pose.label)
                         continue
-                    try:
-                        command_age = time.monotonic() - float(created_at)
-                    except (TypeError, ValueError) as exc:
-                        raise DeploymentError("Policy warm-start timestamp is invalid") from exc
-                    if not np.isfinite(command_age) or not 0.0 <= command_age <= INITIALIZATION_COMMAND_MAX_AGE_S:
-                        raise DeploymentError("Policy warm-start command expired before execution")
 
-                    hand_watchdog.reset(backend)
-                    state = _wait_for_initialization_start(
-                        backend,
-                        stop_event,
-                        heartbeat,
-                        hand_watchdog,
-                        hand_freshness_gate,
-                        status_queue,
-                    )
-                    if state is None:
-                        _status(status_queue, "warm_start_cancelled")
-                        return
-                    command_start = RobotState(
-                        captured_at=state.captured_at,
-                        mode_machine=state.mode_machine,
-                        arm=backend._arm_target.copy(),
-                        arm_dq=state.arm_dq.copy(),
-                        left_hand=backend._left_target.copy(),
-                        right_hand=backend._right_target.copy(),
-                    )
-                    warm_start_chunk = _build_policy_warm_start_chunk(
-                        command_start,
-                        warm_start,
-                        allow_policy_warm_start=profile.name != "dex3",
-                    )
-                    _status(
-                        status_queue,
-                        "warm_starting",
-                        {
-                            "steps": warm_start_chunk.length,
-                            "duration_s": warm_start_chunk.length / PUBLISH_HZ,
-                        },
-                    )
-                    completed = _execute_initialization(
-                        backend,
-                        warm_start_chunk,
-                        stop_event,
-                        heartbeat,
-                        tracking_checks_after,
-                        hand_watchdog,
-                        hand_freshness_gate,
-                        status_queue,
-                        context="policy warm-start",
-                    )
-                    if not completed:
-                        _status(status_queue, "warm_start_cancelled")
-                        return
-                    if conditioner is not None:
-                        conditioner.reset(backend._arm_target, backend._left_target, backend._right_target)
-                    hand_watchdog.reset(backend)
-                    tracking_checks_after = time.monotonic()
-                    holding = False
-                    _status(status_queue, "warm_started", warm_start.label)
-                    continue
+                    except ImmediateControlEvent as exc:
+                        if exc.action != "hold":
+                            raise
+                        cancel_guarded_motion("warmup_pose_cancelled")
+                        continue
+
+                if kind == "warm_start":
+                    try:
+                        _check_guarded_motion_hold(stop_event, urgent_hold_event)
+                        if not isinstance(command, tuple) or len(command) not in {3, 4}:
+                            raise DeploymentError("Malformed policy warm-start command")
+                        if chunk is not None or not holding:
+                            raise DeploymentError("Policy warm-start requires an acknowledged hold with no active chunk")
+                        if len(command) == 4:
+                            _, created_at, expected_pause_generation, warm_start = command
+                        else:
+                            _, created_at, warm_start = command
+                            expected_pause_generation = None
+                        if not isinstance(warm_start, InitializationSpec):
+                            raise DeploymentError("Malformed policy warm-start target")
+                        if not _policy_generation_matches(
+                            expected_pause_generation,
+                            hand_pause_generation,
+                        ):
+                            _status(
+                                status_queue,
+                                "warm_start_invalidated",
+                                {
+                                    "expected_generation": expected_pause_generation,
+                                    "current_generation": _hand_pause_generation_value(hand_pause_generation),
+                                },
+                            )
+                            continue
+                        try:
+                            command_age = time.monotonic() - float(created_at)
+                        except (TypeError, ValueError) as exc:
+                            raise DeploymentError("Policy warm-start timestamp is invalid") from exc
+                        if not np.isfinite(command_age) or not 0.0 <= command_age <= INITIALIZATION_COMMAND_MAX_AGE_S:
+                            raise DeploymentError("Policy warm-start command expired before execution")
+
+                        hand_watchdog.reset(backend)
+                        state = _wait_for_initialization_start(
+                            backend,
+                            stop_event,
+                            heartbeat,
+                            hand_watchdog,
+                            hand_freshness_gate,
+                            status_queue,
+                            urgent_hold_event=urgent_hold_event,
+                        )
+                        if state is None:
+                            _status(status_queue, "warm_start_cancelled")
+                            return
+                        command_start = RobotState(
+                            captured_at=state.captured_at,
+                            mode_machine=state.mode_machine,
+                            arm=backend._arm_target.copy(),
+                            arm_dq=state.arm_dq.copy(),
+                            left_hand=backend._left_target.copy(),
+                            right_hand=backend._right_target.copy(),
+                        )
+                        warm_start_chunk = _build_policy_warm_start_chunk(
+                            command_start,
+                            warm_start,
+                            allow_policy_warm_start=profile.name != "dex3",
+                        )
+                        _status(
+                            status_queue,
+                            "warm_starting",
+                            {
+                                "steps": warm_start_chunk.length,
+                                "duration_s": warm_start_chunk.length / PUBLISH_HZ,
+                            },
+                        )
+                        completed = _execute_initialization(
+                            backend,
+                            warm_start_chunk,
+                            stop_event,
+                            heartbeat,
+                            tracking_checks_after,
+                            hand_watchdog,
+                            hand_freshness_gate,
+                            status_queue,
+                            urgent_hold_event=urgent_hold_event,
+                            context="policy warm-start",
+                        )
+                        if not completed:
+                            _status(status_queue, "warm_start_cancelled")
+                            return
+                        _check_guarded_motion_hold(stop_event, urgent_hold_event)
+                        if conditioner is not None:
+                            conditioner.reset(backend._arm_target, backend._left_target, backend._right_target)
+                        hand_watchdog.reset(backend)
+                        tracking_checks_after = time.monotonic()
+                        holding = False
+                        _status(status_queue, "warm_started", warm_start.label)
+                        continue
+
+                    except ImmediateControlEvent as exc:
+                        if exc.action != "hold":
+                            raise
+                        cancel_guarded_motion("warm_start_cancelled")
+                        continue
 
                 if kind == "rtc_snapshot":
                     if not isinstance(command, tuple) or len(command) != 2:

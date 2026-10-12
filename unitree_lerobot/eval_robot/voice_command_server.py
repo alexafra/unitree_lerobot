@@ -1,7 +1,8 @@
 """Authenticated local TCP bridge for reviewed iOS voice goals.
 
 The wire contract is deliberately tiny: newline-delimited UTF-8 JSON, one
-proposal followed by one explicit confirmation.  This module never talks to
+proposal followed by one explicit confirmation, or an authenticated immediate
+HOLD request. This module never talks to
 the policy or robot directly.  It hands a confirmed command to the runner and
 waits for the runner to accept or reject it before replying to the phone.
 """
@@ -16,7 +17,6 @@ import os
 from pathlib import Path
 import queue
 import secrets
-import select
 import socket
 import threading
 import time
@@ -60,6 +60,8 @@ class VoiceCommand:
     _cancelled: threading.Event = field(default_factory=threading.Event, repr=False)
     _delivery: threading.Event = field(default_factory=threading.Event, repr=False)
     _delivery_succeeded: bool = field(default=False, repr=False)
+    _hold_generation: int = field(default=0, repr=False)
+    _decision_at: float | None = field(default=None, repr=False)
 
     @property
     def cancelled(self) -> bool:
@@ -144,7 +146,7 @@ def _json_bytes(value: dict[str, object]) -> bytes:
 
 
 class VoiceCommandServer:
-    """Single-transaction-at-a-time TCP server for the iOS protocol."""
+    """One queued goal at a time, with HOLD available on every connection."""
 
     def __init__(
         self,
@@ -170,6 +172,9 @@ class VoiceCommandServer:
         self._thread: threading.Thread | None = None
         self._active_lock = threading.Lock()
         self._active: VoiceCommand | None = None
+        self._hold_generation = 0
+        self._connections: set[socket.socket] = set()
+        self._client_threads: set[threading.Thread] = set()
 
     @property
     def address(self) -> tuple[str, int]:
@@ -213,10 +218,13 @@ class VoiceCommandServer:
         *,
         service_callback: Callable[[], None] | None = None,
     ) -> bool:
-        if command.cancelled or command._decision.is_set():
-            return False
-        command._accepted = True
-        command._decision.set()
+        with self._active_lock:
+            if (command.cancelled or command._decision.is_set()
+                    or command._hold_generation != self._hold_generation):
+                return False
+            command._accepted = True
+            command._decision_at = time.monotonic()
+            command._decision.set()
         deadline = time.monotonic() + 2.0
         try:
             while not command._delivery.wait(timeout=0.02):
@@ -228,7 +236,9 @@ class VoiceCommandServer:
         except Exception:
             command._cancelled.set()
             raise
-        return command._delivery_succeeded and not command.cancelled
+        with self._active_lock:
+            return (command._delivery_succeeded and not command.cancelled
+                    and command._hold_generation == self._hold_generation)
 
     def reject_command(self, command: VoiceCommand, code: str, message: str) -> bool:
         if command.cancelled or command._decision.is_set():
@@ -243,9 +253,14 @@ class VoiceCommandServer:
         with self._active_lock:
             active = self._active
             if active is not None:
-                active._cancelled.set()
-                active._decision.set()
-                active._delivery.set()
+                self._cancel_command(active)
+            connections = tuple(self._connections)
+            client_threads = tuple(self._client_threads)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         listener = self._listener
         if listener is not None:
             try:
@@ -254,6 +269,8 @@ class VoiceCommandServer:
                 pass
         if self._thread is not None:
             self._thread.join(timeout=1.0)
+        for thread in client_threads:
+            thread.join(timeout=1.0)
 
     def _serve(self) -> None:
         assert self._listener is not None
@@ -268,119 +285,206 @@ class VoiceCommandServer:
                 LOGGER.exception("Voice listener failed")
                 return
             peer = f"{address[0]}:{address[1]}"
-            try:
-                self._handle_connection(connection, peer)
-            except VoiceConnectionClosed:
-                LOGGER.info("Voice connection %s closed; pending proposal discarded", peer)
-            except Exception:
-                LOGGER.exception("Voice connection %s failed", peer)
-            finally:
+            thread = threading.Thread(
+                target=self._serve_connection, args=(connection, peer),
+                name="groot-voice-client", daemon=True,
+            )
+            with self._active_lock:
+                self._connections.add(connection)
+                self._client_threads.add(thread)
+            thread.start()
+
+    def _serve_connection(self, connection: socket.socket, peer: str) -> None:
+        try:
+            self._handle_connection(connection, peer)
+        except VoiceConnectionClosed:
+            LOGGER.info("Voice connection %s closed; pending proposal discarded", peer)
+        except Exception:
+            LOGGER.exception("Voice connection %s failed", peer)
+        finally:
+            connection.close()
+            with self._active_lock:
+                self._connections.discard(connection)
+                self._client_threads.discard(threading.current_thread())
+
+    @staticmethod
+    def _cancel_command(command: VoiceCommand) -> None:
+        command._cancelled.set()
+        command._decision.set()
+        command._delivery.set()
+
+    def _request_hold(self, connection: socket.socket, message: dict[str, object]) -> None:
+        request_id = self._validate_common(message, "request_hold")
+        # Cancel before invoking the callback: even a failed controller request
+        # must not leave an older confirmed goal eligible for execution.
+        with self._active_lock:
+            self._hold_generation += 1
+            if self._active is not None:
+                self._cancel_command(self._active)
+                self._active = None
+            while True:
                 try:
-                    connection.close()
-                except OSError:
-                    pass
+                    self._cancel_command(self._commands.get_nowait())
+                except queue.Empty:
+                    break
+        self._request_powered_hold(request_id, require_callback=True)
+        self._send(connection, {
+            "protocol": PROTOCOL_VERSION,
+            "type": "hold_requested",
+            "request_id": request_id,
+        })
 
     def _handle_connection(self, connection: socket.socket, peer: str) -> None:
-        connection.settimeout(0.2)
+        connection.settimeout(0.02)
         decoder = JsonLineDecoder()
         buffered: list[dict[str, object]] = []
-        while not self._stop.is_set():
-            try:
-                proposal = self._read_message(
-                    connection,
-                    decoder,
-                    buffered,
-                    time.monotonic() + self._confirmation_timeout_s,
-                )
-            except VoiceProtocolError as exc:
-                self._send_error(connection, exc)
-                return
-            request_id = ""
-            try:
-                request_id, goal = self._validate_proposal(proposal)
-                confirmation_id = secrets.token_urlsafe(24)
-                self._request_powered_hold(request_id)
-                self._send(
-                    connection,
-                    {
-                        "protocol": PROTOCOL_VERSION,
-                        "type": "confirmation_required",
-                        "request_id": request_id,
-                        "confirmation_id": confirmation_id,
-                        "goal": goal,
-                        "robot_state": "HOLD",
-                        "warning": self._warning_factory(goal),
-                    },
-                )
-                deadline = time.monotonic() + self._confirmation_timeout_s
-                confirmation = self._read_message(connection, decoder, buffered, deadline)
-                self._validate_confirmation(confirmation, request_id, confirmation_id)
-                # A terminal command may have started while the phone was
-                # reviewing the proposal. Reassert HOLD when confirmation
-                # arrives so a late confirmation cannot leave motion active.
-                self._request_powered_hold(request_id)
-                command = VoiceCommand(request_id, confirmation_id, goal, peer)
+        command: VoiceCommand | None = None
+        confirmed = False
+        retired: set[str] = set()
+        deadline = time.monotonic() + self._confirmation_timeout_s
+        try:
+            while not self._stop.is_set():
+                # A different authenticated connection may have requested HOLD.
                 with self._active_lock:
-                    if self._active is not None:
-                        raise VoiceProtocolError("controller_busy", "Another voice command is pending", request_id)
-                    self._active = command
+                    if command is not None and command._hold_generation != self._hold_generation:
+                        retired.add(command.request_id)
+                        self._cancel_command(command)
+                        command = None
+                        confirmed = False
+                        deadline = time.monotonic() + self._confirmation_timeout_s
                 try:
-                    self._commands.put_nowait(command)
-                except queue.Full as exc:
-                    with self._active_lock:
-                        self._active = None
-                    raise VoiceProtocolError("controller_busy", "Another voice command is pending", request_id) from exc
-                self._wait_for_decision(connection, command, deadline)
-                if command.cancelled:
+                    data = connection.recv(4096)
+                except socket.timeout:
+                    data = None
+                except OSError as exc:
+                    raise VoiceConnectionClosed from exc
+                if data == b"":
                     raise VoiceConnectionClosed
-                if command._accepted:
-                    try:
-                        self._send(
-                            connection,
-                            {
+                if data:
+                    buffered.extend(decoder.feed(data))
+                while buffered:
+                    # Prioritize a HOLD already received in the same TCP read.
+                    # In particular, confirm_goal + request_hold must not put
+                    # the now-cancelled goal in the runner's queue first.
+                    hold_index = next((i for i, item in enumerate(buffered)
+                                       if item.get("type") == "request_hold"), None)
+                    if hold_index is not None:
+                        message = buffered[hold_index]
+                        self._validate_common(message, "request_hold")
+                        for discarded in buffered[:hold_index]:
+                            if isinstance(discarded.get("request_id"), str):
+                                retired.add(discarded["request_id"])
+                        del buffered[:hold_index + 1]
+                        if command is not None:
+                            retired.add(command.request_id)
+                        try:
+                            self._request_hold(connection, message)
+                        except VoiceProtocolError as exc:
+                            self._send_error(connection, exc)
+                        command = None
+                        confirmed = False
+                        deadline = time.monotonic() + self._confirmation_timeout_s
+                        continue
+                    message = buffered.pop(0)
+                    if message.get("type") == "confirm_goal":
+                        request_id = self._validate_common(message, "confirm_goal")
+                        if request_id in retired:
+                            self._send_error(connection, VoiceProtocolError(
+                                "goal_cancelled", "HOLD cancelled this goal; propose it again to resume", request_id,
+                            ))
+                            continue
+                    if command is None:
+                        request_id, goal = self._validate_proposal(message)
+                        retired.discard(request_id)
+                        with self._active_lock:
+                            generation = self._hold_generation
+                        self._request_powered_hold(request_id)
+                        command = VoiceCommand(request_id, secrets.token_urlsafe(24), goal, peer,
+                                               _hold_generation=generation)
+                        self._send(connection, {
+                            "protocol": PROTOCOL_VERSION,
+                            "type": "confirmation_required",
+                            "request_id": request_id,
+                            "confirmation_id": command.confirmation_id,
+                            "goal": goal,
+                            "robot_state": "HOLD_REQUESTED",
+                            "warning": self._warning_factory(goal),
+                        })
+                        deadline = time.monotonic() + self._confirmation_timeout_s
+                    else:
+                        if confirmed:
+                            raise VoiceProtocolError("controller_busy", "A confirmed goal is pending", command.request_id)
+                        self._validate_confirmation(message, command.request_id, command.confirmation_id)
+                        with self._active_lock:
+                            if command._hold_generation != self._hold_generation:
+                                retired.add(command.request_id)
+                                self._cancel_command(command)
+                                self._send_error(connection, VoiceProtocolError(
+                                    "goal_cancelled", "HOLD cancelled this goal; propose it again to resume",
+                                    command.request_id,
+                                ))
+                                command = None
+                                continue
+                            if self._active is not None:
+                                raise VoiceProtocolError("controller_busy", "Another voice command is pending", command.request_id)
+                            self._request_powered_hold(command.request_id)
+                            self._active = command
+                            try:
+                                self._commands.put_nowait(command)
+                            except queue.Full as exc:
+                                raise VoiceProtocolError("controller_busy", "Another voice command is pending", command.request_id) from exc
+                            confirmed = True
+                if command is not None and confirmed and command._decision.is_set():
+                    with self._active_lock:
+                        cancelled = command.cancelled or command._hold_generation != self._hold_generation
+                    if not cancelled:
+                        if command._accepted:
+                            # Preserve the previous short FIN-detection grace
+                            # before authorizing execution. Unlike a blocking
+                            # wait, this loop continues servicing HOLD traffic.
+                            if (command._decision_at is not None
+                                    and time.monotonic() - command._decision_at < 0.05):
+                                continue
+                            self._send(connection, {
                                 "protocol": PROTOCOL_VERSION,
                                 "type": "goal_accepted",
-                                "request_id": request_id,
-                            },
-                        )
-                    except VoiceConnectionClosed:
-                        command._cancelled.set()
-                        raise
-                    else:
-                        command._delivery_succeeded = True
-                    finally:
-                        command._delivery.set()
-                else:
-                    self._send_error(
-                        connection,
-                        VoiceProtocolError(command._error_code, command._error_message, request_id),
+                                "request_id": command.request_id,
+                            })
+                            with self._active_lock:
+                                command._delivery_succeeded = (
+                                    not command.cancelled and command._hold_generation == self._hold_generation
+                                )
+                        else:
+                            self._send_error(connection, VoiceProtocolError(
+                                command._error_code, command._error_message, command.request_id,
+                            ))
+                    command._delivery.set()
+                    with self._active_lock:
+                        if self._active is command:
+                            self._active = None
+                    command = None
+                    confirmed = False
+                    deadline = time.monotonic() + self._confirmation_timeout_s
+                if time.monotonic() >= deadline:
+                    raise VoiceProtocolError(
+                        "controller_timeout" if confirmed else "confirmation_timeout",
+                        "Controller did not accept the goal in time" if confirmed else "Confirmation timed out",
+                        "" if command is None else command.request_id,
                     )
+        except VoiceProtocolError as exc:
+            self._send_error(connection, exc)
+        finally:
+            if command is not None:
                 with self._active_lock:
+                    self._cancel_command(command)
                     if self._active is command:
                         self._active = None
-            except VoiceConnectionClosed:
-                with self._active_lock:
-                    active = self._active
-                    if active is not None and active.request_id == request_id:
-                        active._cancelled.set()
-                        active._decision.set()
-                        active._delivery.set()
-                        self._active = None
-                raise
-            except VoiceProtocolError as exc:
-                with self._active_lock:
-                    active = self._active
-                    if active is not None and active.request_id == request_id:
-                        active._cancelled.set()
-                        active._decision.set()
-                        active._delivery.set()
-                        self._active = None
-                self._send_error(connection, exc)
-                return
 
-    def _request_powered_hold(self, request_id: str) -> None:
+    def _request_powered_hold(self, request_id: str, *, require_callback: bool = False) -> None:
         callback = self._on_proposal
         if callback is None:
+            if require_callback:
+                raise VoiceProtocolError("controller_unavailable", "No active robot controller can receive HOLD", request_id)
             return
         try:
             callback()
@@ -390,55 +494,6 @@ class VoiceCommandServer:
                 "Controller could not enter powered HOLD",
                 request_id,
             ) from exc
-
-    def _read_message(
-        self,
-        connection: socket.socket,
-        decoder: JsonLineDecoder,
-        buffered: list[dict[str, object]],
-        deadline: float | None,
-    ) -> dict[str, object]:
-        while not self._stop.is_set():
-            if buffered:
-                return buffered.pop(0)
-            if deadline is not None and time.monotonic() >= deadline:
-                raise VoiceProtocolError("confirmation_timeout", "Confirmation timed out")
-            try:
-                data = connection.recv(4096)
-            except socket.timeout:
-                continue
-            except OSError as exc:
-                raise VoiceConnectionClosed from exc
-            if not data:
-                raise VoiceConnectionClosed
-            buffered.extend(decoder.feed(data))
-        raise VoiceConnectionClosed
-
-    def _wait_for_decision(self, connection: socket.socket, command: VoiceCommand, deadline: float) -> None:
-        while not self._stop.is_set() and not command._decision.wait(0.05):
-            if time.monotonic() >= deadline:
-                command._cancelled.set()
-                raise VoiceProtocolError("controller_timeout", "Controller did not accept the goal in time", command.request_id)
-            try:
-                readable, _, _ = select.select([connection], [], [], 0.0)
-                if readable and connection.recv(1, socket.MSG_PEEK) == b"":
-                    command._cancelled.set()
-                    raise VoiceConnectionClosed
-            except OSError as exc:
-                command._cancelled.set()
-                raise VoiceConnectionClosed from exc
-        # The wire protocol has no client ACK after confirm_goal. Give a local
-        # TCP FIN a short opportunity to surface before reporting acceptance;
-        # this closes the common confirm-then-disconnect race without adding a
-        # third app message or delaying robot execution materially.
-        try:
-            readable, _, _ = select.select([connection], [], [], 0.05)
-            if readable and connection.recv(1, socket.MSG_PEEK) == b"":
-                command._cancelled.set()
-                raise VoiceConnectionClosed
-        except OSError as exc:
-            command._cancelled.set()
-            raise VoiceConnectionClosed from exc
 
     def _validate_common(self, value: dict[str, object], expected_type: str) -> str:
         request_id = _request_id(value.get("request_id"))
