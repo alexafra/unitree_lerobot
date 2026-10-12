@@ -205,9 +205,8 @@ class _OperatorTerminal:
 
     ``stop_action="hold"`` is the normal active-loop behavior: ``s`` requests
     a child-acknowledged powered HOLD. ``stop_action="release"`` is reserved
-    for startup and initialization stages, which retain their release-only
-    operator protocol; there ``s`` cancels through the same orderly
-    authority-release path as ``q``.
+    for guarded blocking transitions, which retain their release-only
+    keyboard protocol. Phone HOLD is handled independently after startup.
     """
 
     def __init__(
@@ -482,6 +481,32 @@ def _confirm_before_authority(prompt: str) -> str:
     return _readline_before_authority(prompt, confirmation_mode=True)
 
 
+class _PhoneHoldBridge:
+    """Track only phone-originated interruptions that invalidate buffered input."""
+
+    def __init__(self, actuator: SafeG1Dex3Actuator):
+        self._actuator = actuator
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._consumed_generation = 0
+
+    def request_hold(self) -> None:
+        with self._lock:
+            self._actuator.request_immediate_hold()
+            self._generation += 1
+
+    def consume_input_boundary(self) -> bool:
+        with self._lock:
+            pending = self._generation != self._consumed_generation
+            self._consumed_generation = self._generation
+            return pending
+
+
+def _consume_phone_hold_input_boundary(actuator: SafeG1Dex3Actuator) -> bool:
+    bridge = getattr(actuator, "_phone_hold_bridge", None)
+    return isinstance(bridge, _PhoneHoldBridge) and bridge.consume_input_boundary()
+
+
 def _pending_prompt_control(actuator: SafeG1Dex3Actuator) -> str | None:
     """Translate asynchronous controls without consuming their acknowledgements."""
 
@@ -556,9 +581,17 @@ def _wait_for_confirmation_input_boundary(
             discarded_affirmative,
             extra={"terminal_yellow": True},
         )
-    if actuator is not None and getattr(actuator, "_discard_prompt_input_after_hold", False) is True:
-        actuator._discard_prompt_input_after_hold = False
     return None
+
+
+def _wait_for_phone_hold_input_boundary(fd: int, actuator: SafeG1Dex3Actuator) -> str | None:
+    """Keep draining stale phone-HOLD input across any buffered local STOP keys."""
+
+    while True:
+        control = _wait_for_confirmation_input_boundary(fd, actuator)
+        if control != "stop":
+            return control
+        _finish_operator_stop(actuator)
 
 
 def _run_blocking_motion_with_immediate_release(
@@ -572,7 +605,7 @@ def _run_blocking_motion_with_immediate_release(
     Startup and initial authority acquisition cannot acknowledge powered HOLD
     before initialization completes. Their ``s`` key therefore cancels and
     releases, exactly like ``q``. Post-initialization Warmup2 and Return-to-Start
-    use the separate HOLD-aware wrapper and child cancellation path.
+    retain this keyboard binding in the separate phone-HOLD-aware wrapper.
     """
 
     with _OperatorTerminal(actuator, stop_action="release") as terminal:
@@ -1123,7 +1156,7 @@ def _readline_while_armed(
             # Live actuation requires a real interactive terminal at startup.
             input_fd = None
         if input_fd is not None:
-            control = _wait_for_confirmation_input_boundary(input_fd, actuator)
+            control = _wait_for_phone_hold_input_boundary(input_fd, actuator)
             if control is not None:
                 return control
     LOGGER.warning("stdin is not a TTY; armed input is line-buffered and immediate keys are unavailable")
@@ -1218,7 +1251,9 @@ def _readline_with_immediate_prompt_controls(
     escape_prefix_at: float | None = None
     try:
         if confirmation_mode or discard_buffered_input:
-            buffered_control = _wait_for_confirmation_input_boundary(fd, actuator)
+            boundary = (_wait_for_phone_hold_input_boundary if discard_buffered_input
+                        else _wait_for_confirmation_input_boundary)
+            buffered_control = boundary(fd, actuator)
             if buffered_control is not None:
                 return buffered_control
         # Display the prompt only after ICANON is disabled and queued input has
@@ -1516,13 +1551,18 @@ def _select_next_goal_while_holding(
             print(f"  {index}. {task_name:16s}  {instruction}")
 
     show_mode()
-    # Only a real HOLD interruption invalidates buffered menu input. Ordinary
-    # menu entries (including voice-disabled runs) retain the legacy shortcuts.
-    discard_buffered_input = (
-        getattr(actuator, "_discard_prompt_input_after_hold", False) is True
-        or _pending_prompt_control(actuator) == "stop"
-    )
+    discard_buffered_input = False
     while True:
+        # Only an asynchronous phone interruption invalidates already-buffered
+        # local input. Ordinary terminal menu entry and local s/S retain their
+        # existing editing, Tab/Shift+Tab, Alt-q and queued-input behavior.
+        if _consume_phone_hold_input_boundary(actuator):
+            control = _pending_prompt_control(actuator)
+            if control == "q":
+                return None
+            if control == "stop":
+                _finish_operator_stop(actuator)
+            discard_buffered_input = True
         if voice_server is not None and voice_server.command_pending:
             voice_result = _take_held_voice_command(
                 actuator,
@@ -1531,7 +1571,6 @@ def _select_next_goal_while_holding(
                 return_to_start=return_to_start,
             )
             if voice_result in {VOICE_INPUT_AVAILABLE, VOICE_STAY_HOLDING}:
-                discard_buffered_input = voice_result == VOICE_STAY_HOLDING
                 continue
             if voice_result == "release":
                 return None
@@ -1571,7 +1610,6 @@ def _select_next_goal_while_holding(
         if lowered in STOP_COMMANDS or not response:
             if lowered in STOP_COMMANDS:
                 _finish_operator_stop(actuator)
-                discard_buffered_input = True
             LOGGER.info("Already stopped; no GR00T request was sent")
             continue
 
@@ -1667,7 +1705,7 @@ def _run_return_to_start_from_hold(
             return decision
         # Recheck after confirmation but before enqueueing any motion. A
         # feedback-HOLD may have arrived while the prompt was open.
-        _run_with_immediate_operator_keys(actuator, lambda: _wait_for_hand_feedback(actuator))
+        _run_with_immediate_control(actuator, lambda: _wait_for_hand_feedback(actuator))
     except OperatorStop:
         return "hold"
     except OperatorRelease:
@@ -1687,6 +1725,7 @@ def _run_return_to_start_from_hold(
         _run_with_immediate_operator_keys(
             actuator,
             lambda: actuator.return_to_start_pose(spec, warmup1=warmup1),
+            stop_action="release",
         )
     except OperatorStop:
         return "hold"
@@ -2216,7 +2255,7 @@ def _prepare_policy_goal(
         # A goal selected from the 1.25 s operator-HOLD terminal is explicit
         # consent to try again, but no policy-server command may be sent until
         # three distinct paired Dex3 readings have re-established feedback.
-        _run_with_immediate_operator_keys(actuator, lambda: _wait_for_hand_feedback(actuator))
+        _run_with_immediate_control(actuator, lambda: _wait_for_hand_feedback(actuator))
         _run_with_immediate_operator_keys(actuator, policy.reset)
         if warmup2_enabled is None:
             warmup2_enabled = bool(getattr(args, "policy_warm_start", True))
@@ -2268,7 +2307,7 @@ def _prepare_policy_goal(
         # Catch an already-pending operator HOLD before any Warmup2 motion is
         # queued. A failure after enqueue must still propagate so the child
         # cannot resume a paused transition while the parent is back at a menu.
-        _run_with_immediate_operator_keys(actuator, lambda: _wait_for_hand_feedback(actuator))
+        _run_with_immediate_control(actuator, lambda: _wait_for_hand_feedback(actuator))
     except OperatorStop:
         return "hold"
     except OperatorRelease:
@@ -2285,6 +2324,7 @@ def _prepare_policy_goal(
         _run_with_immediate_operator_keys(
             actuator,
             lambda: actuator.warm_start(warm_start_chunk),
+            stop_action="release",
         )
     except OperatorStop:
         return "hold"
@@ -2352,28 +2392,24 @@ def _finish_operator_stop(actuator: SafeG1Dex3Actuator) -> None:
             raise OperatorRelease
     else:
         actuator.hold()
-    # Carry cancellation across stage boundaries until a quiet terminal read
-    # consumes stale approvals; an ordinary completed goal does not set this.
-    actuator._discard_prompt_input_after_hold = True
 
 
-def _run_with_immediate_operator_keys(
+def _run_with_immediate_control(
     actuator: SafeG1Dex3Actuator,
     operation: Callable[[], object],
 ) -> object:
-    """Run one blocking policy/client call while s/q remain immediate."""
+    """Handle asynchronous control without adding a terminal key reader."""
 
-    with _OperatorTerminal(actuator):
-        try:
-            result = operation()
-        except ImmediateControlEvent as exc:
-            if exc.action == "release":
-                raise OperatorRelease from exc
-            _finish_operator_stop(actuator)
-            raise OperatorStop from exc
-        except OperatorStop:
-            _finish_operator_stop(actuator)
-            raise
+    try:
+        result = operation()
+    except ImmediateControlEvent as exc:
+        if exc.action == "release":
+            raise OperatorRelease from exc
+        _finish_operator_stop(actuator)
+        raise OperatorStop from exc
+    except OperatorStop:
+        _finish_operator_stop(actuator)
+        raise
     checker = getattr(actuator, "immediate_control_requested", None)
     requested = checker() if callable(checker) else None
     if requested == "release":
@@ -2382,6 +2418,21 @@ def _run_with_immediate_operator_keys(
         _finish_operator_stop(actuator)
         raise OperatorStop
     return result
+
+def _run_with_immediate_operator_keys(
+    actuator: SafeG1Dex3Actuator,
+    operation: Callable[[], object],
+    *,
+    stop_action: str = "hold",
+) -> object:
+    """Keep the phase's existing keyboard binding and accept phone HOLD separately."""
+
+    terminal = (_OperatorTerminal(actuator) if stop_action == "hold"
+                else _OperatorTerminal(actuator, stop_action=stop_action))
+    with terminal:
+        result = _run_with_immediate_control(actuator, operation)
+    # The terminal's final drain can request control as the operation returns.
+    return _run_with_immediate_control(actuator, lambda: result)
 
 
 def _run_active_goal(
@@ -3539,7 +3590,7 @@ def _run_held_policy_io(actuator, operation):
         raise DeploymentError("Policy refresh requires an acknowledged powered HOLD")
     checker = getattr(actuator, "assert_healthy", None)
     if callable(checker):
-        _run_with_immediate_operator_keys(actuator, checker)
+        _run_with_immediate_control(actuator, checker)
     stopped = threading.Event()
     expired = threading.Event()
 
@@ -3560,7 +3611,7 @@ def _run_held_policy_io(actuator, operation):
     try:
         result = _run_with_immediate_operator_keys(actuator, operation)
         if callable(checker):
-            _run_with_immediate_operator_keys(actuator, checker)
+            _run_with_immediate_control(actuator, checker)
         if expired.is_set():
             raise OperatorRelease
         return result
@@ -3918,9 +3969,10 @@ def run(args: argparse.Namespace) -> None:
             else configured_initialization,
         )
         if voice_enabled:
+            actuator._phone_hold_bridge = _PhoneHoldBridge(actuator)
             voice_server = _start_voice_server(
                 args,
-                on_proposal=actuator.request_immediate_hold,
+                on_proposal=actuator._phone_hold_bridge.request_hold,
             )
 
         # The publisher-free result predates initialization and is deliberately
@@ -4032,7 +4084,7 @@ def run(args: argparse.Namespace) -> None:
                 if not return_to_start_enabled:
                     break
                 try:
-                    _run_with_immediate_operator_keys(actuator, actuator.hold)
+                    _run_with_immediate_operator_keys(actuator, actuator.hold, stop_action="release")
                 except OperatorStop:
                     pass  # The interruptible wrapper already acknowledged HOLD.
                 except OperatorRelease:
@@ -4073,7 +4125,7 @@ def run(args: argparse.Namespace) -> None:
                     except Exception as exc:
                         checker = getattr(actuator, "assert_healthy", None)
                         try:
-                            _run_with_immediate_operator_keys(
+                            _run_with_immediate_control(
                                 actuator, lambda: checker() if callable(checker) else None,
                             )
                         except OperatorStop:
@@ -4115,7 +4167,7 @@ def run(args: argparse.Namespace) -> None:
                     except Exception as exc:
                         checker = getattr(actuator, "assert_healthy", None)
                         try:
-                            _run_with_immediate_operator_keys(
+                            _run_with_immediate_control(
                                 actuator, lambda: checker() if callable(checker) else None,
                             )
                         except OperatorStop:

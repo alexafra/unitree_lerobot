@@ -479,6 +479,12 @@ acquisition and hardware faults retain their existing release behavior.
 Previews now report `robot_state: "HOLD_REQUESTED"`; the paired app accepts that
 value as well as legacy `"HOLD"`.
 
+Terminal keys keep their existing phase-specific behavior. In particular, `s`
+still releases during the original guarded blocking transitions; the phone's
+HOLD is handled separately. Ordinary menu entry and local Stop do not add an
+input-discard interval. Only a phone-originated HOLD interruption quarantines
+buffered input before another menu selection.
+
 The phone's **Return to Start** button sends the exact existing `Return to start`
 shortcut through the normal preview/confirmation flow. It retains the PC's
 configured Warmup1 or initialization target and motion/visual gates; it does not
