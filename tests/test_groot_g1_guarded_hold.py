@@ -22,6 +22,13 @@ from test_groot_g1_rtc import (
 )
 from unitree_lerobot.eval_robot.eval_groot_g1 import (
     _prepare_policy_goal,
+    _PhoneHoldBridge,
+    _consume_phone_hold_input_boundary,
+    _run_with_immediate_control,
+    _run_with_immediate_operator_keys,
+    _OperatorTerminal,
+    OperatorRelease,
+    RETURN_TO_START,
     _readline_while_armed,
     _select_next_goal_while_holding,
     _run_return_to_start_from_hold,
@@ -301,6 +308,7 @@ class PromptHoldTests(unittest.TestCase):
             immediate_control_requested=lambda: control["pending"],
             finish_immediate_hold=mock.Mock(side_effect=lambda: control.update(pending=None) or "hold"),
             request_immediate_release=mock.Mock(side_effect=lambda: control.update(pending="release")),
+            request_immediate_hold=mock.Mock(side_effect=lambda: control.update(pending="hold")),
             warm_start=mock.Mock(), return_to_start_pose=mock.Mock(),
             wait_for_hand_feedback=mock.Mock(), close=mock.Mock(), hold=mock.Mock(),
             _holding=True,
@@ -366,16 +374,18 @@ class PromptHoldTests(unittest.TestCase):
         actuator.request_immediate_release.assert_not_called()
 
     def test_held_menu_acknowledges_hold_and_quarantines_prior_local_input(self):
-        actuator, _ = self._actuator("hold")
+        actuator, _ = self._actuator()
+        actuator._phone_hold_bridge = _PhoneHoldBridge(actuator)
+        actuator._phone_hold_bridge.request_hold()
         stdin = mock.Mock()
         stdin.isatty.return_value = False
         stdin.fileno.return_value = 42
         with (mock.patch(f"{_RUNNER}.sys.stdin", stdin),
-              mock.patch(f"{_RUNNER}._wait_for_confirmation_input_boundary", side_effect=("stop", "q")) as boundary,
+              mock.patch(f"{_RUNNER}._wait_for_confirmation_input_boundary", return_value="q") as boundary,
               mock.patch("builtins.print")):
             result = _select_next_goal_while_holding(actuator)
         self.assertIsNone(result)  # Only the subsequent explicit q leaves the menu.
-        self.assertEqual(boundary.call_args_list, [mock.call(42, actuator), mock.call(42, actuator)])
+        boundary.assert_called_once_with(42, actuator)
         actuator.finish_immediate_hold.assert_called_once()
         actuator.warm_start.assert_not_called()
         actuator.return_to_start_pose.assert_not_called()
@@ -383,6 +393,9 @@ class PromptHoldTests(unittest.TestCase):
 
     def test_first_custom_menu_quarantines_r_left_by_cancelled_confirmation(self):
         actuator, _ = self._actuator()
+        actuator._phone_hold_bridge = _PhoneHoldBridge(actuator)
+        actuator._phone_hold_bridge.request_hold()
+        actuator.finish_immediate_hold()
         stdin = SimpleNamespace(isatty=lambda: True, fileno=lambda: 42)
         with (mock.patch(f"{_RUNNER}.sys.stdin", stdin),
               mock.patch(f"{_RUNNER}.termios.tcgetattr", return_value=[0, 0, 0, 0, 0, 0, [0] * 32]),
@@ -481,6 +494,136 @@ class PromptHoldTests(unittest.TestCase):
         refresh.assert_not_called()
         actuator.finish_immediate_hold.assert_called_once()
         actuator.close.assert_not_called()
+
+    def _raw_menu(self, actuator, values, *, custom=False, return_to_start=False):
+        stdin = SimpleNamespace(isatty=lambda: True, fileno=lambda: 42)
+        with (mock.patch(f"{_RUNNER}.sys.stdin", stdin),
+              mock.patch(f"{_RUNNER}.termios.tcgetattr", return_value=[0, 0, 0, 0, 0, 0, [0] * 32]),
+              mock.patch(f"{_RUNNER}.termios.tcsetattr"),
+              mock.patch(f"{_RUNNER}.select.select", return_value=([42], [], [])),
+              mock.patch(f"{_RUNNER}.os.read", side_effect=values),
+              mock.patch(f"{_RUNNER}._wait_for_confirmation_input_boundary",
+                         side_effect=AssertionError("ordinary menu must not discard buffered input")),
+              mock.patch("builtins.print")):
+            return _select_next_goal_while_holding(
+                actuator, custom_goal_mode=custom, return_to_start=return_to_start,
+            )
+
+    def test_normal_menu_preserves_buffered_tab_and_custom_text(self):
+        actuator, _ = self._actuator()
+        result = self._raw_menu(actuator, [b"\t", b"h", b"i", b"\n"])
+        self.assertEqual(result, ("custom-goal", "hi"))
+        actuator.request_immediate_release.assert_not_called()
+        actuator.request_immediate_hold.assert_not_called()
+
+    def test_normal_menu_preserves_buffered_shift_tab(self):
+        actuator, _ = self._actuator()
+        result = self._raw_menu(actuator, [b"\x1b", b"[", b"Z"], return_to_start=True)
+        self.assertEqual(result, RETURN_TO_START)
+        actuator.request_immediate_release.assert_not_called()
+
+    def test_normal_custom_menu_preserves_alt_q_and_lowercase_s(self):
+        actuator, _ = self._actuator()
+        result = self._raw_menu(actuator, [b"\x1b", b"q", b"s", b"\n"], custom=True)
+        self.assertEqual(result, ("custom-goal", "qs"))
+        actuator.request_immediate_release.assert_not_called()
+        actuator.request_immediate_hold.assert_not_called()
+
+    def test_local_stop_does_not_add_menu_quarantine(self):
+        actuator, _ = self._actuator()
+        result = self._raw_menu(actuator, [b"S", b"\t", b"h", b"i", b"\n"])
+        self.assertEqual(result, ("custom-goal", "hi"))
+        actuator.finish_immediate_hold.assert_called_once()
+        actuator.request_immediate_release.assert_not_called()
+
+    def test_phone_quarantine_drains_stale_input_after_buffered_stop(self):
+        for key in (b"s", b"S"):
+            with self.subTest(key=key):
+                actuator, _ = self._actuator()
+                actuator._phone_hold_bridge = _PhoneHoldBridge(actuator)
+                actuator._phone_hold_bridge.request_hold()
+                stale = [key, b"r", b"\n"]
+                fresh = [b"h", b"i", b"\n"]
+                state = {"now": 0.0, "prompt": False}
+                def select_input(*_args):
+                    state["now"] += 0.05
+                    return ([42], [], []) if stale or state["prompt"] else ([], [], [])
+                def print_prompt(*args, **_kwargs):
+                    if args and args[0] == "Custom goal> ":
+                        state["prompt"] = True
+                stdin = SimpleNamespace(isatty=lambda: True, fileno=lambda: 42)
+                with (mock.patch(f"{_RUNNER}.sys.stdin", stdin),
+                      mock.patch(f"{_RUNNER}.termios.tcgetattr", return_value=[0, 0, 0, 0, 0, 0, [0] * 32]),
+                      mock.patch(f"{_RUNNER}.termios.tcsetattr"),
+                      mock.patch(f"{_RUNNER}.time.monotonic", side_effect=lambda: state["now"]),
+                      mock.patch(f"{_RUNNER}.select.select", side_effect=select_input),
+                      mock.patch(f"{_RUNNER}.os.read", side_effect=lambda *_args: (stale or fresh).pop(0)),
+                      mock.patch("builtins.print", side_effect=print_prompt)):
+                    result = _select_next_goal_while_holding(actuator, custom_goal_mode=True)
+                self.assertEqual(result, ("custom-goal", "hi"))
+                self.assertEqual(actuator.finish_immediate_hold.call_count, 2)
+                actuator.request_immediate_release.assert_not_called()
+                actuator.close.assert_not_called()
+
+    def test_phone_input_boundary_is_consumed_once_and_local_stop_does_not_mark_it(self):
+        actuator, _ = self._actuator()
+        actuator._phone_hold_bridge = _PhoneHoldBridge(actuator)
+        actuator.request_immediate_hold()
+        self.assertFalse(_consume_phone_hold_input_boundary(actuator))
+        actuator._phone_hold_bridge.request_hold()
+        self.assertTrue(_consume_phone_hold_input_boundary(actuator))
+        self.assertFalse(_consume_phone_hold_input_boundary(actuator))
+        actuator._phone_hold_bridge.request_hold()
+        self.assertTrue(_consume_phone_hold_input_boundary(actuator))
+
+    def test_original_blocking_keyboard_stop_releases_while_phone_hold_stays_powered(self):
+        for key in (b"s", b"S"):
+            with self.subTest(key=key):
+                actuator, _ = self._actuator()
+                keyboard = _OperatorTerminal(actuator, stop_action="release")
+                def terminal_enter():
+                    keyboard._handle_key(key, False)
+                with mock.patch(f"{_RUNNER}._OperatorTerminal") as terminal:
+                    terminal.return_value.__enter__.side_effect = terminal_enter
+                    with self.assertRaises(OperatorRelease):
+                        _run_with_immediate_operator_keys(actuator, lambda: None, stop_action="release")
+                    terminal.assert_called_once_with(actuator, stop_action="release")
+                actuator.request_immediate_release.assert_called_once()
+                actuator.finish_immediate_hold.assert_not_called()
+        actuator, _ = self._actuator()
+        bridge = _PhoneHoldBridge(actuator)
+        with mock.patch(f"{_RUNNER}._OperatorTerminal"), self.assertRaises(OperatorStop):
+            _run_with_immediate_operator_keys(actuator, bridge.request_hold, stop_action="release")
+        actuator.finish_immediate_hold.assert_called_once()
+        actuator.request_immediate_release.assert_not_called()
+
+    def test_feedback_control_handler_does_not_open_a_new_terminal_reader(self):
+        actuator, _ = self._actuator()
+        with mock.patch(f"{_RUNNER}._OperatorTerminal") as terminal:
+            self.assertEqual(_run_with_immediate_control(actuator, lambda: "done"), "done")
+        terminal.assert_not_called()
+
+    def test_warmup2_and_return_callers_keep_original_keyboard_release_binding(self):
+        actuator, _ = self._actuator()
+        calls = []
+        def operation(_actuator, callback, **kwargs):
+            calls.append(kwargs)
+            return callback()
+        policy = SimpleNamespace(reset=mock.Mock())
+        with (mock.patch(f"{_RUNNER}._run_with_immediate_operator_keys", side_effect=operation),
+              mock.patch(f"{_RUNNER}.infer_chunk", return_value=(_plan(1), 0.01)),
+              mock.patch(f"{_RUNNER}.chunk_delta_summary", return_value="test target"),
+              mock.patch(f"{_RUNNER}.confirm_policy_warm_start", return_value="continue"),
+              mock.patch(f"{_RUNNER}.confirm_policy_continue", return_value="hold"),
+              mock.patch(f"{_RUNNER}.confirm_return_to_start", return_value="continue")):
+            self.assertEqual(_prepare_policy_goal(policy, None, None, actuator, "pick red cup",
+                SimpleNamespace(end_effector="dex3"),
+                SimpleNamespace(execution_horizon=8, policy_warm_start=True),
+                allow_custom_instruction=False), "hold")
+            self.assertEqual(_run_return_to_start_from_hold(actuator, _target()), "continue")
+        self.assertEqual([call for call in calls if call], [{"stop_action": "release"}] * 2)
+        actuator.warm_start.assert_called_once()
+        actuator.return_to_start_pose.assert_called_once()
 
 
 if __name__ == "__main__":
