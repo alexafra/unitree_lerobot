@@ -27,6 +27,7 @@ from unitree_lerobot.eval_robot.eval_groot_g1 import (
     _run_return_to_start_from_hold,
     _take_held_voice_command,
     _wait_for_confirmation_input_boundary,
+    _finish_operator_stop,
     _run_held_policy_io,
     confirm_policy_warm_start,
     OperatorStop,
@@ -382,7 +383,8 @@ class PromptHoldTests(unittest.TestCase):
         actuator.close.assert_not_called()
 
     def test_first_custom_menu_quarantines_r_left_by_cancelled_confirmation(self):
-        actuator, _ = self._actuator()
+        actuator, _ = self._actuator("hold")
+        _finish_operator_stop(actuator)
         stdin = SimpleNamespace(isatty=lambda: True, fileno=lambda: 42)
         with (mock.patch(f"{_RUNNER}.sys.stdin", stdin),
               mock.patch(f"{_RUNNER}.termios.tcgetattr", return_value=[0, 0, 0, 0, 0, 0, [0] * 32]),
@@ -395,6 +397,38 @@ class PromptHoldTests(unittest.TestCase):
         resolve_custom.assert_not_called()
         actuator.request_immediate_release.assert_called_once()
         actuator.warm_start.assert_not_called()
+
+    def test_normal_voice_disabled_menu_preserves_buffered_shortcuts(self):
+        for keys, options, expected in (
+            (b"11\n", {}, ("stack-three-cups", "stack the three red cups.")),
+            (b"\tmove red cup\n", {}, ("custom-goal", "move red cup")),
+            (b"\x1b[Z", {"return_to_start": True}, "\x1b[Z"),
+            (b"\x12", {}, "refresh"),
+        ):
+            with self.subTest(keys=keys):
+                actuator, _ = self._actuator()
+                stdin = SimpleNamespace(isatty=lambda: True, fileno=lambda: 42)
+                with (
+                    mock.patch(f"{_RUNNER}.sys.stdin", stdin),
+                    mock.patch(f"{_RUNNER}.termios.tcgetattr", return_value=[0, 0, 0, 0, 0, 0, [0] * 32]),
+                    mock.patch(f"{_RUNNER}.termios.tcsetattr"),
+                    mock.patch(f"{_RUNNER}.select.select", return_value=([42], [], [])),
+                    mock.patch(f"{_RUNNER}.os.read", side_effect=[bytes([key]) for key in keys]),
+                    mock.patch(f"{_RUNNER}._wait_for_confirmation_input_boundary") as boundary,
+                    mock.patch("builtins.print"),
+                ):
+                    self.assertEqual(_select_next_goal_while_holding(actuator, **options), expected)
+                boundary.assert_not_called()
+                actuator.finish_immediate_hold.assert_not_called()
+                actuator.hold.assert_not_called()
+
+    def test_completed_quiet_boundary_clears_hold_quarantine(self):
+        actuator, _ = self._actuator("hold")
+        _finish_operator_stop(actuator)
+        self.assertTrue(actuator._discard_prompt_input_after_hold)
+        with mock.patch(f"{_RUNNER}.select.select", return_value=([], [], [])):
+            self.assertIsNone(_wait_for_confirmation_input_boundary(42, actuator))
+        self.assertFalse(actuator._discard_prompt_input_after_hold)
 
     def test_hold_at_return_final_visual_gate_cancels_without_release(self):
         actuator, control = self._actuator()

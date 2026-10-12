@@ -556,6 +556,8 @@ def _wait_for_confirmation_input_boundary(
             discarded_affirmative,
             extra={"terminal_yellow": True},
         )
+    if actuator is not None and getattr(actuator, "_discard_prompt_input_after_hold", False) is True:
+        actuator._discard_prompt_input_after_hold = False
     return None
 
 
@@ -1514,9 +1516,12 @@ def _select_next_goal_while_holding(
             print(f"  {index}. {task_name:16s}  {instruction}")
 
     show_mode()
-    # A cancelled confirmation may leave an old r or partial custom line in
-    # stdin. Require a fresh menu boundary even when HOLD happened elsewhere.
-    discard_buffered_input = True
+    # Only a real HOLD interruption invalidates buffered menu input. Ordinary
+    # menu entries (including voice-disabled runs) retain the legacy shortcuts.
+    discard_buffered_input = (
+        getattr(actuator, "_discard_prompt_input_after_hold", False) is True
+        or _pending_prompt_control(actuator) == "stop"
+    )
     while True:
         if voice_server is not None and voice_server.command_pending:
             voice_result = _take_held_voice_command(
@@ -2347,6 +2352,9 @@ def _finish_operator_stop(actuator: SafeG1Dex3Actuator) -> None:
             raise OperatorRelease
     else:
         actuator.hold()
+    # Carry cancellation across stage boundaries until a quiet terminal read
+    # consumes stale approvals; an ordinary completed goal does not set this.
+    actuator._discard_prompt_input_after_hold = True
 
 
 def _run_with_immediate_operator_keys(
