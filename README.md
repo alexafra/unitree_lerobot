@@ -1,3 +1,15 @@
+# Research fork: unitree_lerobot
+
+This is [alexafra's research fork](https://github.com/alexafra/unitree_lerobot) of [unitreerobotics/unitree_lerobot](https://github.com/unitreerobotics/unitree_lerobot). **The thesis implementation is on [`research/g1-rgbd-dataset-tools`](https://github.com/alexafra/unitree_lerobot/tree/research/g1-rgbd-dataset-tools), not this `main` branch.**
+
+RGB-D dataset conversion and G1 GR00T deployment, including geometry contracts, recording, operator controls, and experimental asynchronous execution.
+
+Read the [research-branch README](https://github.com/alexafra/unitree_lerobot/blob/research/g1-rgbd-dataset-tools/README.md) for the implemented additions, companion repositories, branch-specific setup, and limitations. Selecting this fork's `main` branch does not select the research configuration.
+
+The upstream documentation and attribution below are retained for reference; they are not validation or safety guarantees for the research additions. Existing licensing and third-party attribution remain applicable.
+
+---
+
 <div align="center">
   <h1 align="center"> unitree_lerobot </h1>
   <h3 align="center"> Unitree Robotics </h3>
