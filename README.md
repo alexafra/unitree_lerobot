@@ -1,3 +1,27 @@
+# G1 RGB-D datasets and GR00T deployment research fork
+
+This fork extends [Unitree Robotics' unitree_lerobot](https://github.com/unitreerobotics/unitree_lerobot) for thesis dataset preparation and real-robot policy evaluation. The research implementation is on **`research/g1-rgbd-dataset-tools`**, not `main`.
+
+## What this fork adds
+
+- Calibration-aware RGB-D episode conversion, fixed-metric depth and surface-normal representations, lossless geometry-video encoding, task-label normalisation, and recorded geometry contracts. See the [dataset converter](unitree_lerobot/utils/convert_unitree_json_to_lerobot.py).
+- A [GR00T deployment client](unitree_lerobot/eval_robot/eval_groot_g1.py) with camera/state adapters, checkpoint-contract checks, command conditioning, operator HOLD controls, recording, and synchronous or experimental asynchronous Real-Time Chunking. Pure RTC requires the compatible [Isaac-GR00T server fork](https://github.com/alexafra/Isaac-GR00T/tree/research/g1-dex3-finetuning).
+- Distinct Dex3 and Inspire transport support. Consult the [G1 deployment guide](docs/groot_g1_dex3.md), [Inspire FTP guide](docs/groot_g1_inspire_ftp.md), and [pipeline validation checklist](docs/groot_g1_pipeline_validation_checklist.md).
+
+```bash
+git clone --recurse-submodules --branch research/g1-rgbd-dataset-tools https://github.com/alexafra/unitree_lerobot.git
+```
+
+Collection uses the [XR fork](https://github.com/alexafra/xr_teleoperate/tree/research/g1-data-collection) and [TeleImager fork](https://github.com/alexafra/teleimager/tree/research/rgbd-data-collection); experiment orchestration lives in [thesis_scripts](https://github.com/alexafra/thesis_scripts).
+
+**Deployment warning:** the current GR00T runner defaults to Inspire FTP with actuation enabled, subject to its preflight and operator gates. Publisher-free shadow operation requires **`--no-actuate`**. Software guards are not safety certification; check hardware, checkpoint contracts, and current configuration before any live run. Inherited deployment/replay examples are separate workflows, not a safe-default quick start for this client.
+
+## Upstream documentation and attribution
+
+Unitree's original documentation and acknowledgements are retained below, including its Hugging Face LeRobot dependencies. Upstream clone commands target the original project. Preserve the existing [LICENSE](LICENSE) and third-party attribution when redistributing.
+
+---
+
 <div align="center">
   <h1 align="center"> unitree_lerobot </h1>
   <h3 align="center"> Unitree Robotics </h3>
@@ -272,10 +296,10 @@ If you want to use multi-GPU training, please refer to the details [here](https:
 
 # 4. 🤖 Real-World Testing
 
-For an Isaac-GR00T N1.7 checkpoint controlling a G1-29 with Dex3 hands, use the
-[guarded GR00T deployment guide](docs/groot_g1_dex3.md). Its default shadow mode is
-publisher-free; real actuation remains explicitly fail-closed pending hardware
-qualification. For the split GPU-PC/Wi-Fi/laptop/PC2 topology, follow the
+For Isaac-GR00T N1.7 deployment on a G1-29, use the
+[GR00T deployment guide](docs/groot_g1_dex3.md) and the appropriate end-effector guide.
+The current runner defaults to Inspire FTP with actuation enabled; publisher-free
+shadow operation requires explicit `--no-actuate`. For the split GPU-PC/Wi-Fi/laptop/PC2 topology, follow the
 [laptop shadow-mode checklist](docs/groot_g1_laptop_shadow.md).
 
 To test your trained model on a real robot, you can use the eval_g1.py script located in the eval_robot folder. Here’s how to run it:
